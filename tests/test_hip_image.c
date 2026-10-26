@@ -1,0 +1,233 @@
+/* test_hip_image.c — the AMD/HIP vision tower against the same frozen fixtures the CPU image test
+ * uses.
+ *
+ * Usage: e2_test_hip_image <model_dir> <fixture_dir>
+ *
+ * Two comparisons per case: the HIP engine against the fp32 reference (the number that matters for
+ * the port) and against the CPU engine on the same input. As on the Intel backend the GPU attention
+ * is int8 while the CPU attention is fp32, so cos(gpu,cpu) says whether the attention quantization
+ * moved the embedding; the reference column says whether it matters.
+ *
+ * E2_HIP_VLAYERS=n records a diagnostic graph that stops after n layers (0 = after the patch
+ * embedder); the soft-token tail is then never run and the entry points return early.
+ */
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "e2.h"
+#include "test_metrics.h"
+#include "e2hip.h"
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static double cosine(const float *a, const float *b, int n) {
+    const double c = e2_test_cosine(a, b, (size_t)n);
+    return isfinite(c) ? c : -1.0;
+}
+
+/* image.bin: int32 n_patches, patch_dim, n_pos, dim; pixels[]; positions[]; ref[] */
+static float *read_image(const char *path, int32_t *np, int32_t *pd, int32_t *npos) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    int32_t dim = 0;
+    if (fread(np, 4, 1, f) != 1 || fread(pd, 4, 1, f) != 1 || fread(npos, 4, 1, f) != 1 ||
+        fread(&dim, 4, 1, f) != 1) {
+        fclose(f);
+        return NULL;
+    }
+    float *px = malloc(sizeof(float) * (size_t)*np * *pd + sizeof(int32_t) * (size_t)*np * *npos +
+                       sizeof(float) * 768);
+    if (fread(px, 4, (size_t)*np * *pd, f) != (size_t)*np * *pd) {
+        free(px);
+        fclose(f);
+        return NULL;
+    }
+    int32_t *pos = (int32_t *)(px + (size_t)*np * *pd);
+    float *ref = (float *)(pos + (size_t)*np * *npos);
+    if (fread(pos, 4, (size_t)*np * *npos, f) != (size_t)*np * *npos ||
+        fread(ref, 4, (size_t)dim, f) != (size_t)dim) {
+        free(px);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    return px;
+}
+
+/* image_caption.bin: int32 n_ids, n_patches, patch_dim, dim; ids[]; pixels[]; positions[]; ref[] */
+static float *read_caption(const char *path, int32_t *n_ids, int32_t *np, int32_t *pd,
+                           int32_t **ids_out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    int32_t dim = 0;
+    if (fread(n_ids, 4, 1, f) != 1 || fread(np, 4, 1, f) != 1 || fread(pd, 4, 1, f) != 1 ||
+        fread(&dim, 4, 1, f) != 1) {
+        fclose(f);
+        return NULL;
+    }
+    int32_t *ids = malloc(sizeof(int32_t) * (size_t)*n_ids);
+    float *px = malloc(sizeof(float) * (size_t)*np * *pd + sizeof(int32_t) * (size_t)*np * 2 +
+                       sizeof(float) * 768);
+    if (!ids || !px) { free(ids); free(px); fclose(f); return NULL; }
+    if (fread(ids, 4, (size_t)*n_ids, f) != (size_t)*n_ids ||
+        fread(px, 4, (size_t)*np * *pd, f) != (size_t)*np * *pd) {
+        free(ids);
+        free(px);
+        fclose(f);
+        return NULL;
+    }
+    int32_t *pos = (int32_t *)(px + (size_t)*np * *pd);
+    float *ref = (float *)(pos + (size_t)*np * 2);
+    if (fread(pos, 4, (size_t)*np * 2, f) != (size_t)*np * 2 ||
+        fread(ref, 4, (size_t)dim, f) != (size_t)dim) {
+        free(ids);
+        free(px);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *ids_out = ids;
+    return px;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: %s <model_dir> <fixture_dir>\n", argv[0]); return 2; }
+    e2_model *m = e2_load(argv[1]);
+    if (!m) { fprintf(stderr, "model load failed: %s\n", e2_last_error()); return 1; }
+    double t0 = now_ms();
+    e2_hip *g = e2_hip_create(m);
+    if (!g) { fprintf(stderr, "hip init failed: %s\n", e2_hip_last_error()); return 1; }
+    printf("hip: %s (upload %.2f s)\n", e2_hip_device(g), (now_ms() - t0) / 1e3);
+    const int diagnostic = getenv("E2_HIP_VLAYERS") != NULL;
+    int failures = 0;
+
+    { /* image only */
+        char path[512];
+        snprintf(path, sizeof path, "%s/image.bin", argv[2]);
+        int32_t n_patch = 0, p_dim = 0, n_pos = 0;
+        float *fx = read_image(path, &n_patch, &p_dim, &n_pos);
+        if (!fx) { fprintf(stderr, "cannot read %s\n", path); return 2; }
+        const float *pixels = fx;
+        const int32_t *pos = (const int32_t *)(fx + (size_t)n_patch * p_dim);
+        const float *ref = (const float *)(pos + (size_t)n_patch * n_pos);
+        float *gpu = malloc(sizeof(float) * 768);
+        float *cpu = malloc(sizeof(float) * 768);
+        double tcpu = now_ms();
+        if (e2_image_embed(m, pixels, pos, n_patch, cpu) ||
+            !e2_test_unit("CPU image reference", cpu, 768) ||
+            !e2_test_match("CPU image reference", cpu, ref, 768, 0.999)) {
+            fprintf(stderr, "CPU reference failed: %s\n", e2_last_error());
+            free(gpu); free(cpu); free(fx);
+            e2_hip_destroy(g); e2_free(m);
+            return 1;
+        }
+        tcpu = now_ms() - tcpu;
+        double best = 1e18;
+        const char *re = getenv("E2_REPS");
+        int reps = re ? atoi(re) : 5;
+        if (reps < 1) reps = 1;
+        double *samples = malloc(sizeof *samples * (size_t)reps);
+        if (!samples) return 2;
+        int checked = 0;
+        for (int r = 0; r < reps; r++) {
+            const double t = now_ms();
+            if (e2_hip_image_embed(g, pixels, pos, n_patch, gpu)) {
+                fprintf(stderr, "hip: %s\n", e2_hip_last_error());
+                failures++;
+                break;
+            }
+            const double d = now_ms() - t;
+            if (!diagnostic && (!e2_test_unit("image", gpu, 768) ||
+                !e2_test_match("image", gpu, ref, 768, 0.999) ||
+                !e2_test_match("image GPU vs CPU", gpu, cpu, 768, 0.999))) {
+                failures++;
+                break;
+            }
+            samples[checked++] = d;
+            if (getenv("E2_HIP_VERBOSE")) printf("     run %d: %.3f ms\n", r, d);
+            if (d < best) best = d;
+        }
+        if (!diagnostic) e2_test_timing(samples, checked);
+        free(samples);
+        if (diagnostic) {
+            printf("E2_HIP_VLAYERS=%s: diagnostic run only\n", getenv("E2_HIP_VLAYERS"));
+        } else {
+            long k = 0;
+            double last = 0;
+            e2_hip_vision_stats(g, &k, &last);
+            printf("image          %d patches  gpu %8.2f ms  cos(gpu,ref) %.6f  cos(gpu,cpu) %.6f  "
+                   "cos(cpu,ref) %.6f  kernels %ld (cpu %.1f ms)\n",
+                   n_patch, best, cosine(gpu, ref, 768), cosine(gpu, cpu, 768),
+                   cosine(cpu, ref, 768), k, tcpu);
+            if (cosine(gpu, ref, 768) < 0.999 || cosine(gpu, cpu, 768) < 0.999) failures++;
+        }
+        free(gpu);
+        free(cpu);
+        free(fx);
+    }
+
+    if (!diagnostic) { /* text + image */
+        char path[512];
+        snprintf(path, sizeof path, "%s/image_caption.bin", argv[2]);
+        int32_t n_ids = 0, n_patch = 0, p_dim = 0;
+        int32_t *ids = NULL;
+        float *fx = read_caption(path, &n_ids, &n_patch, &p_dim, &ids);
+        if (!fx) { fprintf(stderr, "cannot read %s\n", path); return 2; }
+        const float *pixels = fx;
+        const int32_t *pos = (const int32_t *)(fx + (size_t)n_patch * p_dim);
+        const float *ref = (const float *)(pos + (size_t)n_patch * 2);
+        float *gpu = malloc(sizeof(float) * 768);
+        float *cpu = malloc(sizeof(float) * 768);
+        double tcpu = now_ms();
+        if (e2_text_image_embed(m, ids, n_ids, pixels, pos, n_patch, cpu) ||
+            !e2_test_unit("CPU caption reference", cpu, 768) ||
+            !e2_test_match("CPU caption reference", cpu, ref, 768, 0.999)) {
+            fprintf(stderr, "CPU reference failed: %s\n", e2_last_error());
+            free(gpu); free(cpu); free(fx); free(ids);
+            e2_hip_destroy(g); e2_free(m);
+            return 1;
+        }
+        tcpu = now_ms() - tcpu;
+        double best = 1e18, samples[3];
+        int checked = 0;
+        for (int r = 0; r < 3; r++) {
+            const double t = now_ms();
+            if (e2_hip_text_image_embed(g, ids, n_ids, pixels, pos, n_patch, gpu)) {
+                fprintf(stderr, "hip: %s\n", e2_hip_last_error());
+                failures++;
+                break;
+            }
+            const double d = now_ms() - t;
+            if (!e2_test_unit("image+caption", gpu, 768) ||
+                !e2_test_match("image+caption", gpu, ref, 768, 0.999) ||
+                !e2_test_match("caption GPU vs CPU", gpu, cpu, 768, 0.999)) {
+                failures++;
+                break;
+            }
+            samples[checked++] = d;
+            if (d < best) best = d;
+        }
+        e2_test_timing(samples, checked);
+        printf("image+caption  %d ids      gpu %8.2f ms  cos(gpu,ref) %.6f  cos(gpu,cpu) %.6f  "
+               "cos(cpu,ref) %.6f  (cpu %.1f ms)\n",
+               n_ids, best, cosine(gpu, ref, 768), cosine(gpu, cpu, 768), cosine(cpu, ref, 768),
+               tcpu);
+        if (cosine(gpu, ref, 768) < 0.999 || cosine(gpu, cpu, 768) < 0.999) failures++;
+        free(gpu);
+        free(cpu);
+        free(fx);
+        free(ids);
+    }
+
+    printf(failures ? "FAIL (%d)\n" : "ok\n", failures);
+    e2_hip_destroy(g);
+    e2_free(m);
+    return failures ? 1 : 0;
+}

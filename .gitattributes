@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.bin -text
+*.f32 -text
+*.e8cq -text
+*.png binary
+*.jpg binary
+*.webp binary
+*.hip text
+*.cl text

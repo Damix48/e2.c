@@ -36,13 +36,14 @@ int e2_text_embed_batch(e2_model *m, const int32_t *ids, const uint8_t *valid,
                         int batch, int seq_len, float *out);
 
 /* Image: pre-patchified pixels -> 768d unit vector.
- * pixels: (n_patches, patch_dim=768) row-major, 16x16x3 patches flattened by the HF image processor;
+ * pixels: finite values in [0,1], (n_patches, patch_dim=768) row-major, 16x16x3 patches flattened by the HF image processor;
  * position_ids: (n_patches, 2) int32, (-1,-1) marks padding (stripped, as the model does). */
 int e2_image_embed(e2_model *m, const float *pixels, const int32_t *position_ids, int n_patches, float *out768);
 
 /* Audio: 16 kHz mono PCM in [-1,1], n_samples of it -> 768d unit vector. Runs the audio tower, then
  * the text tower over <bos> <|audio> <|audio|>xN <audio|> <eos>. Up to 30 s (750 soft tokens); the
- * sequence is not padded, so n_samples only has to be the real length. */
+ * sequence is not padded, so n_samples only has to be the real length (at least 161 samples).
+ * Longer clips are truncated to the first 30 s, matching the reference processor. */
 int e2_audio_embed(e2_model *m, const float *pcm, int n_samples, float *out768);
 
 /* Text + audio: the text's `<|audio|>` placeholders already expanded to <|audio> + N soft slots +
@@ -127,7 +128,8 @@ int e2_image_soft_tokens(int n_patches);
 /* Introspection (used by the tests and the benchmark). */
 void e2_info(const e2_model *m);
 
-/* Last error message, or "" if the last call succeeded. */
+/* Last load/encode/preprocess/embed error, or "" after a successful such call.
+ * Free, info and pure size/format queries leave it unchanged. Not thread-safe. */
 const char *e2_last_error(void);
 
 #endif /* E2_H */

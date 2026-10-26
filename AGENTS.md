@@ -214,7 +214,7 @@ Each of these cost real debugging time and none of them was caught by an ordinar
 `docs/llms/` holds a local, unpublished corpus: the long design/performance write-up, an external
 architecture review, the unresolved Intel GPU investigation, and the benchmark runbook. It is ignored
 by git and absent from a clone, so do not link to it from committed files. Everything a reader of this
-repository needs is in `README.md`, `PERFORMANCE.md`, `AGENTS.md`, `tools/README.md` and
+repository needs is in `README.md`, `PERFORMANCE.md`, `HARDWARE.md`, `AGENTS.md`, `tools/README.md` and
 `tests/fixtures/README.md`.
 
 # License

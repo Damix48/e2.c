@@ -39,15 +39,16 @@ all:text-image-audio:e2_test_audio:"
 printf '%-38s %10s  %-32s %s\n' FILE SIZE MD5 VERIFY
 failed=0
 manifest="$OUT/manifest.txt"
-: >"$manifest"
+stage=$(mktemp -d "$OUT/.export.XXXXXX")
+trap 'rm -rf "$stage"' EXIT HUP INT TERM
+: >"$stage/manifest.txt"
+: >"$stage/manifest.sha256"
 
 for combo in $COMBOS; do
     IFS=':' read -r towers slug test_bin test_args <<EOF
 $combo
 EOF
-    file="$OUT/$PREFIX-$slug.e8cq"
-
-    rm -f "$file"
+    file="$stage/$PREFIX-$slug.e8cq"
     if ! E2_Q8_TOWERS="$towers" E2_Q8_WRITE="$file" "$BIN" "$MODEL" >/dev/null; then
         echo "  $slug: export FAILED" >&2
         failed=1
@@ -57,7 +58,8 @@ EOF
     md5=$(md5sum "$file" | cut -d' ' -f1)
 
     verify="-"
-    if [ "${E2_SKIP_VERIFY:-0}" != 1 ] && [ -x "$BUILD/$test_bin" ] && [ -d "$FIXTURES" ]; then
+    if [ "${E2_SKIP_VERIFY:-0}" != 1 ]; then
+        [ -x "$BUILD/$test_bin" ] && [ -d "$FIXTURES" ] || die "verification requires $BUILD/$test_bin and $FIXTURES"
         # read the cache back and run the fixture test that exercises this shape
         if E2_Q8_READ="$file" "$BUILD/$test_bin" "$MODEL" "$FIXTURES" $test_args >"$OUT/$slug.verify.log" 2>&1; then
             verify="PASS ($test_bin${test_args:+ $test_args})"
@@ -68,10 +70,15 @@ EOF
     fi
 
     printf '%-38s %10s  %-32s %s\n' "$(basename "$file")" "$bytes" "$md5" "$verify"
-    printf '%s  %s  %s\n' "$md5" "$bytes" "$(basename "$file")" >>"$manifest"
+    case "$verify" in FAIL*) continue ;; esac
+    printf '%s  %s  %s\n' "$md5" "$bytes" "$(basename "$file")" >>"$stage/manifest.txt"
+    (cd "$stage" && sha256sum "$(basename "$file")") >>"$stage/manifest.sha256"
 done
 
+[ "$failed" = 0 ] || die "at least one export failed; previous models unchanged"
+for file in "$stage"/*.e8cq; do mv -f "$file" "$OUT/"; done
+mv -f "$stage/manifest.txt" "$manifest"
+mv -f "$stage/manifest.sha256" "$OUT/manifest.sha256"
 echo
-echo "manifest: $manifest   (md5, bytes, file - publish it next to the files)"
-[ "$failed" = 0 ] || die "at least one export failed"
-echo "use one with: E2_Q8_READ=$OUT/$PREFIX-text.e8cq ./$BUILD/e2_test <model_dir> tests/fixtures"
+echo "manifests: $manifest (legacy), $OUT/manifest.sha256 (required for downloads)"
+echo "use one with: E2_Q8_READ=$OUT/$PREFIX-text.e8cq $BUILD/e2_test <model_dir> tests/fixtures"

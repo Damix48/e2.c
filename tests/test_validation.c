@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "e2.h"
+#include "../src/model.h" /* inject a numeric failure without modifying mapped weights */
 #ifdef E2_TEST_GPU
 #include "e2gpu.h"
 #endif
@@ -71,7 +72,7 @@ static void rejected_n(const char *what, int rc, const char *err, int n) {
 /* A valid run has to produce a unit vector: "valid data unchanged" at the API boundary, without
  * pinning the exact numbers (the fixtures do that). */
 static void accepted(const char *what, int rc, const char *err) {
-    if (rc != 0) {
+    if (rc != 0 || err[0]) {
         printf("  FAIL %s: rejected (\"%s\")\n", what, err);
         failures++;
         return;
@@ -103,7 +104,7 @@ static int grid_positions(int32_t *pos, int k) {
     return n;
 }
 
-static void cpu_sections(e2_model *m, const float *pixels, int32_t *pos) {
+static void cpu_sections(e2_model *m, float *pixels, int32_t *pos) {
     printf("model and token ids\n");
     grid_positions(pos, 3);
     REJECTED("image NULL model", 768, e2_image_embed(NULL, pixels, pos, 9, out));
@@ -161,6 +162,14 @@ static void cpu_sections(e2_model *m, const float *pixels, int32_t *pos) {
     }
     REJECTED("one patch per pool group", 768, e2_image_embed(m, pixels, pos, N_PATCHES_MAX, out));
 
+    printf("numeric image boundaries\n");
+    grid_positions(pos, 3);
+    const float invalid[] = { NAN, INFINITY, -INFINITY, -0.01f, 1.01f };
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        float saved = pixels[0]; pixels[0] = invalid[i];
+        REJECTED("nonfinite/out-of-range image pixel", 768, e2_image_embed(m, pixels, pos, 9, out));
+        pixels[0] = saved;
+    }
     printf("valid input still runs\n");
     const int np = grid_positions(pos, 3);
     out_fill(768);
@@ -177,12 +186,32 @@ static void cpu_sections(e2_model *m, const float *pixels, int32_t *pos) {
     printf("audio\n");
     REJECTED("audio NULL pcm", 768, e2_audio_embed(m, NULL, 3200, out));
     REJECTED("audio zero samples", 768, e2_audio_embed(m, pixels, 0, out));
+    REJECTED("audio too short", 768, e2_audio_embed(m, pixels, 160, out));
     rejected_n("audio NULL out", e2_audio_embed(m, pixels, 3200, NULL), e2_last_error(), 0);
     float pcm[3200];
     for (int i = 0; i < 3200; i++)
         pcm[i] = 0.5f * sinf(2.0f * 3.14159265358979f * 440.0f * (float)i / 16000.0f);
+    const float bad_pcm[] = { NAN, INFINITY, -INFINITY, -1.01f, 1.01f };
+    for (size_t i = 0; i < sizeof bad_pcm / sizeof bad_pcm[0]; i++) {
+        pcm[0] = bad_pcm[i];
+        REJECTED("nonfinite/out-of-range PCM", 768, e2_audio_embed(m, pcm, 3200, out));
+        REJECTED("nonfinite text+audio PCM", 768,
+                 e2_text_audio_embed(m, (int32_t[]){2,1}, 2, pcm, 3200, out));
+    }
+    pcm[0] = 0.f;
     out_fill(768);
     accepted("audio 0.2 s sine", e2_audio_embed(m, pcm, 3200, out), e2_last_error());
+    if (m->use_int8) {
+        float bad_scale[768];
+        memcpy(bad_scale, m->q8_embed_proj.scale, sizeof bad_scale);
+        bad_scale[0] = NAN;
+        float *saved = m->q8_embed_proj.scale;
+        m->q8_embed_proj.scale = bad_scale;
+        REJECTED("nonfinite computed embedding", 768, e2_text_embed(m, (int32_t[]){2,1}, 2, out));
+        m->q8_embed_proj.scale = saved;
+    }
+    REJECTED("text bad geometry", 768, e2_text_embed(m, (int32_t[]){2,1}, 0, out));
+    accepted("text clears stale error", e2_text_embed(m, (int32_t[]){2,1}, 2, out), e2_last_error());
 }
 
 #ifdef E2_TEST_GPU

@@ -12,6 +12,10 @@
 
 #include "model.h"
 
+/* Implemented in validation.c, compiled without fast-math. */
+int e2_valid_floats(const float *p, size_t n, float lo, float hi);
+int e2_valid_embedding(const float *p);
+
 /* Ids index the embedding table directly, and a batched call gathers its padding rows too, so every
  * id in the block must be a vocabulary entry ("pad with any valid id"). */
 static inline int e2_valid_ids(const int32_t *ids, size_t n_ids, char *err, size_t errcap) {

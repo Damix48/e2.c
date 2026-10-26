@@ -21,6 +21,7 @@
 
 #include "model.h"
 #include "threads.h"
+#include "validation.h"
 
 /* E2_DUMP=<dir> writes raw f32 activations for bisecting against the PyTorch reference. */
 static void e2_dump(const char *name, const float *p, size_t n) {
@@ -475,13 +476,17 @@ static void layer_types_init(e2_model *m) {
     }
 }
 
-static void rope_init(e2_model *m) {
+static int rope_init(e2_model *m) {
     for (int t = 0; t < 2; t++) {
         int head_dim = (t == 0) ? 256 : 512;
         float theta = (t == 0) ? m->rope_theta_sliding : m->rope_theta_full;
         size_t n = (size_t)E2_MAX_SEQ * head_dim;
         m->rope_cos[t] = malloc(sizeof(float) * n);
         m->rope_sin[t] = malloc(sizeof(float) * n);
+        if (!m->rope_cos[t] || !m->rope_sin[t]) {
+            e2_set_error("oom: text RoPE tables");
+            return -1;
+        }
         for (int p = 0; p < E2_MAX_SEQ; p++) {
             float *c = m->rope_cos[t] + (size_t)p * head_dim;
             float *s = m->rope_sin[t] + (size_t)p * head_dim;
@@ -493,6 +498,7 @@ static void rope_init(e2_model *m) {
             }
         }
     }
+    return 0;
 }
 
 #define ATTN_ROWS 4 /* rows claimed per work item (see gemm_worker for why claiming beats a split) */
@@ -706,13 +712,15 @@ static void attention(e2_model *m, e2_layer *L, float *h, int B, int seq_len, e2
             /* probabilities for one head, all query rows: (S, S); only the bisection tooling wants
              * this, and it costs a serial (S,S) dot loop - see e2_dump */
             float *pr = malloc(sizeof(float) * (size_t)S * S);
-            for (int i = 0; i < S; i++) {
-                for (int j = 0; j < S; j++)
-                    pr[(size_t)i * S + j] = K->dot_f32(q + (size_t)i * GD, k + (size_t)j * L->kv_dim, (size_t)D);
-                K->softmax(pr + (size_t)i * S, S);
+            if (pr) {
+                for (int i = 0; i < S; i++) {
+                    for (int j = 0; j < S; j++)
+                        pr[(size_t)i * S + j] = K->dot_f32(q + (size_t)i * GD, k + (size_t)j * L->kv_dim, (size_t)D);
+                    K->softmax(pr + (size_t)i * S, S);
+                }
+                e2_dump("l0_probs_h0", pr, (size_t)S * S);
+                free(pr);
             }
-            e2_dump("l0_probs_h0", pr, (size_t)S * S);
-            free(pr);
         }
         {
             double ta = e2_now_ms();
@@ -811,12 +819,19 @@ static int text_forward(e2_model *m, int B, int seq_len, float *out) {
     gemm(m, w->emb, w->x, &m->q8_embed_proj, m->embed_proj, S, E2_EMBED_DIM, D, 0);
     e2_dump("emb_proj", w->emb, (size_t)S * E2_EMBED_DIM);
     for (int b = 0; b < B; b++) {
-        float *dst = out + (size_t)b * E2_EMBED_DIM;
+        float dst[E2_EMBED_DIM];
         e2_meanpool_f32(dst, w->emb + (size_t)b * seq_len * E2_EMBED_DIM,
                         seq_len, E2_EMBED_DIM, w->valid + (size_t)b * seq_len);
         int any = 0;
         for (int i = 0; i < seq_len; i++) any |= w->valid[b * seq_len + i];
-        if (any) e2_l2norm_f32(dst, E2_EMBED_DIM);
+        if (any) {
+            e2_l2norm_f32(dst, E2_EMBED_DIM);
+            if (!e2_valid_embedding(dst)) {
+                e2_set_error("text inference produced an invalid embedding");
+                return -1;
+            }
+        }
+        memcpy(out + (size_t)b * E2_EMBED_DIM, dst, sizeof dst);
     }
     prof_flush(S);
     return 0;
@@ -824,6 +839,7 @@ static int text_forward(e2_model *m, int B, int seq_len, float *out) {
 
 /* Image/audio callers supply already-spliced, all-valid embeddings. */
 int e2_text_embed_embeds(e2_model *m, const float *embeds, int S, float *out768) {
+    e2_set_error("");
     if (!m || !embeds || !out768) { e2_set_error("null text input"); return -1; }
     if (S <= 0 || S > E2_MAX_SEQ) { e2_set_error("sequence length %d out of range", S); return -1; }
     if (!m->ws.x) { e2_set_error("workspace not allocated"); return -1; }
@@ -834,6 +850,7 @@ int e2_text_embed_embeds(e2_model *m, const float *embeds, int S, float *out768)
 
 int e2_text_embed_batch(e2_model *m, const int32_t *ids, const uint8_t *valid,
                         int batch, int seq_len, float *out) {
+    e2_set_error("");
     if (!m || !ids || !out) { e2_set_error("null text input"); return -1; }
     if (batch <= 0 || seq_len <= 0 || seq_len > E2_MAX_SEQ ||
         (size_t)batch > SIZE_MAX / (size_t)seq_len / sizeof(*ids) ||
@@ -857,7 +874,7 @@ int e2_text_embed_batch(e2_model *m, const int32_t *ids, const uint8_t *valid,
             e2_embed_token(m, ids[off + i], m->ws.x + (size_t)i * m->hidden);
             m->ws.valid[i] = valid ? valid[off + i] : 1;
         }
-        text_forward(m, n, seq_len, out + (size_t)b0 * E2_EMBED_DIM);
+        if (text_forward(m, n, seq_len, out + (size_t)b0 * E2_EMBED_DIM)) return -1;
         b0 += n;
     }
     return 0;
@@ -867,7 +884,7 @@ int e2_text_embed(e2_model *m, const int32_t *ids, int S, float *out768) {
     return e2_text_embed_batch(m, ids, NULL, 1, S, out768);
 }
 
-void e2_text_init(e2_model *m) {
+int e2_text_init(e2_model *m) {
     layer_types_init(m);
-    rope_init(m);
+    return rope_init(m);
 }

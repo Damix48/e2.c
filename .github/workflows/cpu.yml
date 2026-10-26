@@ -1,0 +1,60 @@
+name: CPU checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_release:
+        description: Run the checkpoint release gate on a trusted self-hosted CPU runner
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  portable:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {cc: gcc, codecs: AUTO, sanitizer: false}
+          - {cc: clang, codecs: OFF, sanitizer: false}
+          - {cc: gcc, codecs: OFF, sanitizer: true}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          SANITIZER: ${{ matrix.sanitizer }}
+          CODECS: ${{ matrix.codecs }}
+        run: |
+          flags=''
+          if [ "$SANITIZER" = true ]; then
+            flags='-g -fsanitize=address,undefined -fno-omit-frame-pointer'
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DE2_WITH_GPU=OFF -DE2_WITH_HIP=OFF \
+            -DE2_WITH_PNG="$CODECS" -DE2_WITH_JPEG="$CODECS" -DE2_WITH_WEBP="$CODECS" \
+            -DCMAKE_C_FLAGS="$flags" -DCMAKE_EXE_LINKER_FLAGS="$flags"
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure
+        env:
+          E2_THREADS: 2
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+  checkpoint-release:
+    if: github.event_name == 'workflow_dispatch' && inputs.full_release
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full CPU release gate
+        env:
+          E2_MODEL_DIR: ${{ vars.E2_MODEL_DIR }}
+        run: tools/check_cpu.sh "${E2_MODEL_DIR:?Set repository variable E2_MODEL_DIR to the local checkpoint}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-release-logs
+          path: |
+            build-release-check/**/Testing/Temporary/LastTest.log
+            build-release-check/models/*.log
+            build-release-check/models/manifest*

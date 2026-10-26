@@ -856,7 +856,7 @@ static void rope_tables(e2_vision *v, const int32_t *pos, const int *order, int 
 /* ---------------------------------------------------------------- load */
 static float *vnorm_weight(e2_model *m, const char *name, int64_t n) {
     float *dst = malloc(sizeof(float) * (size_t)n);
-    if (!dst) return NULL;
+    if (!dst) { e2_set_error("oom: %s", name); return NULL; }
     if (e2_copy_bf16_f32(m, name, n, dst)) { free(dst); return NULL; }
     return dst;
 }
@@ -880,7 +880,7 @@ int e2_vision_init(e2_model *m) {
     v->patch_proj = e2_tensor_bf16(m, "vision_tower.patch_embedder.input_proj.weight", 2, dp);
     v->pos_table = e2_tensor_bf16(m, "vision_tower.patch_embedder.position_embedding_table", 3, dpos);
     v->embed_proj = e2_tensor_bf16(m, "embed_vision.embedding_projection.weight", 2, dep);
-    if (!e2_weight_ok(v->patch_proj) || !e2_weight_ok(v->pos_table) || !e2_weight_ok(v->embed_proj))
+    if (!e2_weight_ok(v->patch_proj) || !v->pos_table || !e2_weight_ok(v->embed_proj))
         return -1;
 
     char n_[13][112];
@@ -1067,6 +1067,7 @@ static int vision_tower(e2_model *m, const float *pixels, const int32_t *positio
                 /* E2_DUMP: keep the materialised (P,P) form, which is what the bisection fixtures
                  * (tools/dump_image_fixture.py) compare against. Dev path only. */
                 float *full = malloc(sizeof(float) * (size_t)P * P);
+                if (!full) { e2_set_error("oom: vision diagnostics"); return -1; }
                 sgemm_nn(full, P, v->q + (size_t)h * HD, D, v->kt, P, P, P, HD);
                 if (l == 0 && h == 0) vdump("l0_scores", full, (size_t)P * P);
                 vsoftmax(full, P, P);
@@ -1179,6 +1180,10 @@ static int image_soft_tokens(e2_model *m, const float *pixels, const int32_t *po
         e2_set_error("%s", verr);
         return -1;
     }
+    if (!e2_valid_floats(pixels, (size_t)n_patches * E2_V_PATCH, 0.f, 1.f)) {
+        e2_set_error("image pixels must be finite and in [0,1]");
+        return -1;
+    }
     const int n = vision_tower(m, pixels, position_ids, n_patches);
     if (n < 0) return -1;
     const double t0 = g_vprof_on ? vnow() : 0;
@@ -1204,6 +1209,7 @@ int e2_vision_soft_tokens(e2_model *m, const float *pixels, const int32_t *posit
 }
 
 int e2_image_embed(e2_model *m, const float *pixels, const int32_t *position_ids, int n_patches, float *out768) {
+    e2_set_error("");
     if (vision_args_ok(m, pixels, position_ids, out768)) return -1;
     e2_vision *v = m->vision;
     if (!v) { e2_set_error("vision tower not loaded"); return -1; }
@@ -1231,6 +1237,7 @@ int e2_image_embed(e2_model *m, const float *pixels, const int32_t *position_ids
 
 int e2_text_image_embed(e2_model *m, const int32_t *ids, int n_ids, const float *pixels,
                         const int32_t *position_ids, int n_patches, float *out768) {
+    e2_set_error("");
     char verr[256];
     if (vision_args_ok(m, pixels, position_ids, out768)) return -1;
     e2_vision *v = m->vision;

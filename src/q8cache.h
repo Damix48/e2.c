@@ -21,7 +21,9 @@ enum { Q8C_BF16 = 1, Q8C_F32 = 2, Q8C_Q8W = 3 };
 int q8c_write_open(const char *path);
 int q8c_begin(const char *name, int kind, int ndim, const int64_t *dims);
 int q8c_bytes(const void *p, size_t n);
+/* Close commits by atomic rename; abort leaves an existing destination untouched. */
 int q8c_write_close(void);
+void q8c_write_abort(void);
 /* Keep a tensor's bytes aside and write them at close time; q8c_drop cancels one by name. The
  * loader fetches every int8 weight in bf16 first (to quantize it), so without this the cache would
  * carry all 1.1 GB of bf16 weights as well as the quantized ones. */

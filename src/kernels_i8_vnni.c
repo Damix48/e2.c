@@ -71,7 +71,7 @@ void e2_i8_attn_gemm_vnni(float *C, int ldc, const uint8_t *A, int lda, const fl
                         (const __m256i *)(Bp + ((size_t)q * Np + n0) * 4));
                     for (int i = 0; i < mm; i++)
                         acc[i] = _mm256_dpbusd_epi32(
-                            acc[i], _mm256_set1_epi32(*(const int32_t *)(ap[i] + off)), bv);
+                            acc[i], _mm256_set1_epi32(e2_load_i32_tail(ap[i] + off, K - q * 4)), bv);
                 }
                 const __m256i zp = _mm256_slli_epi32(
                     _mm256_loadu_si256((const __m256i *)(bz + (size_t)b * Np + n0)), 7);
@@ -127,7 +127,7 @@ static void gemm_cols8(float *y, const int8_t *qa, const float *a_scales, const 
                 const __m256i wv = _mm256_loadu_si256((const __m256i *)wpq);
                 for (int i = 0; i < MR; i++)
                     acc[i] = _mm256_dpbusd_epi32(
-                        acc[i], _mm256_set1_epi32(*(const int32_t *)(ap[i] + off)), wv);
+                        acc[i], _mm256_set1_epi32(e2_load_i32(ap[i] + off)), wv);
             }
             /* one 8-lane zero-point and eight activation scales for the block */
             const __m256i zp = _mm256_slli_epi32(
@@ -159,7 +159,7 @@ static void gemm_cols8(float *y, const int8_t *qa, const float *a_scales, const 
             for (int q = 0, off = 0; q < NQ4; q++, off += 4, wpq += 32) {
                 const __m256i wv = _mm256_loadu_si256((const __m256i *)wpq);
                 acc = _mm256_dpbusd_epi32(
-                    acc, _mm256_set1_epi32(*(const int32_t *)(ap + off)), wv);
+                    acc, _mm256_set1_epi32(e2_load_i32(ap + off)), wv);
             }
             const __m256i zp = _mm256_slli_epi32(
                 _mm256_loadu_si256((const __m256i *)(bs + (size_t)b * NP)), 7);

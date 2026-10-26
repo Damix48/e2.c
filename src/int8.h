@@ -43,6 +43,20 @@
 #define E2_INT8_H
 
 #include <stdint.h>
+#include <string.h>
+
+/* Packed byte operands need not have int32 alignment (e.g. attention rows of width 9). */
+static inline int32_t e2_load_i32(const void *p) {
+    int32_t v;
+    memcpy(&v, p, sizeof v);
+    return v;
+}
+static inline int32_t e2_load_i32_tail(const void *p, int n) {
+    if (n >= 4) return e2_load_i32(p);
+    int32_t v = 0;
+    memcpy(&v, p, (size_t)n);
+    return v;
+}
 
 /* Activation/weight quantization block. The kernel converts each block's int32 dot to float and
  * applies the scale, so this is a direct uop/throughput knob: 32 keeps the most fidelity, 128 is

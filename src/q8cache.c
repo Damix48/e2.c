@@ -40,6 +40,7 @@ const char *q8c_error(void) { return g_err; }
 
 /* ---------------------------------------------------------------- writer */
 static FILE *w_f;
+static char *w_path, *w_tmp;
 static uint64_t w_off;
 static q8c_entry *w_idx;
 static size_t w_n, w_cap;
@@ -59,10 +60,21 @@ static size_t w_pend_n, w_pend_cap;
 
 int q8c_write_open(const char *path) {
     if (w_f) { snprintf(g_err, sizeof g_err, "cache already open for writing"); return -1; }
-    w_f = fopen(path, "wb");
-    if (!w_f) { snprintf(g_err, sizeof g_err, "cannot write %s", path); return -1; }
+    size_t n = strlen(path) + 1;
+    w_path = malloc(n); w_tmp = malloc(n + 16);
+    if (w_tmp) w_tmp[0] = 0;
+    if (!w_path || !w_tmp) { snprintf(g_err, sizeof g_err, "oom: cache path"); q8c_write_abort(); return -1; }
+    memcpy(w_path, path, n);
+    snprintf(w_tmp, n + 16, "%s.tmp.XXXXXX", path);
+    int fd = mkstemp(w_tmp);
+    if (fd < 0 || !(w_f = fdopen(fd, "wb"))) {
+        if (fd >= 0) close(fd);
+        else w_tmp[0] = 0;
+        snprintf(g_err, sizeof g_err, "cannot write %s", path);
+        q8c_write_abort(); return -1;
+    }
     const uint32_t hdr[4] = { Q8C_MAGIC, Q8C_VERSION, 0, 0 };
-    if (fwrite(hdr, sizeof hdr, 1, w_f) != 1) { fclose(w_f); w_f = NULL; return -1; }
+    if (fwrite(hdr, sizeof hdr, 1, w_f) != 1) { q8c_write_abort(); return -1; }
     w_off = Q8C_INDEX_OFF;
     return 0;
 }
@@ -190,13 +202,23 @@ int q8c_write_close(void) {
         if (w_n && fwrite(w_idx, sizeof *w_idx, w_n, w_f) != w_n) rc = -1;
         if (fseek(w_f, 0, SEEK_SET) || fwrite(hdr, sizeof hdr, 1, w_f) != 1) rc = -1;
     }
+    if (fflush(w_f) || fsync(fileno(w_f))) rc = -1;
     if (fclose(w_f)) rc = -1;
     w_f = NULL;
-    free(w_idx);
-    w_idx = NULL;
-    w_n = w_cap = 0;
-    w_cur = NULL;
+    if (!rc && rename(w_tmp, w_path)) rc = -1;
+    if (rc) snprintf(g_err, sizeof g_err, "cache write/commit failed");
+    q8c_write_abort();
     return rc;
+}
+
+void q8c_write_abort(void) {
+    if (w_f) fclose(w_f);
+    w_f = NULL;
+    if (w_tmp && w_tmp[0]) unlink(w_tmp);
+    free(w_tmp); free(w_path);
+    w_tmp = w_path = NULL;
+    free(w_pend); w_pend = NULL; w_pend_n = w_pend_cap = 0;
+    free(w_idx); w_idx = NULL; w_n = w_cap = 0; w_cur = NULL;
 }
 
 /* ---------------------------------------------------------------- reader */

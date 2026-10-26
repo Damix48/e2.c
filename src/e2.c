@@ -10,7 +10,7 @@
 #include "model.h"
 #include "q8cache.h"
 
-void e2_text_init(e2_model *m);
+int e2_text_init(e2_model *m);
 int e2_vision_init(e2_model *m);
 void e2_vision_free(e2_vision *v);
 int e2_audio_init(e2_model *m);
@@ -111,7 +111,7 @@ int e2_q8w_load(e2_model *m, e2_q8w *q, const char *name, const uint16_t *w, int
         }
         return 0;
     }
-    if (e2_q8w_from_bf16(q, w, N, K)) return -1;
+    if (e2_q8w_from_bf16(q, w, N, K)) { e2_set_error("oom: quantizing %s", name); return -1; }
     if (g_q8_write) {
         q8c_drop(name); /* the bf16 copy the loader just fetched is not needed in the cache */
         if (q8c_put_q8w(name, q)) { e2_set_error("cache write: %s", q8c_error()); return -1; }
@@ -241,6 +241,7 @@ static int parse_q8_towers(void) {
 }
 
 e2_model *e2_load(const char *model_dir) {
+    g_err[0] = 0;
     if (g_live) {
         e2_set_error("a model is already loaded: one live model per process, call e2_free first");
         return NULL;
@@ -299,7 +300,7 @@ e2_model *e2_load(const char *model_dir) {
         e2_set_error("expected %d text layers, found %d", E2_MAX_LAYERS, m->n_layers);
         goto fail;
     }
-    e2_text_init(m);
+    if (e2_text_init(m)) goto fail;
 
     /* fixed shapes: every text-tower dimension is known here, so the checkpoint and the packed cache
      * are checked against all of it (no wildcard second dimension) */
@@ -309,7 +310,7 @@ e2_model *e2_load(const char *model_dir) {
     m->ple_model_proj = e2_tensor_bf16(m, "language_model.ple.per_layer_model_projection.weight", 2, d_ple);
     const int64_t d_proj[2] = { E2_EMBED_DIM, m->hidden };
     m->embed_proj = e2_tensor_bf16(m, "language_model.embedding_projection.weight", 2, d_proj);
-    if (!e2_weight_ok(m->embed_tokens) || !e2_weight_ok(m->ple_model_proj) ||
+    if (!m->embed_tokens || !e2_weight_ok(m->ple_model_proj) ||
         !e2_weight_ok(m->embed_proj))
         goto fail;
     m->ple_proj_norm = copy_bf16_f32(m, "language_model.ple.per_layer_projection_norm.weight", m->ple_dim);
@@ -412,7 +413,7 @@ e2_model *e2_load(const char *model_dir) {
     return m;
 
 fail:
-    q8c_write_close(); /* a partial cache is useless; the reader reports the missing tensor */
+    q8c_write_abort(); /* never publish a partial model or replace a working cache */
     q8c_read_close();
     g_q8_read = g_q8_write = 0; /* no cache is open any more: e2_q8_is_read/write must say so */
     model_release(m);

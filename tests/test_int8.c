@@ -63,7 +63,8 @@ static int check(int M, int N, int K, int outliers) {
     for (int m = 0; m < M; m++)
         for (int o = 0; o < outliers && o < K; o++) x[(size_t)m * K + (o * 37) % K] *= 30.0f;
 
-    int8_t *qa = malloc((size_t)M * K);
+    int8_t *qa_base = malloc((size_t)M * K + 1);
+    int8_t *qa = qa_base + 1; /* exercise packed loads without int32 alignment */
     float *ascales = calloc((size_t)M * ((K + E2_I8_BLOCK - 1) / E2_I8_BLOCK) + 8, sizeof(float));
     e2_i8_quantize(qa, ascales, x, M, K, -INFINITY, INFINITY);
 
@@ -159,9 +160,41 @@ static int check(int M, int N, int K, int outliers) {
     double cos = dot / (sqrt(na) * sqrt(nb));
     printf("M=%-4d N=%-6d K=%-5d outliers=%-3d  int8 vs float: cos=%.6f  row rel err=%.2e  %s\n",
            M, N, K, outliers, cos, maxrow, (cos > 0.9995 && !kernel_bad) ? "OK" : "BAD");
-    free(x); free(w); free(y); free(ref); free(qa); free(ascales);
+    free(x); free(w); free(y); free(ref); free(qa_base); free(ascales);
     e2_q8w_free(&qw);
     return cos > 0.9995 && !kernel_bad;
+}
+
+static int check_attention_tail(int K) {
+    if (!e2_i8_attn_gemm) return 0;
+    const int M = 2, N = 8, Np = 16, Kp = (K + 3) / 4 * 4;
+    const int nb = (K + E2_I8_BLOCK - 1) / E2_I8_BLOCK;
+    uint8_t *base = malloc((size_t)M * K + 1);
+    uint8_t *b = calloc((size_t)Np * Kp, 1);
+    float *asc = malloc(sizeof(float) * M * nb), bsc[16], out[16];
+    int32_t *bz = malloc(sizeof(int32_t) * nb * Np);
+    if (!base || !b || !asc || !bz) exit(2);
+    uint8_t *a = base + 1;
+    for (int i = 0; i < M * K; i++) a[i] = (uint8_t)(128 + i % 37);
+    for (int i = 0; i < M * nb; i++) asc[i] = 1;
+    for (int n = 0; n < Np; n++) {
+        bsc[n] = 1;
+        for (int k = 0; k < K; k++) b[((size_t)(k / 4) * Np + n) * 4 + k % 4] = 1;
+        for (int block = 0; block < nb; block++) {
+            int left = K - block * E2_I8_BLOCK;
+            bz[block * Np + n] = left < E2_I8_BLOCK ? left : E2_I8_BLOCK;
+        }
+    }
+    e2_i8_attn_gemm(out, N, a, K, asc, b, bsc, bz, M, Np, N, K);
+    int bad = 0;
+    for (int m = 0; m < M; m++) {
+        float expected = 0;
+        for (int k = 0; k < K; k++) expected += a[m * K + k] - 128;
+        for (int n = 0; n < N; n++) if (!isfinite(out[m*N+n]) || fabsf(out[m*N+n] - expected) > 1e-4f) bad = 1;
+    }
+    free(base); free(b); free(asc); free(bz);
+    printf("unaligned attention K=%d, exact-sized activation tail: %s\n", K, bad ? "FAIL" : "OK");
+    return bad;
 }
 
 int main(void) {
@@ -175,6 +208,8 @@ int main(void) {
     fails += !check(15, 512, 512, 8);
     fails += !check(196, 128, 2048, 16);
     fails += !check(7, 33, 512, 3); /* odd M, odd N */
+    const int tails[] = {1,3,9,129};
+    for (int i = 0; i < 4; i++) fails += check_attention_tail(tails[i]);
     printf("%s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }

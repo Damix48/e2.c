@@ -57,7 +57,7 @@ void e2_i8_attn_gemm_avx512(float *C, int ldc, const uint8_t *A, int lda, const 
                     for (int i = 0; i < mm; i++)
                         acc[i] = _mm512_dpbusd_epi32(
                             acc[i],
-                            _mm512_set1_epi32(*(const int32_t *)(A + (size_t)(m0 + i) * lda + q * 4)),
+                            _mm512_set1_epi32(e2_load_i32_tail(A + (size_t)(m0 + i) * lda + q * 4, K - q * 4)),
                             bv);
                 }
                 const __m512i zp =
@@ -108,7 +108,7 @@ static int gemm_cols16_mr8(float *y, const int8_t *qa, const float *a_scales, co
                     _mm256_loadu_si256((const __m256i *)wpq1), 1);
                 for (int i = 0; i < 8; i++)
                     acc[i] = _mm512_dpbusd_epi32(
-                        acc[i], _mm512_set1_epi32(*(const int32_t *)(ap[i] + off)), wv);
+                        acc[i], _mm512_set1_epi32(e2_load_i32(ap[i] + off)), wv);
             }
             const __m512i zp = _mm512_slli_epi32(
                 _mm512_loadu_si512((const void *)(w->bsq + (size_t)b * NP + n)), 7);
@@ -151,7 +151,7 @@ static void gemm_cols8_256(float *y, const int8_t *qa, const float *a_scales, co
                 const __m256i wv = _mm256_loadu_si256((const __m256i *)wpq);
                 for (int i = 0; i < MR8; i++)
                     acc[i] = _mm256_dpbusd_epi32(
-                        acc[i], _mm256_set1_epi32(*(const int32_t *)(ap[i] + off)), wv);
+                        acc[i], _mm256_set1_epi32(e2_load_i32(ap[i] + off)), wv);
             }
             const __m256i zp = _mm256_slli_epi32(
                 _mm256_loadu_si256((const __m256i *)(w->bsq + (size_t)b * NP + n)), 7);
@@ -182,7 +182,7 @@ static void gemm_cols8_256(float *y, const int8_t *qa, const float *a_scales, co
             const int8_t *wpq = wp + (size_t)b * NQ4 * 32;
             for (int q = 0, off = 0; q < NQ4; q++, off += 4, wpq += 32) {
                 const __m256i wv = _mm256_loadu_si256((const __m256i *)wpq);
-                acc = _mm256_dpbusd_epi32(acc, _mm256_set1_epi32(*(const int32_t *)(ap + off)), wv);
+                acc = _mm256_dpbusd_epi32(acc, _mm256_set1_epi32(e2_load_i32(ap + off)), wv);
             }
             const __m256i zp = _mm256_slli_epi32(
                 _mm256_loadu_si256((const __m256i *)(w->bsq + (size_t)b * NP + n)), 7);
@@ -241,7 +241,7 @@ static int gemm_cols32_mr4(float *y, const int8_t *qa, const float *a_scales, co
                     _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)q2)),
                     _mm256_loadu_si256((const __m256i *)q3), 1);
                 for (int i = 0; i < 4; i++) {
-                    const __m512i av = _mm512_set1_epi32(*(const int32_t *)(ap[i] + off));
+                    const __m512i av = _mm512_set1_epi32(e2_load_i32(ap[i] + off));
                     acc[i][0] = _mm512_dpbusd_epi32(acc[i][0], av, wv0);
                     acc[i][1] = _mm512_dpbusd_epi32(acc[i][1], av, wv1);
                 }

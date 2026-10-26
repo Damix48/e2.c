@@ -197,6 +197,15 @@ int main(void) {
     CHECK(q8c_write_close() == 0, "double close is not a no-op");
     unlink(bad);
 
+    /* Aborting a replacement must preserve the old artifact, including for mapped readers. */
+    CHECK(q8c_read_open(valid) == 0, "map before replacement");
+    CHECK(q8c_write_open(valid) == 0, "replacement writer");
+    CHECK(q8c_put_q8w(NAME_Q8W, &src) == 0, "partial replacement");
+    q8c_write_abort();
+    CHECK(q8c_kind_of(NAME_BF16) == Q8C_BF16, "live mapping changed");
+    q8c_read_close();
+    check_roundtrip(valid, &src);
+
     /* ---- one record per tensor: a repeated name is refused and the file keeps exactly one */
     snprintf(bad, sizeof bad, "%s/dup.e8cq", dir);
     CHECK(q8c_write_open(bad) == 0, "writer open for the duplicate case");

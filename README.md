@@ -67,8 +67,9 @@ tokens a clip becomes (one per 40 ms). `E2_MAX_PATCHES` is 2520 and the sequence
 
 ## Features
 
-* **All three towers verified** against the fp32 ONNX/PyTorch reference: R@1 agreement to 0.9994-0.9998
-  cosine on every fixture (see [PERFORMANCE.md](PERFORMANCE.md#fidelity)).
+* **Short fixtures for all three towers verified** against the fp32 ONNX/PyTorch reference:
+  0.9994-0.9998 cosine. Long steady-tone audio has a lower int8 floor; see
+  [PERFORMANCE.md](PERFORMANCE.md#fidelity) and [production acceptance](PRODUCTION.md).
 * **int8 weights and activations** in a quad-interleaved layout (`[N/8][K/4][8][4]`) so one 32-byte
   load covers eight output rows, dispatched at runtime to AVX512-VNNI (`vpdpbusd`), AVX-VNNI, AVX2
   (`vpmaddubsw`) or a scalar fallback. The scalar path always compiles.
@@ -118,7 +119,9 @@ case: `e2_test`, `e2_test_image`, `e2_test_audio`, `e2_test_pre`, `e2_text_bench
 
 Each backend is dropped automatically when its toolchain is missing, so a plain `cmake -B build` on a
 CPU-only machine still builds. The int8 path needs AVX2 at runtime; on a CPU without it the engine
-falls back to bf16 (`E2_INT8=0` forces that path anywhere).
+falls back to bf16 (`E2_INT8=0` forces that path anywhere). [HARDWARE.md](HARDWARE.md) has the full
+CPU/GPU matrix - which parts get which kernel, what a non-x86 port needs - and the compute libraries
+that were measured and rejected.
 
 ## Testing
 
@@ -159,6 +162,11 @@ The second tier needs the checkpoint (`-DE2_MODEL_DIR=...`) and compares against
 Assertions and finite-value checks are compiled without `-ffast-math` and with `-UNDEBUG`, even in
 Release, so they stay real checks; the production kernels keep fast-math. Device tests skip with
 return code 77 when there is no device.
+
+For CPU deployment and release acceptance, see [PRODUCTION.md](PRODUCTION.md). Run
+`tools/check_cpu.sh <model_dir>` for the full checkpoint/sanitizer/cache gate. The long steady-tone
+audio corpus exposes a lower int8 fidelity floor (~0.987 cosine) than the short fixtures; do not treat
+the short-fixture 0.999 score as a universal audio accuracy guarantee.
 
 ## Performance
 
@@ -215,7 +223,7 @@ Generate them from a checkpoint - the export is deterministic, two exports of th
 md5-identical, and each file is read back and put through the fixture test for its own shape:
 
 ```bash
- tools/export_models.sh <model_dir> models/e2 build     # writes the four files + manifest.txt
+ tools/export_models.sh <model_dir> models/e2 build     # writes the four files + manifest.sha256 (and legacy manifest.txt)
 ```
 
 Or fetch the published copies (`HF_E2_REPO` overrides the repository id):

@@ -18,6 +18,7 @@
  * Not thread-safe: the BPE scratch lives in the tokenizer (one tokenizer per thread), like the rest
  * of the engine's call API.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -191,11 +192,20 @@ static long js_str(js *j, char *dst, size_t cap) {
 }
 
 static int js_int(js *j, long *out) {
-    char *end;
+    char token[32], *end;
     js_ws(j);
-    *out = strtol(j->p, &end, 10);
-    if (end == j->p) return jerr(j, "js_int");
-    j->p = end;
+    const char *p = j->p;
+    size_t n = 0;
+    if (p < j->end && *p == '-') token[n++] = *p++;
+    while (p < j->end && *p >= '0' && *p <= '9') {
+        if (n + 1 == sizeof token) return jerr(j, "js_int");
+        token[n++] = *p++;
+    }
+    token[n] = 0;
+    errno = 0;
+    *out = strtol(token, &end, 10);
+    if (end == token || *end || errno == ERANGE) return jerr(j, "js_int");
+    j->p = p;
     return 0;
 }
 
@@ -655,7 +665,7 @@ static int bpe(e2_tokenizer *t, int32_t *ids, int n) {
     int32_t pos, i;
     int k;
     if (n < 2) return n;
-    if (scratch_reserve(t, (size_t)n)) return -1;
+    if (scratch_reserve(t, (size_t)n)) { e2_set_error("oom: tokenizer scratch"); return -1; }
     for (i = 0; i < n; i++) {
         t->sym[i] = ids[i];
         t->prev[i] = i - 1;
@@ -693,32 +703,22 @@ static int bpe(e2_tokenizer *t, int32_t *ids, int n) {
 /* ---------------------------------------------------------------- encode */
 /* Returns 0 for a valid sequence, -1 for a bogus one (which is then passed through byte by byte). */
 static int utf8_decode(const char *p, const char *end, uint32_t *cp, int *len) {
-    unsigned char c = (unsigned char)*p;
-    if (c < 0x80) {
-        *cp = c;
-        *len = 1;
-        return 0;
+    if (p == end) return -1;
+    const unsigned char c = (unsigned char)*p;
+    const int n = c < 0x80 ? 1 : c >= 0xc2 && c <= 0xdf ? 2 :
+                  c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+    if (!n || end - p < n) return -1;
+    uint32_t v = c & (n == 1 ? 0x7f : n == 2 ? 0x1f : n == 3 ? 0x0f : 0x07);
+    for (int i = 1; i < n; i++) {
+        unsigned char b = (unsigned char)p[i];
+        if ((b & 0xc0) != 0x80) return -1;
+        v = (v << 6) | (b & 0x3f);
     }
-    if ((c & 0xE0) == 0xC0 && end - p >= 2) {
-        *cp = ((uint32_t)(c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
-        *len = 2;
-        return *cp >= 0x80 ? 0 : -1;
-    }
-    if ((c & 0xF0) == 0xE0 && end - p >= 3) {
-        *cp = ((uint32_t)(c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) |
-              ((unsigned char)p[2] & 0x3F);
-        *len = 3;
-        return *cp >= 0x800 ? 0 : -1;
-    }
-    if ((c & 0xF8) == 0xF0 && end - p >= 4) {
-        *cp = ((uint32_t)(c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) |
-              (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
-        *len = 4;
-        return *cp >= 0x10000 && *cp <= 0x10FFFF ? 0 : -1;
-    }
-    *cp = c;
-    *len = 1;
-    return -1;
+    if ((n == 2 && v < 0x80) || (n == 3 && v < 0x800) || (n == 4 && v < 0x10000) ||
+        (v >= 0xd800 && v <= 0xdfff) || v > 0x10ffff) return -1;
+    *cp = v;
+    *len = n;
+    return 0;
 }
 
 static int utf8_encode(uint32_t cp, char *buf) {
@@ -841,38 +841,45 @@ static int encode_core(e2_tokenizer *t, const char *text, const int32_t *n_soft,
     if ((n = emit(ids, n, max_ids, (int32_t)t->eos)) < 0) goto too_small;
     return n;
 too_small:
-    e2_set_error("id buffer too small: 2 + 3 tokens per input byte is the bound");
+    if (!e2_last_error()[0]) e2_set_error("id buffer too small: 2 + 3 tokens per input byte is the bound");
     return -1;
 }
 
 int e2_encode(e2_tokenizer *t, const char *text, int32_t *ids, int max_ids) {
-    if (!t || !text || !ids) return -1;
-    return encode_core(t, text, NULL, 0, NULL, 0, ids, max_ids);
+    return e2_encode_mma(t, text, NULL, 0, NULL, 0, ids, max_ids);
 }
 
 int e2_encode_mm(e2_tokenizer *t, const char *text, const int32_t *n_soft_tokens, int n_images,
                  int32_t *ids, int max_ids) {
-    if (!t || !text || !ids) return -1;
-    if (n_images < 0 || (n_images > 0 && !n_soft_tokens)) return -1;
-    return encode_core(t, text, n_soft_tokens, n_images, NULL, 0, ids, max_ids);
+    return e2_encode_mma(t, text, n_soft_tokens, n_images, NULL, 0, ids, max_ids);
 }
 
 int e2_encode_mma(e2_tokenizer *t, const char *text, const int32_t *n_image_soft, int n_images,
                   const int32_t *n_audio_soft, int n_audios, int32_t *ids, int max_ids) {
-    if (!t || !text || !ids) return -1;
-    if (n_images < 0 || (n_images > 0 && !n_image_soft)) return -1;
-    if (n_audios < 0 || (n_audios > 0 && !n_audio_soft)) return -1;
+    e2_set_error("");
+    if (!t || !text || !ids || n_images < 0 || n_audios < 0 ||
+        (n_images > 0 && !n_image_soft) || (n_audios > 0 && !n_audio_soft)) {
+        e2_set_error("tokenizer: invalid arguments");
+        return -1;
+    }
+    for (int i = 0; i < n_images; i++)
+        if (n_image_soft[i] < 0) { e2_set_error("negative image soft-token count"); return -1; }
+    for (int i = 0; i < n_audios; i++)
+        if (n_audio_soft[i] < 0) { e2_set_error("negative audio soft-token count"); return -1; }
     return encode_core(t, text, n_image_soft, n_images, n_audio_soft, n_audios, ids, max_ids);
 }
 
 /* ---------------------------------------------------------------- load / free */
 e2_tokenizer *e2_tokenizer_load(const char *model_dir) {
+    e2_set_error("");
+    if (!model_dir || !model_dir[0]) { e2_set_error("tokenizer: model_dir is empty"); return NULL; }
     char path[1024];
     long size;
     char *buf;
     FILE *f;
     e2_tokenizer *t;
-    snprintf(path, sizeof path, "%s/tokenizer.json", model_dir);
+    int plen = snprintf(path, sizeof path, "%s/tokenizer.json", model_dir);
+    if (plen < 0 || (size_t)plen >= sizeof path) { e2_set_error("tokenizer: model_dir is too long"); return NULL; }
     f = fopen(path, "rb");
     if (!f) {
         e2_set_error("cannot open %s", path);
@@ -963,6 +970,7 @@ e2_tokenizer *e2_tokenizer_load(const char *model_dir) {
     return t;
 
 fail:
+    if (!e2_last_error()[0]) e2_set_error("oom: tokenizer tables");
     free(buf);
     e2_tokenizer_free(t);
     return NULL;

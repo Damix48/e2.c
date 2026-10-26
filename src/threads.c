@@ -10,7 +10,11 @@
  * on a condition variable guarded by it. On a 16-core box that was the single largest cost in a
  * short-text embedding. A spin-then-futex barrier is ~1 us and still idles at zero CPU.
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "threads.h"
+#include <sched.h>
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -96,6 +100,12 @@ e2_pool *e2_pool_create(int nthreads) {
     p->nthreads = nthreads;
     p->threads = calloc((size_t)(nthreads - 1), sizeof(pthread_t));
     p->wargs = calloc((size_t)(nthreads - 1), sizeof(struct worker_arg));
+    if (!p->threads || !p->wargs) {
+        free(p->threads);
+        free(p->wargs);
+        free(p);
+        return NULL; /* the global caller safely falls back to serial execution */
+    }
     atomic_init(&p->generation, 0);
     atomic_init(&p->nfinished, 0);
     atomic_init(&p->shutdown, 0);
@@ -181,11 +191,61 @@ static int default_threads(void) {
     return keep > 0 ? keep : n;
 }
 
+/* cgroup v2 quotas may be fractional CPU equivalents; round up, bounded by affinity. */
+#if defined(__linux__)
+static int quota_threads(FILE *f) {
+    long long quota, period;
+    if (fscanf(f, "%lld %lld", &quota, &period) != 2 || quota <= 0 || period <= 0) return 64;
+    long long n = quota / period + (quota % period != 0);
+    return n < 64 ? (int)n : 64;
+}
+static int cpu_budget(void) {
+    int limit = 64;
+    cpu_set_t allowed;
+    if (!sched_getaffinity(0, sizeof allowed, &allowed)) {
+        int n = CPU_COUNT(&allowed);
+        if (n > 0 && n < limit) limit = n;
+    }
+    char path[2048] = "/sys/fs/cgroup", line[2048];
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "0::/", 4) && !strstr(line + 3, "..")) {
+                line[strcspn(line, "\n")] = 0;
+                if (strlen(line + 3) + strlen(path) < sizeof path)
+                    strcat(path, line + 3);
+                break;
+            }
+        }
+        fclose(f);
+    }
+    const size_t root = strlen("/sys/fs/cgroup");
+    for (;;) {
+        char file[2080];
+        snprintf(file, sizeof file, "%s/cpu.max", path);
+        f = fopen(file, "r");
+        if (f) { int n = quota_threads(f); if (n < limit) limit = n; fclose(f); }
+        size_t n = strlen(path);
+        if (n <= root) break;
+        char *slash = strrchr(path, '/');
+        if (!slash || (size_t)(slash - path) < root) break;
+        *slash = 0;
+    }
+    return limit;
+}
+#endif
+
 int e2_pool_global_init(int nthreads) {
     if (g_pool) return g_pool->nthreads;
     const char *env = getenv("E2_THREADS"); /* E2_THREADS=1 disables the pool (profiling) */
     if (env) nthreads = atoi(env);
-    if (nthreads <= 0) nthreads = default_threads();
+    if (nthreads <= 0) {
+        nthreads = default_threads();
+#if defined(__linux__)
+        int budget = cpu_budget();
+        if (nthreads > budget) nthreads = budget;
+#endif
+    }
     if (nthreads > 64) nthreads = 64;
     g_pool = e2_pool_create(nthreads);
     return g_pool ? g_pool->nthreads : 1;

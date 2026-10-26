@@ -45,7 +45,7 @@ static void gemm_cols8(float *y, const int8_t *qa, const float *a_scales, const 
                 __m256i av[MR], u[MR];
                 for (int i = 0; i < MR; i++) {
                     av[i] = _mm256_xor_si256(
-                        _mm256_set1_epi32(*(const int32_t *)(qa + (size_t)(m + i) * K + k)), flip);
+                        _mm256_set1_epi32(e2_load_i32(qa + (size_t)(m + i) * K + k)), flip);
                     u[i] = _mm256_sign_epi8(av[i], av[i]); /* |a| */
                 }
                 const __m256i wv = _mm256_loadu_si256(
@@ -78,7 +78,7 @@ static void gemm_cols8(float *y, const int8_t *qa, const float *a_scales, const 
             for (int q = 0; q < NQ4; q++) {
                 const int k = b * E2_I8_BLOCK + q * 4;
                 const __m256i av = _mm256_xor_si256(
-                    _mm256_set1_epi32(*(const int32_t *)(qa + (size_t)m * K + k)), flip);
+                    _mm256_set1_epi32(e2_load_i32(qa + (size_t)m * K + k)), flip);
                 const __m256i wv = _mm256_loadu_si256(
                     (const __m256i *)(wp + (size_t)(b * NQ4 + q) * 32));
                 acc = _mm256_add_epi32(acc,

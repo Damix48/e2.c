@@ -69,6 +69,15 @@ the cost of the recipe, not a modelling error - the bf16 path on the same input 
 For scale: the weight-only int8 models shipped elsewhere score 0.99983 (OpenVINO) and 0.99990 (GGUF
 Q8_0). Quantizing activations too is the more aggressive recipe, and it lands at 0.9994-0.9998.
 
+### Long-audio hardening corpus
+
+The separately frozen `audio_checks.bin` adds independent FP32 audio-only references through 30 s,
+including 743/744/745/749/750-token boundaries. For its steady-tone stress signal, minimum cosine on
+the reference CPU is **0.986984 int8** and **0.999984 bf16**. This exposes the int8 recipe's sensitivity
+beyond the original 0.75 s fixture; the short-fixture numbers above are not a universal fidelity floor.
+The new corpus gates at 0.98 int8 / 0.999 bf16, without changing any existing 0.999 gate. Application
+quality acceptance remains separate; see [PRODUCTION.md](PRODUCTION.md).
+
 ## The front end
 
 Same machine, `e2_test_pre`, best of 200 / 2000:

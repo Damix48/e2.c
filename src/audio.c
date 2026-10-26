@@ -84,19 +84,21 @@ static size_t aws_layout(e2_audio *a, float *base) {
         p += c_;                         \
         n += c_;                         \
     } while (0)
-    const size_t S = E2_A_MAX_TOK, H = E2_A_HIDDEN, I = E2_A_INTER;
+    /* Every projection writes full int8 row tiles, including the final padded rows. */
+    const size_t S = (E2_A_MAX_TOK + E2_I8_MR - 1) / E2_I8_MR * E2_I8_MR;
+    const size_t H = E2_A_HIDDEN, I = E2_A_INTER;
     ASLOT(x, S * H);
     ASLOT(res, S * H);
-    ASLOT(tmp, S * H);
+    ASLOT(tmp, S * E2_A_OUT);
     ASLOT(q, S * H);
     ASLOT(k, S * H);
     ASLOT(v, S * H);
     ASLOT(att, S * H);
     ASLOT(ff, S * I);
     ASLOT(lc, S * 2 * H); /* the light-conv GLU projection is 2048 wide */
-    ASLOT(relk, (size_t)E2_A_RELPOS * H);
+    ASLOT(relk, (size_t)((E2_A_RELPOS + E2_I8_MR - 1) / E2_I8_MR * E2_I8_MR) * H);
     ASLOT(clamp8, (size_t)8 * I); /* bf16 fallback: 8 clamped rows at a time */
-    ASLOT(soft, (size_t)E2_A_MAX_TOK * 512);
+    ASLOT(soft, S * 512);
     ASLOT(emb, (size_t)E2_MAX_SEQ * 512);
     ASLOT(qa_words, (S * I + 3) / 4);
     ASLOT(qa_scale, S * (I / E2_I8_BLOCK + 1));
@@ -155,7 +157,7 @@ struct agemm_task {
     const float *x;
     float *y;
     int M, Mp, N, K, tile;
-    _Atomic int next, qdone;
+    _Atomic int qnext, next, qdone;
 };
 
 static void agemm_worker(void *arg, int tid, int nthreads) {
@@ -168,7 +170,7 @@ static void agemm_worker(void *arg, int tid, int nthreads) {
          * then quantise (which was 20 ms of an 11 s clip across the tower's 135 projections) */
         const float lo = t->lin->in_min, hi = t->lin->in_max;
         for (;;) {
-            const int m0 = atomic_fetch_add_explicit(&t->next, 16, memory_order_relaxed);
+            const int m0 = atomic_fetch_add_explicit(&t->qnext, 16, memory_order_relaxed);
             if (m0 >= t->Mp) break;
             int nr = t->Mp - m0;
             if (nr > 16) nr = 16;
@@ -184,7 +186,6 @@ static void agemm_worker(void *arg, int tid, int nthreads) {
         }
         atomic_fetch_add_explicit(&t->qdone, 1, memory_order_release);
         while (atomic_load_explicit(&t->qdone, memory_order_acquire) < nthreads) e2_pause();
-        atomic_store_explicit(&t->next, 0, memory_order_relaxed);
     }
     /* claim width: ~8 claims per thread, 8-aligned because the kernel moves 8 output rows per
      * weight load (a fixed 32 left the last round of a 1024-wide projection 4 claims wide) */
@@ -236,7 +237,8 @@ static void agemm_run(e2_model *m, e2_audio *a, float *y, const float *x, const 
         if (tile < 8) tile = 8;
         if (tile > 64) tile = 64;
         t.tile = tile;
-        if (x) { atomic_init(&t.next, 0); atomic_init(&t.qdone, 0); }
+        atomic_init(&t.next, 0);
+        if (x) { atomic_init(&t.qnext, 0); atomic_init(&t.qdone, 0); }
         e2_parallel(agemm_worker, &t);
     }
     /* accounting: an embedding is ~150 of these regions, so the split against attention/conv decides
@@ -630,11 +632,21 @@ static void alconv(e2_model *m, e2_audio *a, const e2_alayer *L, int S, int dump
 /* The front end is shared by the CPU tower and the GPU path: the GPU takes over at the [S,1024]
  * tensor that enters the first Conformer layer, so mel/FFT and the two subsampling convolutions stay
  * in one implementation and the two backends cannot drift apart. */
+static int pcm_ok(const float *pcm, int n_samples) {
+    if (!pcm || n_samples <= 0) { e2_set_error("empty audio input"); return -1; }
+    const int n = n_samples > E2_A_MAX_SAMPLES ? E2_A_MAX_SAMPLES : n_samples;
+    if (n <= E2_A_FRAME / 2) { e2_set_error("audio too short: %d samples", n); return -1; }
+    if (!e2_valid_floats(pcm, (size_t)n, -1.f, 1.f)) {
+        e2_set_error("audio PCM must be finite and in [-1,1]");
+        return -1;
+    }
+    return 0;
+}
+
 int e2_audio_frontend(e2_model *m, const float *pcm, int n_samples, const float **x, int *n_tok) {
     e2_audio *a = (e2_audio *)m->audio;
     if (!a) { e2_set_error("audio tower not loaded"); return -1; }
-    if (e2_audio_prepare(m)) return -1;
-    if (!pcm || n_samples <= 0) { e2_set_error("empty audio input"); return -1; }
+    if (pcm_ok(pcm, n_samples) || e2_audio_prepare(m)) return -1;
     if (n_samples > E2_A_MAX_SAMPLES) n_samples = E2_A_MAX_SAMPLES;
     if (aws_alloc(a)) return -1;
 
@@ -852,7 +864,7 @@ static int alat_init(e2_model *m, e2_alin *lin, const char *prefix, int N, int K
             *dst[i] = e2_bf16f(p[0]);
         }
     }
-    if (e2_q8_is_write() && aq8(m, lin, wname, N, K)) return -1;
+    if ((e2_q8_is_write() || e2_q8_is_read()) && aq8(m, lin, wname, N, K)) return -1;
     lin->q8.out_min = lin->out_min;
     lin->q8.out_max = lin->out_max;
     return 0;
@@ -861,7 +873,8 @@ static int alat_init(e2_model *m, e2_alin *lin, const char *prefix, int N, int K
 static float *acopy(const uint16_t *src, size_t n) {
     if (!src) return NULL;
     float *p = malloc(sizeof(float) * n);
-    if (p) e2_bf16_to_f32(p, src, n);
+    if (!p) e2_set_error("oom: audio tensor copy");
+    else e2_bf16_to_f32(p, src, n);
     return p;
 }
 
@@ -924,7 +937,7 @@ int e2_audio_init(e2_model *m) {
             p[i].lin->in_min = p[i].lin->out_min = -1e31f;
             p[i].lin->in_max = p[i].lin->out_max = 1e31f;
             if (!e2_weight_ok(p[i].lin->w)) return -1;
-            if (e2_q8_is_write() && aq8(m, p[i].lin, p[i].name, p[i].N, p[i].K)) return -1;
+            if ((e2_q8_is_write() || e2_q8_is_read()) && aq8(m, p[i].lin, p[i].name, p[i].N, p[i].K)) return -1;
         }
     }
     (void)dout;
@@ -950,7 +963,7 @@ int e2_audio_init(e2_model *m) {
             snprintf(n_, sizeof n_, "%s.self_attn.relative_k_proj.weight", pre);
             L->rel_k = e2_tensor_bf16(m, n_, 2, drel);
             if (!e2_weight_ok(L->rel_k)) return -1;
-            if (e2_q8_is_write()) {
+            if (e2_q8_is_write() || e2_q8_is_read()) {
                 e2_alin tmp;
                 memset(&tmp, 0, sizeof tmp);
                 tmp.w = L->rel_k;
@@ -1085,6 +1098,7 @@ void e2_audio_free(e2_audio *a) {
  * into their placeholder slots. */
 static int mm_embed(e2_model *m, const int32_t *ids, int n_ids, const float *pixels,
                     const int32_t *ppos, int n_patches, const float *pcm, int n_samples, float *out768) {
+    e2_set_error("");
     char verr[256];
     if (!m) { e2_set_error("model is NULL"); return -1; }
     e2_audio *a = (e2_audio *)m->audio;
@@ -1102,7 +1116,7 @@ static int mm_embed(e2_model *m, const int32_t *ids, int n_ids, const float *pix
         e2_set_error("patch count %d out of range (max %d)", n_patches, E2_V_MAX_PATCHES);
         return -1;
     }
-    if (pcm && n_samples <= 0) { e2_set_error("empty audio input"); return -1; }
+    if (pcm && pcm_ok(pcm, n_samples)) return -1;
     if (e2_audio_prepare(m) || aws_alloc(a)) return -1;
 
     const float *isoft = NULL;
@@ -1149,10 +1163,11 @@ int e2_text_image_audio_embed(e2_model *m, const int32_t *ids, int n_ids, const 
 }
 
 int e2_audio_embed(e2_model *m, const float *pcm, int n_samples, float *out768) {
+    e2_set_error("");
     if (!m) { e2_set_error("model is NULL"); return -1; }
     e2_audio *a = (e2_audio *)m->audio;
     if (!a) { e2_set_error("audio tower not loaded"); return -1; }
-    if (!pcm || n_samples <= 0) { e2_set_error("empty audio input"); return -1; }
+    if (pcm_ok(pcm, n_samples)) return -1;
     if (!out768) { e2_set_error("output pointer is NULL"); return -1; }
     if (e2_audio_prepare(m) || aws_alloc(a)) return -1;
     int n = 0;

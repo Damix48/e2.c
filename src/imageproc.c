@@ -308,6 +308,7 @@ static void patch_run(const uint8_t *res, int tw, float *pixels, int32_t *pos, i
 
 int e2_image_preprocess_rgb(const uint8_t *rgb, int width, int height, float *pixels,
                             int32_t *position_ids) {
+    e2_set_error("");
     int th, tw, ph, pw, n;
     uint8_t *tmp = NULL, *res = NULL;
     const uint8_t *img = rgb;
@@ -315,7 +316,8 @@ int e2_image_preprocess_rgb(const uint8_t *rgb, int width, int height, float *pi
     int ok = -1;
     memset(&ch, 0, sizeof ch);
     memset(&cv, 0, sizeof cv);
-    if (!rgb || !pixels || !position_ids || width <= 0 || height <= 0) {
+    if (!rgb || !pixels || !position_ids || width <= 0 || height <= 0 ||
+        width > (1 << 20) || height > (1 << 20) || (uint64_t)width * height > (1u << 28)) {
         e2_set_error("image preprocessing: bad arguments");
         return -1;
     }
@@ -402,6 +404,7 @@ static int preprocess_container(const uint8_t *data, size_t len, float *pixels, 
 }
 
 int e2_image_preprocess(const uint8_t *data, size_t len, float *pixels, int32_t *position_ids) {
+    e2_set_error("");
     if (!data) {
         e2_set_error("image: no data");
         return -1;
@@ -410,6 +413,7 @@ int e2_image_preprocess(const uint8_t *data, size_t len, float *pixels, int32_t 
 }
 
 int e2_image_preprocess_png(const uint8_t *png, size_t len, float *pixels, int32_t *position_ids) {
+    e2_set_error("");
     if (!png) {
         e2_set_error("png: no data");
         return -1;

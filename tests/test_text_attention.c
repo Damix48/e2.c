@@ -110,7 +110,7 @@ int main(void) {
         check_attention(sizes[i], 0);
     }
     const int rows[] = { 1, 7, 8, 9, 15, 16, 17, 31 };
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; e2_i8_quantize && i < 8; i++) {
         check_gate_quant(rows[i], 2048, 2048);
         check_gate_quant(rows[i], 512, 24 * 512);
     }

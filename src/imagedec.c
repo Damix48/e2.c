@@ -368,7 +368,7 @@ static uint8_t *libpng_decode(const uint8_t *data, size_t len, int *w, int *h, c
     if (color == PNG_COLOR_TYPE_GRAY && depth < 8) png_set_expand_gray_1_2_4_to_8(png);
     if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
     if (color == PNG_COLOR_TYPE_GRAY || color == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
-    if (color & PNG_COLOR_MASK_ALPHA) png_set_strip_alpha(png);
+    png_set_strip_alpha(png); /* also strips alpha introduced by tRNS */
     passes = png_set_interlace_handling(png); /* Adam7: the in-tree reader refuses it, this does not */
     png_read_update_info(png, info);
     if (png_get_channels(png, info) != 3 || png_get_bit_depth(png, info) != 8) {

@@ -866,6 +866,14 @@ int e2_vision_init(e2_model *m) {
     if (!v) { e2_set_error("oom"); return -1; }
     m->vision = v;
 
+    /* a checkpoint (or a packed cache written with E2_Q8_TOWERS=text) without a vision tower must
+     * still load: a missing tower disables its entry points instead of failing the whole load */
+    if (!e2_tensor_exists(m, "vision_tower.patch_embedder.input_proj.weight")) {
+        free(v);
+        m->vision = NULL;
+        return 0;
+    }
+
     const int64_t dp[2] = { E2_V_HIDDEN, E2_V_PATCH };
     const int64_t dpos[3] = { 2, E2_V_POS, E2_V_HIDDEN }; /* checked exactly: positions are bounded by it */
     const int64_t dep[2] = { 512, E2_V_HIDDEN };

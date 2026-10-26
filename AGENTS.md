@@ -81,12 +81,16 @@ src/gpu/hip/hip.c       - HIP host layer: device selection, memory, graph captur
 src/gpu/hip/forward.c   - HIP forward pass: one upload, one recorded graph per shape
 src/gpu/hip/kernels.hip - the HIP kernels
 tools/embed_cli.c       - batch text -> embedding bridge for MTEB (`e2_embed_cli`)
+tools/export_cache.c    - load and write the packed int8 cache, nothing else (`e2_export_cache`)
 tools/mteb_e2.py        - runs MTEB tasks through e2_embed_cli
+tools/export_models.sh  - writes the four packed models (E2_Q8_TOWERS x E2_Q8_WRITE) + manifest.txt
 tools/dump_*.py         - fixture generators (development only, need PyTorch + the checkpoint)
 tools/bench/            - bench_compare.py plus the C/HIP benchmark workers
 tests/test_*.c          - one file per test, wired into CTest in CMakeLists.txt
 tests/fixtures/         - frozen reference fixtures (committed, see its README)
 cmake/embed_binary.cmake - SPIR-V blob -> C array
+download_model.sh       - fetch model.safetensors + tokenizer.json into models/ (gitignored)
+download_models.sh      - fetch the published packed int8 models (placeholder repo id for now)
 ```
 
 # Build Targets
@@ -152,6 +156,7 @@ The GPU test binaries take the same two arguments and skip with 77 when there is
 | `E2_GPU_DUMP=<dir>` / `E2_HIP_DUMP=<dir>` | device-side intermediates |
 | `E2_INT8=0` | bf16 path (and: refuses a packed cache, which holds only int8 weights) |
 | `E2_Q8_WRITE=<f>` / `E2_Q8_READ=<f>` | write / read the packed int8 model cache |
+| `E2_Q8_TOWERS=` | with `E2_Q8_WRITE`: which towers the cache holds (`text`, `text+image`, `text+audio`, `all`) |
 
 `tests/ref_act/` is 218 MB of raw float32 and is **not** committed: the fixture generators write it
 when you need to bisect a tower stage by stage. Without it, the fixtures alone still give you the
@@ -188,6 +193,10 @@ Each of these cost real debugging time and none of them was caught by an ordinar
 * **PNG row-0 filter state.** A missing zeroed "previous row" for row 0 hid behind every real image
   happening to start with the Sub or None filter; the filter bytes live inside the compressed stream,
   so a mutation fuzzer cannot reach them. The 45-case filter matrix in `png.bin` is the regression.
+* **`e2_tensor_exists` must ask both cache kinds.** It probed `Q8C_BF16` only, so the vision tower's
+  probe tensor (an int8-quantized weight, stored as `Q8C_Q8W`) looked absent and a full cache loaded
+  with no vision tower at all. The export verification catches this: it read every file back and the
+  two image shapes failed with "vision tower not loaded" while the text shapes passed.
 * **Attention past 513 tokens.** The blocked attention path only existed for short sequences; the
   longer window silently used the wrong shape. `test_text_attention` and the 514/2048 rows of
   [PERFORMANCE.md](PERFORMANCE.md#cpu-single-item) cover it.

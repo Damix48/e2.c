@@ -26,6 +26,10 @@ static e2_model *g_live;
  * from that dump instead of from model.safetensors (the int8 weight set plus the tensors that stay
  * bf16/f32 - the token table, the vision position table, the norm scales). See q8cache.c. */
 static int g_q8_write;
+/* E2_Q8_TOWERS selects the towers a cache written by E2_Q8_WRITE contains: "text", "text+image",
+ * "text+audio" or "all" (the default). Reading takes whatever the file has, so this is only
+ * consulted when writing. */
+static int g_want_vision, g_want_audio;
 static int g_q8_read;
 
 int e2_q8_is_write(void) { return g_q8_write; }
@@ -85,7 +89,8 @@ int e2_q8_is_read(void) { return g_q8_read; }
 int e2_tensor_exists(e2_model *m, const char *name) {
     if (g_q8_read) {
         const int64_t d[1] = { 0 };
-        return q8c_get(name, Q8C_BF16, 1, d, NULL) != NULL;
+        /* a quantized weight is stored as Q8C_Q8W, never as bf16, so "is it here" has to ask both */
+        return q8c_get(name, Q8C_BF16, 1, d, NULL) != NULL || q8c_kind_of(name) == Q8C_Q8W;
     }
     return st_find(&m->st, name) != NULL;
 }
@@ -223,6 +228,18 @@ static void model_release(e2_model *m) {
     free(m);
 }
 
+/* ---------------------------------------------------------------- towers to write */
+static int parse_q8_towers(void) {
+    const char *t = getenv("E2_Q8_TOWERS");
+    g_want_vision = g_want_audio = 1;
+    if (!t || !t[0] || !strcmp(t, "all")) return 0;
+    if (!strcmp(t, "text")) { g_want_vision = g_want_audio = 0; return 0; }
+    if (!strcmp(t, "text+image")) { g_want_audio = 0; return 0; }
+    if (!strcmp(t, "text+audio")) { g_want_vision = 0; return 0; }
+    e2_set_error("E2_Q8_TOWERS must be text, text+image, text+audio or all (got \"%s\")", t);
+    return -1;
+}
+
 e2_model *e2_load(const char *model_dir) {
     if (g_live) {
         e2_set_error("a model is already loaded: one live model per process, call e2_free first");
@@ -251,6 +268,11 @@ e2_model *e2_load(const char *model_dir) {
      * file: a half-opened load must not leave session state (the g_q8_* flags above) behind */
     if (g_q8_read && g_q8_write) {
         e2_set_error("E2_Q8_READ and E2_Q8_WRITE are exclusive");
+        goto fail;
+    }
+    if (g_q8_write && parse_q8_towers()) goto fail;
+    if (!g_q8_write && getenv("E2_Q8_TOWERS")) {
+        e2_set_error("E2_Q8_TOWERS selects what E2_Q8_WRITE writes: it cannot be used when reading");
         goto fail;
     }
     if (!g_q8_read && st_open(&m->st, path)) { e2_set_error("%s", st_error()); goto fail; }
@@ -381,8 +403,9 @@ e2_model *e2_load(const char *model_dir) {
 
     e2_pool_global_init(0); /* default: one worker per hardware thread */
     if (e2_ws_alloc(m, E2_MAX_SEQ, 0)) goto fail;
-    if (e2_vision_init(m)) goto fail;
-    if (e2_audio_init(m)) goto fail;
+    /* with E2_Q8_WRITE the towers that are not selected are never built, so they are not in the file */
+    if ((!g_q8_write || g_want_vision) && e2_vision_init(m)) goto fail;
+    if ((!g_q8_write || g_want_audio) && e2_audio_init(m)) goto fail;
     if (g_q8_write && q8c_write_close()) { e2_set_error("%s", q8c_error()); goto fail; }
     g_live = m;
     g_err[0] = 0;

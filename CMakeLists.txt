@@ -269,6 +269,8 @@ endif()
 
 add_executable(e2_embed_cli tools/embed_cli.c)
 target_link_libraries(e2_embed_cli PRIVATE e2)
+add_executable(e2_export_cache tools/export_cache.c)
+target_link_libraries(e2_export_cache PRIVATE e2)
 add_executable(e2_text_bench tools/bench/text_bench.c)
 target_link_libraries(e2_text_bench PRIVATE e2)
 target_compile_options(e2_text_bench PRIVATE -fno-fast-math)

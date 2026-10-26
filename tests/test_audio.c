@@ -64,7 +64,13 @@ static void score(const char *what, const float *got, const float *ref, size_t n
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s <model_dir> <fixture_dir>\n", argv[0]); return 2; }
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <model_dir> <fixture_dir> [noimage]\n"
+                        "  noimage: skip the text+image+audio case, for a cache without a vision tower\n",
+                argv[0]);
+        return 2;
+    }
+    const int with_image = !(argc > 3 && !strcmp(argv[3], "noimage"));
     char path[512];
     snprintf(path, sizeof path, "%s/audio.bin", argv[2]);
     FILE *f = fopen(path, "rb");
@@ -175,7 +181,7 @@ int main(int argc, char **argv) {
     e2_test_timing(samples, reps);
 
     /* 3. text+image+audio: the image fixture of the image test, spliced before the audio */
-    {
+    if (with_image) {
         char ipath[512];
         snprintf(ipath, sizeof ipath, "%s/image.bin", argv[2]);
         FILE *fi = fopen(ipath, "rb");

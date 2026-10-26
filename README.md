@@ -23,6 +23,10 @@ cmake --build build -j
 # Get the model (~1.4 GB, into models/ which is not tracked by git)
 ./download_model.sh
 
+# Optional: the packed int8 weight sets (410 MB text-only .. 916 MB all towers), generated locally
+# until they are on the Hub: ./download_models.sh all
+ tools/export_models.sh models/embeddinggemma-2 models/e2 build
+
 # Run the engine on the frozen fixtures: text, then image and audio
 ./build/e2_test       models/embeddinggemma-2 tests/fixtures
 ./build/e2_test_image models/embeddinggemma-2 tests/fixtures
@@ -190,6 +194,39 @@ a re-quantization (two exports are md5-identical, and the embeddings match to th
 The file is this engine's own format (`src/q8cache.c`, documented at the top of that file) and is
 **one-way**: there is no converter back to safetensors. `E2_INT8=0` refuses it, because it holds only
 int8 weights plus the tensors that never had an int8 form.
+
+`E2_Q8_TOWERS=text|text+image|text+audio|all` (default `all`) chooses which towers are packed, so a
+text-only file does not carry 500 MB of vision and audio weights a text process never touches. Reading
+takes whatever the file has; asking a text-only cache for an image returns "vision tower not loaded"
+rather than a wrong answer.
+
+### The four variants
+
+One weight set, four files, differing only in which towers are packed:
+
+| file | towers | size | input shapes it serves |
+| :-- | :-- | --: | :-- |
+| `…-int8-text.e8cq` | text | **410 MB** | text |
+| `…-int8-text-image.e8cq` | text + vision | 599 MB | text, text+image |
+| `…-int8-text-audio.e8cq` | text + audio | 727 MB | text, text+audio |
+| `…-int8-text-image-audio.e8cq` | all three | 916 MB | everything, including text+image+audio |
+
+Generate them from a checkpoint - the export is deterministic, two exports of the same checkpoint are
+md5-identical, and each file is read back and put through the fixture test for its own shape:
+
+```bash
+ tools/export_models.sh <model_dir> models/e2 build     # writes the four files + manifest.txt
+```
+
+Or fetch the published copies (`HF_E2_REPO` overrides the repository id):
+
+```bash
+ ./download_models.sh all        # or: text | text-image | text-audio | text-image-audio
+```
+
+**The Hub repository is not published yet**, so `download_models.sh` currently ends with a pointer to
+the local export. `tokenizer.json` is still needed from the checkpoint directory: the cache holds
+weights, not the tokenizer.
 
 ## Known limitations
 

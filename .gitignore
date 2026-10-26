@@ -22,3 +22,6 @@ tests/ref_act/
 # local documentation corpus (design notes, review, GPU investigation, benchmark methods and
 # results). Kept in the working tree, deliberately not published.
 /docs/llms/
+
+# model checkpoints (./download_model.sh)
+/models/

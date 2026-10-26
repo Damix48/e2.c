@@ -28,7 +28,14 @@ that runner to untrusted pull-request jobs.
 Before a release, save the logs, compiler version, CPU model/flags, codec versions, checkpoint hashes
 and git revision. Run on the CPU families you will ship: AVX2-only, AVX-VNNI, and AVX512-VNNI where
 claimed. A successful run on one laptop does not validate an unavailable ISA or another operating
-system. No AVX512-VNNI hardware was available for the initial hardening run.
+system.
+
+AVX512-VNNI CPU validation passed on an **AMD Ryzen 7 9700X (Zen 5)**, Linux x86-64, GCC 14.2.0,
+at revision `6cf862d`. The full software gate passed: 24/24 tests at 1 and 4 threads, 24/24 under
+ASan/UBSan, bf16 fidelity checks, and export/read-back of all four packed variants. An additional
+8-thread run passed 24/24; automatic sizing selected the eight physical cores. The 42-case text
+corpus scored minimum cosine **0.999432190**, with all **8/8** retrieval rankings preserved.
+This validates the CPU AVX512 path on AMD Zen 5, not Intel Xeon coverage or the AMD HIP backend.
 
 ## Fidelity is an acceptance decision
 

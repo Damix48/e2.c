@@ -37,6 +37,10 @@ Notes that are not obvious from the table:
   Correct output, 60x slower - this is the same path an ARM machine would get if the tree built there.
 * **The pool sizes itself to physical cores** and drops cores below 75 % of the fastest core's peak
   frequency, which is what makes P/E hybrids behave. `E2_THREADS=n` overrides (1 disables the pool).
+* **AVX512-VNNI CPU correctness was validated on Ryzen 7 9700X (Zen 5)** with GCC 14.2.0,
+  including the full checkpoint/sanitizer/cache gate and 1/4/8-thread runs. See
+  [PRODUCTION.md](PRODUCTION.md) for the tested revision and fidelity. Kernel throughput was not
+  benchmarked on that host; this does not validate the separate AMD HIP backend.
 * No AMX (Sapphire Rapids' matrix units are unused), no int4/int2 weights, no AVX-512 bf16/fp16: the
   bf16 path is a plain fp32 GEMM over bf16 operands.
 

@@ -52,7 +52,7 @@
 #define E2_A_C1 32
 #define E2_A_CONV_K 3
 #define E2_A_LCONV_K 5
-#define E2_A_MAX_SAMPLES 480000 /* the reference processor truncates at 30 s */
+#define E2_A_MAX_SAMPLES E2_AUDIO_MAX_SAMPLES /* the reference processor truncates at 30 s */
 #define E2_A_MAX_TOK 750        /* 30 s / 40 ms per soft token */
 
 /* tokens per GEMM pass; shared by the text and vision work-claiming GEMM regions */

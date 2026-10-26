@@ -19,9 +19,9 @@ include(CTest)
 # benefits from the auto-vectorizer; -fno-tree-vectorize left those 4-8x slower than they need to be.
 
 set(E2_SOURCES src/st.c src/kernels.c src/int8.c src/q8cache.c src/e2.c src/text.c src/vision.c src/audio.c src/threads.c
-               src/tokenizer.c src/imageproc.c src/png.c src/imagedec.c src/validation.c)
+               src/tokenizer.c src/imageproc.c src/png.c src/imagedec.c src/validation.c src/audioproc.c)
 # Input/output validation must keep IEEE finite-value checks real.
-set_source_files_properties(src/validation.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+set_source_files_properties(src/validation.c src/audioproc.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
 
 # x86-64: AVX2/FMA backend compiled with its own flags, and an AVX-512 backend on top
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
@@ -45,16 +45,18 @@ target_include_directories(e2 PUBLIC include PRIVATE src)
 find_package(Threads REQUIRED)
 target_link_libraries(e2 PUBLIC m Threads::Threads)
 
-# Optional image codecs. PNG is in-tree and needs nothing; JPEG and WebP go through the same
+# Optional media codecs. PNG and WAV have in-tree readers; JPEG and WebP go through the same
 # libraries the HF reference uses (libjpeg-turbo, libwebp), which is what makes their pixels match
 # instead of merely look close. AUTO keeps the zero-dependency build working: a codec is used when
 # its header and library are present and quietly left out when they are not.
 set(E2_WITH_PNG "AUTO" CACHE STRING "PNG decoding via libpng, in-tree reader as the fallback (ON/OFF/AUTO)")
 set(E2_WITH_JPEG "AUTO" CACHE STRING "JPEG decoding via libjpeg-turbo (ON/OFF/AUTO)")
 set(E2_WITH_WEBP "AUTO" CACHE STRING "WebP decoding via libwebp (ON/OFF/AUTO)")
+set(E2_WITH_SNDFILE "AUTO" CACHE STRING "Audio decoding via libsndfile, in-tree WAV fallback (ON/OFF/AUTO)")
 set_property(CACHE E2_WITH_PNG PROPERTY STRINGS AUTO ON OFF)
 set_property(CACHE E2_WITH_JPEG PROPERTY STRINGS AUTO ON OFF)
 set_property(CACHE E2_WITH_WEBP PROPERTY STRINGS AUTO ON OFF)
+set_property(CACHE E2_WITH_SNDFILE PROPERTY STRINGS AUTO ON OFF)
 
 function(e2_optional_codec name header library define)
   find_path(E2_${name}_INC ${header})
@@ -71,7 +73,7 @@ function(e2_optional_codec name header library define)
   endif()
 endfunction()
 
-# PNG is the one codec with a fallback: AUTO prefers libpng and falls back to the in-tree reader,
+# PNG AUTO prefers libpng and falls back to the in-tree reader,
 # which is always compiled and always tested (the decoder that ran is reported by e2_png_decoder()).
 if(NOT E2_WITH_PNG STREQUAL "OFF")
   e2_optional_codec(PNG png.h png E2_HAVE_LIBPNG)
@@ -81,6 +83,9 @@ if(NOT E2_WITH_JPEG STREQUAL "OFF")
 endif()
 if(NOT E2_WITH_WEBP STREQUAL "OFF")
   e2_optional_codec(WEBP webp/decode.h webp E2_HAVE_WEBP)
+endif()
+if(NOT E2_WITH_SNDFILE STREQUAL "OFF")
+  e2_optional_codec(SNDFILE sndfile.h sndfile E2_HAVE_LIBSNDFILE)
 endif()
 
 add_executable(e2_test tests/test_text.c)
@@ -252,11 +257,14 @@ endif()
 add_executable(e2_test_metrics tests/test_metrics.c)
 target_link_libraries(e2_test_metrics PRIVATE m)
 foreach(name softmax text_attention text_batch lifecycle q8cache validation audio_load
-             st audio_kernels tokenizer_boundary png_transparency threads model_load audio_reference cpu_backends)
+             st audio_kernels tokenizer_boundary png_transparency threads model_load audio_reference cpu_backends audioproc)
   add_executable(e2_test_${name} tests/test_${name}.c)
   target_link_libraries(e2_test_${name} PRIVATE e2)
   target_include_directories(e2_test_${name} PRIVATE src)
 endforeach()
+if(NOT E2_WITH_SNDFILE STREQUAL "OFF" AND E2_SNDFILE_INC AND E2_SNDFILE_LIB)
+  target_include_directories(e2_test_audioproc PRIVATE ${E2_SNDFILE_INC})
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(e2_test_oom tests/test_oom.c)
   target_link_libraries(e2_test_oom PRIVATE e2)
@@ -311,7 +319,7 @@ if(BUILD_TESTING)
   add_test(NAME softmax COMMAND e2_test_softmax)
   add_test(NAME q8cache COMMAND e2_test_q8cache)
   add_test(NAME audio_load COMMAND e2_test_audio_load)
-  foreach(name st audio_kernels tokenizer_boundary png_transparency threads)
+  foreach(name st audio_kernels tokenizer_boundary png_transparency threads audioproc)
     add_test(NAME ${name} COMMAND e2_test_${name})
   endforeach()
   set_tests_properties(audio_kernels PROPERTIES SKIP_RETURN_CODE 77)

@@ -5,13 +5,14 @@ embedding model, implemented entirely in C11. It is written for this model inste
 text, vision and audio towers have their own int8 kernels, their shapes are baked in and checked
 against the checkpoint at load, and there is no runtime graph interpreter, no GGUF, no ONNX.
 
-It takes a string, a PNG and a 16 kHz PCM buffer, and the four input shapes the model is used with
+It takes text, image files and audio files (or ready-to-embed 16 kHz PCM), and the four input shapes the model is used with
 work end to end: **text**, **text+image**, **text+audio** and **text+image+audio**, each producing the
 model's 768-d L2-normalized vector. Video is out of scope.
 
-Nothing beyond libc, pthreads and libm is required. Image input can go through libpng, libjpeg-turbo
-and libwebp, but every one of them can be turned off at build time - turning PNG off falls back to the
-in-tree reader with its own DEFLATE, so the zero-dependency build is one flag away.
+Nothing beyond libc, pthreads and libm is required. Image input can use libpng, libjpeg-turbo and
+libwebp; audio files prefer libsndfile. All codecs are optional: disabling them leaves the in-tree
+PNG/DEFLATE and PCM/float WAV readers. Set the four `E2_WITH_PNG/JPEG/WEBP/SNDFILE` options to `OFF`
+for dependency-free media input.
 
 ## Quick Start
 
@@ -61,9 +62,10 @@ e2_tokenizer_free(t);
 e2_free(m);
 ```
 
-Text is tokenized by the engine, but images and audio arrive ready to embed: `e2_image_preprocess()`
-turns PNG/JPEG/WebP/RGB bytes into the padded patch tensor and `e2_audio_tokens()` says how many soft
-tokens a clip becomes (one per 40 ms). `E2_MAX_PATCHES` is 2520 and the sequence limit is 2048 tokens.
+`e2_image_preprocess()` turns PNG/JPEG/WebP bytes into the padded patch tensor;
+`e2_audio_preprocess()` turns audio-file bytes into 16 kHz mono PCM. The existing embedding APIs
+still accept prepared pixels/PCM directly. `e2_audio_tokens()` says how many soft tokens a clip
+becomes (one per 40 ms). `E2_MAX_PATCHES` is 2520 and the sequence limit is 2048 tokens.
 
 ## Features
 
@@ -79,10 +81,11 @@ tokens a clip becomes (one per 40 ms). `E2_MAX_PATCHES` is 2520 and the sequence
 * **A persistent worker pool** where every parallel region claims its work from a shared counter
   instead of taking a fixed slice, and the default size keeps one thread per physical core, dropping
   cores below 75 % of the fastest core's peak frequency on hybrid CPUs.
-* **Both front ends in-tree**: the model's BPE tokenizer (`tokenizer.json`, byte fallback, `<bos>`/
+* **Model front ends in-tree**: the model's BPE tokenizer (`tokenizer.json`, byte fallback, `<bos>`/
   `<eos>` template, `<|image|>`/`<|audio|>` placeholder expansion), and the image preprocessing the
   HF processor does (aspect-preserving bicubic resize, 16x16 patchify, axial position ids, padding).
-  Audio needs no front-end library at all: 16 kHz PCM to log-mel with an in-tree FFT.
+  Audio's 16 kHz PCM-to-log-mel FFT is in-tree too. Audio-file input uses optional libsndfile,
+  with an in-tree WAV reader, mono downmix and band-limited resampling as the dependency-free path.
 * **CPU batching**: `e2_text_embed_batch()` shares projection work across sequences in one call.
 * **Two GPU backends**: Intel Level Zero (runs all three towers, **experimental**) and AMD ROCm/HIP
   (text and vision, **source-reviewed only, never run on AMD hardware here**).
@@ -90,8 +93,8 @@ tokens a clip becomes (one per 40 ms). `E2_MAX_PATCHES` is 2520 and the sequence
 ## Usage
 
 The C API is in [`include/e2.h`](include/e2.h) - load, embed text/image/audio, batch text, the
-tokenizer and the image preprocessing. `E2_PATCH_DIM`, `E2_MAX_PATCHES` and `e2_image_supported_formats()`
-describe the input contract of the current build.
+tokenizer and image/audio preprocessing. `e2_image_supported_formats()` and
+`e2_audio_supported_formats()` report common containers supported by the current build.
 
 There is no general-purpose CLI. `tools/embed_cli.c` is a batch text-to-embedding bridge for
 evaluation harnesses:
@@ -107,13 +110,41 @@ INT8 IR, to compare engines rather than prompts).
 The test binaries double as the practical entry points, since they print timings and fidelity per
 case: `e2_test`, `e2_test_image`, `e2_test_audio`, `e2_test_pre`, `e2_text_bench`.
 
+### Audio files
+
+With file bytes already in memory and model `m` loaded (include `<stdlib.h>` and `<stdio.h>`):
+
+```c
+float *pcm = malloc(E2_AUDIO_MAX_SAMPLES * sizeof *pcm);
+if (!pcm) return 1;
+int samples = e2_audio_preprocess(audio_bytes, audio_size, pcm);
+int rc = samples < 0 ? -1 : e2_audio_embed(m, pcm, samples, v);
+if (rc) fprintf(stderr, "%s\n", e2_last_error());
+free(pcm);
+```
+
+`E2_WITH_SNDFILE=AUTO` prefers libsndfile when its headers/library are installed; `ON` requires it,
+and `OFF` forces WAV-only input. libsndfile handles WAV, FLAC, Ogg/Vorbis/Opus, MP3, AIFF, AU and
+other formats available in the installed library (container flags do not promise every subtype).
+`e2_audio_preprocess_wav()` always uses the in-tree PCM 8/16/24/32-bit / IEEE float 32/64-bit RIFF
+WAV reader, including PCM/float WAVE_FORMAT_EXTENSIBLE. Compressed WAV, RF64 and RIFX need libsndfile.
+
+Both paths accept 8..192 kHz and 1..32 channels. They retain the first 30 seconds, clamp finite
+channel samples to [-1,1], average channels, and resample to 16 kHz with a normalized windowed-sinc
+low-pass filter. Resampling overshoot is clipped too; NaN/Inf and fewer than 161 output samples fail.
+The caller owns `E2_AUDIO_MAX_SAMPLES` (480000) floats; the return value is the real sample count,
+rounded up after resampling. Output is untouched on error. No weights or worker pool are needed.
+Already-16-kHz mono samples are not filtered; the resampler is not a bit-exact HF/librosa/soxr clone.
+The existing PCM inference API and frozen reference fixtures are unchanged.
+
 ## Building
 
 | option | default | meaning |
 | :-- | :-- | :-- |
 | `E2_WITH_GPU` | `ON` | Intel Level Zero backend (`src/gpu/`, OpenCL C kernels compiled at build time) |
 | `E2_WITH_HIP` | `ON` | AMD ROCm/HIP backend (`src/gpu/hip/`); needs `hipcc` |
-| `E2_WITH_PNG` / `E2_WITH_JPEG` / `E2_WITH_WEBP` | `ON` | use the system codecs; PNG `OFF` falls back to the in-tree reader |
+| `E2_WITH_PNG` / `E2_WITH_JPEG` / `E2_WITH_WEBP` | `AUTO` | use available system codecs; PNG `OFF` falls back to the in-tree reader |
+| `E2_WITH_SNDFILE` | `AUTO` | prefer libsndfile for audio files; `OFF` keeps the in-tree PCM/float WAV reader |
 | `E2_MODEL_DIR` | empty | registers the fixture tests in CTest |
 | `E2_FIXTURE_DIR` | `tests/fixtures` | where the frozen fixtures live |
 
@@ -138,6 +169,7 @@ Two tiers. The first needs no checkpoint and no device, and is what CI can run o
 | `softmax` | the SIMD exponential range reduction (a wrong polynomial passed everything else once) |
 | `q8cache` | the packed int8 cache round-trips and refuses a corrupt or incompatible file before anything dereferences it |
 | `audio_load` | private loader helpers, without a checkpoint |
+| `audioproc` | WAV fallback/libsndfile parity, codec decoding, downmix/resampling, alias rejection, bounds and malformed files |
 | `text_attention` | text scheduling: claimed regions, and blocked attention past 513 tokens |
 | `gpu_copy` | Level Zero upload/download is byte-exact at unaligned sizes and several MB |
 | `gpu_profile_fallback` | a failed timestamp append must not launch a kernel a second time |
@@ -152,7 +184,7 @@ The second tier needs the checkpoint (`-DE2_MODEL_DIR=...`) and compares against
 | `text_batch` | the batch API against the single-sequence path, with masked tokens |
 | `text_reference` | a 42-case golden FP32 corpus, including kernel boundaries and retrieval rankings |
 | `image` | the vision tower, image-only and image+caption |
-| `audio` | the audio tower, text+audio and text+image+audio |
+| `audio` | the audio tower, text+audio and text+image+audio, with bit-exact PCM from a WAV-file round-trip |
 | `validation` | every public input boundary the engine used to trust (token ids, patch positions, NULLs) |
 | `lifecycle` | one live model per process, and load/free returns the heap |
 | `gpu_text` / `gpu_image` / `gpu_audio` | the device towers against the fp32 reference and against the CPU engine |

@@ -30,6 +30,30 @@ static double now_ms(void) {
 
 static int g_fail;
 
+static void put_u32le(uint8_t *p, uint32_t v) {
+    for (int b = 0; b < 4; b++) p[b] = (uint8_t)(v >> (8*b));
+}
+/* The existing FP32 embedding fixtures must also pass when PCM comes from file bytes. */
+static int file_roundtrip(float *pcm, int n) {
+    size_t bytes = (size_t)n * 4;
+    uint8_t *wav = calloc(44 + bytes, 1);
+    float *decoded = malloc(sizeof(float) * E2_AUDIO_MAX_SAMPLES);
+    if (!wav || !decoded) { free(wav); free(decoded); return -1; }
+    memcpy(wav, "RIFF", 4); put_u32le(wav + 4, (uint32_t)bytes + 36);
+    memcpy(wav + 8, "WAVEfmt ", 8); put_u32le(wav + 16, 16);
+    wav[20] = 3; wav[22] = 1; /* IEEE float, mono */
+    put_u32le(wav + 24, E2_AUDIO_SAMPLE_RATE); put_u32le(wav + 28, E2_AUDIO_SAMPLE_RATE * 4);
+    wav[32] = 4; wav[34] = 32;
+    memcpy(wav + 36, "data", 4); put_u32le(wav + 40, (uint32_t)bytes);
+    for (int i = 0; i < n; i++) { uint32_t v; memcpy(&v, pcm + i, 4); put_u32le(wav + 44 + 4*i, v); }
+    int count = e2_audio_preprocess(wav, 44 + bytes, decoded);
+    int ok = count == n && !memcmp(decoded, pcm, bytes);
+    if (ok) memcpy(pcm, decoded, bytes);
+    else fprintf(stderr, "audio file preprocessing: %s\n", e2_last_error());
+    free(wav); free(decoded);
+    return ok ? 0 : -1;
+}
+
 /* the int8 recipe costs ~3e-4 of cosine against the fp32 reference on every tower here (the text
  * document scores 0.99942, the image 0.99976), so the bar is the same 0.999 the other tests use */
 /* per-stage activations are compared for localisation, not as the fidelity bar: the int8 tower loses
@@ -100,6 +124,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     fclose(f);
+    if (file_roundtrip(pcm, n_samples)) return 1;
     for (int i = 0; i < n_frames; i++) nvalid += mask[i] != 0;
     printf("fixture: %d samples, %d mel frames (%d valid), %d soft tokens, %d ids: \"%s\"\n", n_samples,
            n_frames, nvalid, n_soft, n_ids, text);

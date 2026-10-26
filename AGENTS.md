@@ -41,7 +41,9 @@ audio up to 30 s (750 soft tokens, one per 40 ms).
 - Reads the bf16 `model.safetensors` directly (mmap, demand-paged). Optional packed int8 cache
   (`E2_Q8_WRITE`/`E2_Q8_READ`, 916 MB, 0.01 s load) that replaces the checkpoint entirely.
 - Model-specific front ends in-tree: BPE tokenizer from `tokenizer.json`, HF image preprocessing,
-  16 kHz PCM -> log-mel with an in-tree FFT. No ONNX, no Python, no libsndfile.
+  16 kHz PCM -> log-mel with an in-tree FFT. No ONNX or Python in the engine.
+- Audio files: optional libsndfile by default, PCM/float RIFF WAV in-tree when it is unavailable;
+  `e2_audio_preprocess` downmixes/resamples to 16 kHz mono and caps the result at 30 s.
 - Image containers: PNG (in-tree reader, own DEFLATE), JPEG and WebP through the system codecs with
   EXIF orientation applied; each codec is optional at build time.
 - Two GPU backends: Intel Level Zero (all three towers, **experimental**) and AMD HIP (text and
@@ -68,6 +70,7 @@ src/threads.c           - persistent worker pool (claim-from-counter, futex slee
 src/text.c              - text tower: 24 layers, PLE, q/k/v norms, sliding window, fused regions
 src/vision.c            - vision tower: patch embedder, axial 2D RoPE, 16 layers, 3x3 pooling
 src/audio.c             - audio tower: USM/Conformer, 12 layers, chunked local attention, light conv
+src/audioproc.c         - audio files: libsndfile / in-tree WAV, mono downmix + band-limited resampling
 src/tokenizer.c         - tokenizer.json -> BPE + byte fallback + placeholder expansion
 src/imageproc.c         - the HF Gemma4ImageProcessor in C: resize, patchify, position ids, padding
 src/imagedec.c          - JPEG/WebP through the system libraries + EXIF orientation
@@ -106,13 +109,13 @@ run time, the GPU backends are separate libraries (`e2_gpu`, `e2_hip`).
   Configure drops the backend when `libze_loader` or the SPIR-V toolchain is missing.
 - **AMD GPU**: `src/gpu/hip/`, HIP sources compiled with `hipcc`; dropped when it is missing.
 
-Options: `E2_WITH_GPU`, `E2_WITH_HIP`, `E2_WITH_PNG`, `E2_WITH_JPEG`, `E2_WITH_WEBP`, `E2_MODEL_DIR`,
+Options: `E2_WITH_GPU`, `E2_WITH_HIP`, `E2_WITH_PNG`, `E2_WITH_JPEG`, `E2_WITH_WEBP`, `E2_WITH_SNDFILE`, `E2_MODEL_DIR`,
 `E2_FIXTURE_DIR`. See [README.md](README.md#building).
 
 # Development Rules
 
-- No new dependencies. Acceptable: libc, pthreads, libm, the optional system image codecs, Level Zero,
-  ROCm/HIP. No ONNX, no Python, no C++ in the engine.
+- No new dependencies. Acceptable: libc, pthreads, libm, the optional system image codecs and libsndfile,
+  Level Zero, ROCm/HIP. No ONNX, no Python, no C++ in the engine.
 - The scalar backend must keep compiling and working: it is the reference every SIMD path is checked
   against. If you add a kernel, add its scalar version.
 - `-fno-fast-math -UNDEBUG` is forced on every `e2_test*` target by the loop at the end of

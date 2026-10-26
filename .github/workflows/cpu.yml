@@ -17,23 +17,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {cc: gcc, codecs: AUTO, sanitizer: false}
-          - {cc: clang, codecs: OFF, sanitizer: false}
-          - {cc: gcc, codecs: OFF, sanitizer: true}
+          - {cc: gcc, codecs: AUTO, sndfile: "ON", sanitizer: false}
+          - {cc: clang, codecs: OFF, sndfile: "OFF", sanitizer: false}
+          - {cc: gcc, codecs: OFF, sndfile: "OFF", sanitizer: true}
+          - {cc: gcc, codecs: AUTO, sndfile: "ON", sanitizer: true}
     steps:
       - uses: actions/checkout@v4
+      - name: Install optional audio codec
+        if: matrix.sndfile == 'ON'
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1-dev
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           SANITIZER: ${{ matrix.sanitizer }}
           CODECS: ${{ matrix.codecs }}
+          SNDFILE: ${{ matrix.sndfile }}
         run: |
           flags=''
           if [ "$SANITIZER" = true ]; then
             flags='-g -fsanitize=address,undefined -fno-omit-frame-pointer'
           fi
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DE2_WITH_GPU=OFF -DE2_WITH_HIP=OFF \
-            -DE2_WITH_PNG="$CODECS" -DE2_WITH_JPEG="$CODECS" -DE2_WITH_WEBP="$CODECS" \
+            -DE2_WITH_PNG="$CODECS" -DE2_WITH_JPEG="$CODECS" -DE2_WITH_WEBP="$CODECS" -DE2_WITH_SNDFILE="$SNDFILE" \
             -DCMAKE_C_FLAGS="$flags" -DCMAKE_EXE_LINKER_FLAGS="$flags"
       - run: cmake --build build -j2
       - run: ctest --test-dir build --output-on-failure

@@ -16,7 +16,8 @@ This requires the checkpoint **and** tokenizer; it refuses a checkpoint-free rel
 * Whole-text inference through scalar bf16, AVX2 and every VNNI backend supported by the machine.
   Unsupported instruction sets are reported, not emulated.
 * Independent FP32 audio references at 1/12/13 and 743/744/745/749/750 soft tokens (up to 30 seconds).
-* bf16 fidelity checks, then ASan/UBSan with the dependency-free image decoder.
+* bf16 fidelity checks, then ASan/UBSan with the dependency-free PNG and WAV decoders.
+  Hosted CI also exercises libsndfile enabled and disabled, including sanitizer builds.
 * Export/read-back verification of all four packed tower sets, SHA256 verification, and inference
   from the all-tower cache. Artifacts remain under the ignored `build-release-check/` directory.
 
@@ -74,10 +75,16 @@ change; a passing memory-safety gate is not evidence of that quality.
 
 ## Input and output contract
 
-* Enforce a request-byte budget before tokenization or image decoding. The engine is not an HTTP
+* Enforce a request-byte budget before tokenization or image/audio decoding. The engine is not an HTTP
   upload limiter. `e2_encode*` does not truncate; reserve its documented worst-case ID capacity or
   reject overly large text. The embedding sequence limit is 2048 IDs.
 * Validate PCM sampling rate/channel layout in the caller: 16 kHz mono, finite values in [-1,1].
+  Or use `e2_audio_preprocess()` on file bytes: it handles 8..192 kHz, up to 32 channels,
+  clamps/averages finite channel samples and band-limited resamples to 16 kHz. It decodes only the
+  retained first 30 seconds; corruption after that point in compressed audio is not guaranteed to
+  be detected. The in-tree WAV path checks all RIFF chunk bounds before decoding the prefix.
+  Mono/filter scratch is bounded to about 50 MB, plus the caller's ~1.9 MB output and library buffers.
+  This resampler is not bit-identical to HF/librosa/soxr; evaluate that seam on your workload.
   The engine retains the reference's truncation to the first 30 seconds. Pre-patchified pixels,
   including supplied padding, must be finite and in [0,1]. NaN/Inf and out-of-range inputs fail.
 * Decoder limits are a last defense, not a recommended request budget: at most 2^28 decoded pixels;

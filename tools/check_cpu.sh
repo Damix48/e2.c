@@ -21,7 +21,7 @@ E2_INT8=0 E2_THREADS=4 ctest --test-dir "$BUILD/release" --output-on-failure \
     -R '^(text|text_batch|text_reference|image|audio|audio_reference|validation)$'
 cmake -S "$ROOT" -B "$BUILD/sanitized" -DCMAKE_BUILD_TYPE=Release \
     -DE2_WITH_GPU=OFF -DE2_WITH_HIP=OFF -DBUILD_TESTING=ON -DE2_MODEL_DIR="$MODEL" \
-    -DE2_WITH_PNG=OFF -DE2_WITH_JPEG=OFF -DE2_WITH_WEBP=OFF \
+    -DE2_WITH_PNG=OFF -DE2_WITH_JPEG=OFF -DE2_WITH_WEBP=OFF -DE2_WITH_SNDFILE=OFF \
     -DCMAKE_C_FLAGS='-g -fsanitize=address,undefined -fno-omit-frame-pointer' \
     -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
 cmake --build "$BUILD/sanitized" -j "$JOBS"

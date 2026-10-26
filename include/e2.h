@@ -63,6 +63,32 @@ int e2_audio_tokens(int n_samples);
 int e2_text_image_embed(e2_model *m, const int32_t *ids, int n_ids,
                         const float *pixels, const int32_t *position_ids, int n_patches, float *out768);
 
+/* ---------------------------------------------------------------- audio preprocessing
+ * Decode file bytes into caller-owned PCM[E2_AUDIO_MAX_SAMPLES]. Returns the number of 16 kHz
+ * mono samples, or -1 with e2_last_error(), leaving PCM untouched on failure. No weights needed.
+ * Input: 8..192 kHz, 1..32 channels. Keep the first 30 s, clamp finite channel samples to [-1,1],
+ * average channels, then band-limited resample (output length rounded up). NaN/Inf and clips shorter
+ * than 161 output samples are rejected. Already-16-kHz mono samples are not filtered.
+ * This resampler is not promised bit-identical to external HF/librosa/soxr preprocessing. */
+#define E2_AUDIO_SAMPLE_RATE 16000
+#define E2_AUDIO_MAX_SAMPLES 480000
+
+/* Prefer libsndfile when compiled in; otherwise use the in-tree RIFF WAV reader. */
+int e2_audio_preprocess(const uint8_t *data, size_t len, float *pcm);
+/* Always use the in-tree reader: PCM 8/16/24/32-bit and IEEE float 32/64-bit RIFF WAV,
+ * including WAVE_FORMAT_EXTENSIBLE. Compressed WAV/RIFX/RF64 need libsndfile. */
+int e2_audio_preprocess_wav(const uint8_t *data, size_t len, float *pcm);
+
+/* Common containers advertised by the linked decoder. libsndfile may support additional formats;
+ * a container flag does not guarantee every codec/subtype of that container. */
+#define E2_AUDIO_WAV 1
+#define E2_AUDIO_FLAC 2
+#define E2_AUDIO_OGG 4
+#define E2_AUDIO_MP3 8
+#define E2_AUDIO_AIFF 16
+#define E2_AUDIO_AU 32
+int e2_audio_supported_formats(void);
+
 /* ---------------------------------------------------------------- tokenizer
  *
  * Reads <model_dir>/tokenizer.json. Owns ~25 MB (the 262144-entry vocab and the 514906-entry merge

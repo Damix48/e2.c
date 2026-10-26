@@ -83,7 +83,7 @@ entry points mirroring `include/e2gpu.h`.
   is tested; there is no Windows port (`src/st.c` is mmap-based).
 * **Build**: CMake only, C11. Optional dependencies, each dropped automatically when missing:
   libpng (an in-tree PNG + DEFLATE reader is always compiled as the fallback), libjpeg-turbo,
-  libwebp, the Level Zero loader + `ocloc`, ROCm/`hipcc`.
+  libwebp, libsndfile (in-tree PCM/float WAV fallback), the Level Zero loader + `ocloc`, ROCm/`hipcc`.
 * **Footprint**: 1420 MB bf16 checkpoint (mmap, demand-paged) or 916 MB packed int8 cache (410 MB
   text-only); load 0.52 s vs 0.01 s; peak RSS for a text query 884 MB vs 180 MB; workspace 233 MB.
 * **Process model**: one live model per process, not reentrant, no threads beyond the internal pool.

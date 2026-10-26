@@ -7,14 +7,16 @@
  *    A call then costs a host-side copy of the token ids, one submission and a read of the output
  *    vectors. Graphs are keyed by (rows, sequence length).
  *
- *  - The graph is a transcription of the CPU tower in src/text.c, in the same order and with the same
- *    int8 recipe, so the two engines agree on every input. Where the CPU pass runs a serial loop over
+ *  - The graph follows the CPU tower in src/text.c, with its projection weights/block sizes and
+ *    FP32 text attention. Quantization and summation differences still need reference checks.
+ *    Where the CPU pass runs a serial loop over
  *    S x hidden this runs one sub-group per row; where it materializes an (S,S) score block this keeps
  *    an online softmax in registers. The fusions (norm+quantize in one pass, gelu+product+quantize in
  *    one pass, the context quantized inside the attention) exist to keep dependent kernel boundaries
  *    down: each one costs a command-list barrier, measured at 2 us on this iGPU against 0.26 us for a
  *    kernel with no dependent successor.
  */
+#include <float.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -43,6 +45,19 @@ static int fail(e2_gpu *g, const char *fmt, ...) {
     va_end(ap);
     if (g) snprintf(g->err, sizeof g->err, "%s", g_err);
     return -1;
+}
+
+static int begin_call(e2_gpu *g) {
+    g_err[0] = 0;
+    if (!g) return fail(NULL, "GPU context is NULL");
+    if (!e2_l0_ready(g->l0)) return fail(g, "%s", e2_l0_error(g->l0));
+    g->err[0] = 0;
+    return 0;
+}
+
+static int invalid_output(e2_gpu *g, const char *what) {
+    e2_l0_invalidate(g->l0, what);
+    return fail(g, "%s", e2_l0_error(g->l0));
 }
 
 /* ---------------------------------------------------------------- weights */
@@ -168,14 +183,6 @@ static void layout(e2_gpu *g) {
         { A_QAX, R * 512 },      { A_QAXS, R * 4 * 4 },
         { A_QAC, R * 2048 },     { A_QACS, R * 16 * 4 },  { A_QAM, R * 2048 },
         { A_QAMS, R * 16 * 4 },  { A_QAP, R * 512 },      { A_QAPS, R * 4 * 4 },
-        /* attention on the XMX engine (see k_attn_gemm in kernels/e2.cl). Q is packed per (head,row);
-         * K and V^T are packed per (sequence, kv-head) into the DPAS A layout, whose size is
-         * sup*D bytes per (sequence, kv-head) with sup the sequence length padded to 128 rows. */
-        { A_QPK, (size_t)E2_NUM_HEADS * R * 512 + (64 << 10) },
-        { A_QPS, (size_t)E2_NUM_HEADS * R * 4 * 4 },
-        { A_KPK, (size_t)4 << 20 }, { A_KSC, (size_t)64 << 10 }, { A_KBSQ, (size_t)512 << 10 },
-        { A_VPK, (size_t)4 << 20 }, { A_VSC, (size_t)128 << 10 }, { A_VBSQ, (size_t)1 << 20 },
-        { A_SCR, (size_t)17 << 20 }, { A_PB, (size_t)5 << 20 }, { A_PBS, R * 16 * 4 },
         /* vision tower. The activations are sized for E2_V_MAX_PATCHES patches, padded to E2_DM
          * (the GEMM reads its activation tile unguarded) and to 128 for the key axis. */
         { A_VX, (size_t)E2_GPU_VP * 768 * 4 },   { A_VRES, (size_t)E2_GPU_VP * 768 * 4 },
@@ -218,6 +225,9 @@ static void layout(e2_gpu *g) {
     };
     size_t off = 0;
     for (size_t i = 0; i < sizeof dim / sizeof dim[0]; i++) {
+        const int id = dim[i].id;
+        if ((id >= A_VX && id <= A_VSOFT && !g->m->vision) ||
+            (id >= A_AX && !g->m->audio)) continue;
         g->reg[dim[i].id].off = off;
         g->reg[dim[i].id].bytes = dim[i].bytes;
         off = align64(off + dim[i].bytes);
@@ -231,9 +241,12 @@ static void layout(e2_gpu *g) {
 }
 
 e2_gpu *e2_gpu_create(e2_model *m) {
+    g_err[0] = 0;
     if (!m) { fail(NULL, "model is NULL"); return NULL; }
     e2_gpu *g = calloc(1, sizeof *g);
     if (!g) { fail(NULL, "oom"); return NULL; }
+    uint8_t *wbuf = NULL;
+    int32_t *desc = NULL;
     g->max_rows = E2_GPU_MAX_ROWS;
     g->m = m;
     const char *lim = getenv("E2_GPU_LAYERS");
@@ -241,7 +254,6 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     g->dump_dir = getenv("E2_GPU_DUMP");
     { const char *dc = getenv("E2_GPU_DUMP_CALL"); g->dump_call = dc ? atoi(dc) : 1; }
     g->gemm_dp4a = getenv("E2_GPU_DP4A") != NULL;
-    g->attn_dpas = getenv("E2_GPU_ATTN_OLD") == NULL;
     g->vattn_old = getenv("E2_GPU_VATTN_OLD") != NULL;
     g->only = getenv("E2_GPU_ONLY") ? atoi(getenv("E2_GPU_ONLY")) : 0;
     g->limit = getenv("E2_GPU_LIMIT") ? atoi(getenv("E2_GPU_LIMIT")) : 0;
@@ -253,7 +265,8 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     layout(g);
 
     e2_audio *au = (e2_audio *)m->audio;
-    if (au && e2_audio_prepare(m)) goto bad;
+    if (au && e2_audio_prepare(m)) { fail(g, "audio prepare: %s", e2_last_error()); goto bad; }
+    /* Keep descriptor IDs fixed even when a packed model omits vision. */
     const int ntensors = m->n_layers * E2_DS_PER_LAYER + 2 + E2_V_LAYERS * 7 + 2 +
                          (au ? E2_A_LAYERS * E2_ADS_PER_LAYER + 3 : 0);
     g->vdesc_base = m->n_layers * E2_DS_PER_LAYER + 2;
@@ -272,9 +285,8 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     /* vision tower: the seven projections per layer, the two ends, the norm gammas, the axial rope
      * frequencies, and the 31 MB bf16 position table (2 x 10240 x 768), which is small enough to
      * keep resident rather than gather rows out of every call. */
-    {
+    if (m->vision) {
         e2_vision *v = (e2_vision *)m->vision;
-        if (!v) { fail(g, "the model has no vision tower"); goto bad; }
         for (int l = 0; l < E2_V_LAYERS; l++) {
             const e2_vlayer *L = &v->layers[l];
             wbytes += vq8w_bytes(&L->q8_q) + vq8w_bytes(&L->q8_k) + vq8w_bytes(&L->q8_v) +
@@ -305,9 +317,9 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     wbytes = align64(wbytes) + (1u << 20);
     g->wbuf_bytes = wbytes;
 
-    uint8_t *wbuf = calloc(1, wbytes);
-    int32_t *desc = calloc((size_t)ntensors * E2_DS_STRIDE, 4);
-    if (!wbuf || !desc) { free(wbuf); free(desc); fail(g, "oom for %zu bytes of weights", wbytes); goto bad; }
+    wbuf = calloc(1, wbytes);
+    desc = calloc((size_t)ntensors * E2_DS_STRIDE, 4);
+    if (!wbuf || !desc) { fail(g, "oom for %zu bytes of weights", wbytes); goto bad; }
 
     size_t woff = 0;
     for (int l = 0; l < m->n_layers; l++) {
@@ -362,7 +374,7 @@ e2_gpu *e2_gpu_create(e2_model *m) {
         woff += (size_t)E2_MAX_SEQ * D * 4;
     }
     /* ---- vision tower: weights, norm gammas, axial rope frequencies, position table */
-    {
+    if (m->vision) {
         e2_vision *v = (e2_vision *)m->vision;
         static const int vy[7] = { A_VQ, A_VK, A_VV, A_VTMP, A_VGATE, A_VUP, A_VTMP };
         static const int vqa[7] = { A_VQX, A_VQX, A_VQX, A_VQH, A_VQX, A_VQX, A_VQM };
@@ -458,7 +470,7 @@ e2_gpu *e2_gpu_create(e2_model *m) {
         }
         free(pq); free(psc); free(relk);
     }
-    if (woff > wbytes) { free(desc); free(wbuf); fail(g, "weight buffer overflow"); goto bad; }
+    if (woff > wbytes) { fail(g, "weight buffer overflow"); goto bad; }
     if (getenv("E2_GPU_AUDIO_DEBUG") && au) {
         const float *g0 = (const float *)(wbuf + g->anoff[0].n[2]);
         printf("[audio] anoff0 %d %d %d %d %d %d %d %d %d n_out=%g %g %g %g\n",
@@ -485,24 +497,28 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     g->embout = e2_l0_alloc_shared(g->l0, sizeof(float) * 768 * (size_t)E2_GPU_MAX_ROWS);
     /* per-call vision uploads: the raw patches, their position ids, the valid-patch gather and the
      * axial rope tables, plus the pooler's CSR lists (a patch list and a group offset array). */
-    g->vpix = e2_l0_alloc(g->l0, sizeof(float) * (size_t)E2_V_MAX_PATCHES * E2_V_PATCH);
-    g->vpos = e2_l0_alloc(g->l0, sizeof(int32_t) * (size_t)E2_V_MAX_PATCHES * 2);
-    g->vorder = e2_l0_alloc(g->l0, sizeof(int32_t) * (size_t)E2_V_MAX_PATCHES);
-    g->vgpatch = e2_l0_alloc(g->l0, sizeof(int32_t) * (size_t)E2_V_MAX_PATCHES);
-    g->vgstart = e2_l0_alloc(g->l0, sizeof(int32_t) * (E2_GPU_VGROUPS + 1));
-    g->vpool_ng = e2_l0_alloc_shared(g->l0, sizeof(int32_t));
-    g->vrope = e2_l0_alloc(g->l0, sizeof(float) * 2 * (size_t)E2_GPU_VP * E2_V_HEAD_DIM);
-    g->axin = e2_l0_alloc_shared(g->l0, sizeof(float) * (size_t)E2_A_MAX_TOK * 1024);
-    g->asoft = e2_l0_alloc_shared(g->l0, sizeof(float) * (size_t)E2_A_MAX_TOK * 512);
+    if (m->vision) {
+        g->vpix = e2_l0_alloc(g->l0, sizeof(float) * (size_t)E2_V_MAX_PATCHES * E2_V_PATCH);
+        g->vpos = e2_l0_alloc(g->l0, sizeof(int32_t) * (size_t)E2_V_MAX_PATCHES * 2);
+        g->vorder = e2_l0_alloc(g->l0, sizeof(int32_t) * (size_t)E2_V_MAX_PATCHES);
+        g->vgpatch = e2_l0_alloc(g->l0, sizeof(int32_t) * (size_t)E2_V_MAX_PATCHES);
+        g->vgstart = e2_l0_alloc(g->l0, sizeof(int32_t) * (E2_GPU_VGROUPS + 1));
+        g->vpool_ng = e2_l0_alloc_shared(g->l0, sizeof(int32_t));
+        g->vrope = e2_l0_alloc(g->l0, sizeof(float) * 2 * (size_t)E2_GPU_VP * E2_V_HEAD_DIM);
+    }
+    if (au) {
+        g->axin = e2_l0_alloc_shared(g->l0, sizeof(float) * (size_t)E2_A_MAX_TOK * 1024);
+        g->asoft = e2_l0_alloc_shared(g->l0, sizeof(float) * (size_t)E2_A_MAX_TOK * 512);
+    }
     if (!g->wbuf || !g->acts || !g->part || !g->desc || !g->toktab || !g->ids || !g->valid ||
-        !g->embout || !g->vpix || !g->vpos || !g->vorder || !g->vgpatch || !g->vgstart ||
-        !g->vpool_ng || !g->vrope || !g->axin || !g->asoft) {
-        free(desc); free(wbuf); fail(g, "device allocation failed"); goto bad;
+        !g->embout || (m->vision && (!g->vpix || !g->vpos || !g->vorder || !g->vgpatch ||
+        !g->vgstart || !g->vpool_ng || !g->vrope)) || (au && (!g->axin || !g->asoft))) {
+        fail(g, "device allocation failed: %s", e2_l0_error(g->l0)); goto bad;
     }
     if (e2_l0_write(g->l0, g->wbuf, wbytes, wbuf) ||
         e2_l0_write(g->l0, g->desc, (size_t)ntensors * E2_DS_STRIDE * 4, desc) ||
         e2_l0_write(g->l0, g->toktab, (size_t)E2_VOCAB * m->hidden * 2, m->embed_tokens)) {
-        free(desc); free(wbuf); fail(g, "upload failed: %s", e2_l0_error(g->l0)); goto bad;
+        fail(g, "upload failed: %s", e2_l0_error(g->l0)); goto bad;
     }
     if (getenv("E2_GPU_DESC")) {
         static const char *const rn[A_NREGION] = {
@@ -534,6 +550,8 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     free(wbuf);
     return g;
 bad:
+    free(desc);
+    free(wbuf);
     e2_gpu_destroy(g);
     return NULL;
 }
@@ -810,67 +828,7 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
         {
             const int window = L->sliding ? L->window : 0;
             const int kv_stride = KV * D, q_stride = H * D;
-            /* Pack all sequence/KV-heads together, then run each query tile across all
-             * sequence/query-heads. The scratch cap bounds concurrent scores/P, not input shapes. */
-            if (g->attn_dpas && seq_len >= 64) {
-                const int nseq_a = rows / seq_len, nz = nseq_a * H;
-                const int sup = (seq_len + 127) / 128 * 128;
-                const int nbv = sup / 128, gy = 4, one = 1;
-                if (rowops(g, gr, rows * H, D, A_Q, -1, -1, A_QPK, A_QPS, -1, -1, 16 | 2 | 64, 1.f,
-                           1.f))
-                    goto fail2;
-                void *krow = aoff_ptr(g, A_K2), *vrow = aoff_ptr(g, A_V2);
-                void *kd = aoff_ptr(g, A_KPK), *vd = aoff_ptr(g, A_VPK);
-                void *ksc = aoff_ptr(g, A_KSC), *vsc = aoff_ptr(g, A_VSC);
-                void *kbq = aoff_ptr(g, A_KBSQ), *vbq = aoff_ptr(g, A_VBSQ);
-                KERN("k_attn_packw", (uint32_t)((sup + gy - 1) / gy), 1, (uint32_t)(nseq_a * KV),
-                     32, gy, 1, 13, &krow, sizeof krow, &kd, sizeof kd, &ksc, sizeof ksc,
-                     &kbq, sizeof kbq, &sup, sizeof sup, &D, sizeof D, &kv_stride, sizeof kv_stride,
-                     &one, sizeof one, &seq_len, sizeof seq_len, &D, sizeof D,
-                     &seq_len, sizeof seq_len, &KV, sizeof KV, &valid, sizeof valid);
-                KERN("k_attn_packw", (uint32_t)((D + gy - 1) / gy), 1, (uint32_t)(nseq_a * KV),
-                     32, gy, 1, 13, &vrow, sizeof vrow, &vd, sizeof vd, &vsc, sizeof vsc,
-                     &vbq, sizeof vbq, &D, sizeof D, &sup, sizeof sup, &one, sizeof one,
-                     &kv_stride, sizeof kv_stride, &D, sizeof D, &seq_len, sizeof seq_len,
-                     &seq_len, sizeof seq_len, &KV, sizeof KV, &valid, sizeof valid);
-                size_t cap = g->reg[A_SCR].bytes / (sizeof(float) * (size_t)nz * sup);
-                const size_t pcap = g->reg[A_PB].bytes / ((size_t)nz * sup);
-                const size_t scap = g->reg[A_PBS].bytes / (sizeof(float) * (size_t)nz * nbv);
-                if (cap > pcap) cap = pcap;
-                if (cap > scap) cap = scap;
-                const int mpad = (seq_len + E2_DM - 1) / E2_DM * E2_DM;
-                const int tile = cap < (size_t)mpad ? (int)(cap / E2_DM) * E2_DM : mpad;
-                if (tile < E2_DM) { fail(g, "attention scratch too small"); goto fail2; }
-                void *qp = aoff_ptr(g, A_QPK), *qps = aoff_ptr(g, A_QPS);
-                void *scr = aoff_ptr(g, A_SCR), *pb = aoff_ptr(g, A_PB);
-                void *pasc = aoff_ptr(g, A_PBS), *ctxp = aoff_ptr(g, A_CTX);
-                for (int q0 = 0; q0 < seq_len; q0 += tile) {
-                    const int live = seq_len - q0 < tile ? seq_len - q0 : tile;
-                    const int scores = 0, context = 1;
-                    KERN("k_attn_batch_gemm", (uint32_t)(tile / E2_DM),
-                         (uint32_t)((sup + E2_DN * gy - 1) / (E2_DN * gy)), (uint32_t)nz,
-                         8, gy, 1, 14, &kd, sizeof kd, &ksc, sizeof ksc, &kbq, sizeof kbq,
-                         &qp, sizeof qp, &qps, sizeof qps, &scr, sizeof scr,
-                         &seq_len, sizeof seq_len, &sup, sizeof sup, &D, sizeof D, &H, sizeof H,
-                         &KV, sizeof KV, &q0, sizeof q0, &tile, sizeof tile, &scores, sizeof scores);
-                    KERN("k_attn_softmax", (uint32_t)((live + gy - 1) / gy), 1, (uint32_t)nz,
-                         32, gy, 1, 12, &scr, sizeof scr, &pb, sizeof pb, &pasc, sizeof pasc,
-                         &valid, sizeof valid, &live, sizeof live, &sup, sizeof sup,
-                         &seq_len, sizeof seq_len, &window, sizeof window, &H, sizeof H,
-                         &nbv, sizeof nbv, &q0, sizeof q0, &tile, sizeof tile);
-                    KERN("k_attn_batch_gemm", (uint32_t)(tile / E2_DM),
-                         (uint32_t)((D + E2_DN * gy - 1) / (E2_DN * gy)), (uint32_t)nz,
-                         8, gy, 1, 14, &vd, sizeof vd, &vsc, sizeof vsc, &vbq, sizeof vbq,
-                         &pb, sizeof pb, &pasc, sizeof pasc, &ctxp, sizeof ctxp,
-                         &seq_len, sizeof seq_len, &sup, sizeof sup, &D, sizeof D, &H, sizeof H,
-                         &KV, sizeof KV, &q0, sizeof q0, &tile, sizeof tile, &context, sizeof context);
-                }
-                /* the context is the o projection's input: quantize it (k_attn used to do this) */
-                if (rowops(g, gr, rows, q_stride, A_CTX, -1, -1, A_QAC, A_QACS, -1, -1, 16 | 2, 1.f,
-                           1.f))
-                    goto fail2;
-                goto attn_done;
-            }
+            /* FP32 attention keeps the 0.999 reference gate; INT8 attention failed length_129. */
             {
                 void *ctx = aoff_ptr(g, A_CTX), *q = aoff_ptr(g, A_Q), *k = aoff_ptr(g, A_K2);
                 void *v = aoff_ptr(g, A_V2);
@@ -882,7 +840,6 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
                      sizeof D, &KV, sizeof KV, &q_stride, sizeof q_stride, &kv_stride,
                      sizeof kv_stride, &window, sizeof window, &seq_len, sizeof seq_len);
             }
-        attn_done:;
         }
         /* 5. o projection from the quantized context */
         if (gemm(g, gr, rows, base + E2_DS_O, 1, 512, 0)) goto fail2;
@@ -981,9 +938,6 @@ static const struct { const char *name; int region; } g_dump[] = {
     { "x", A_X },   { "res", A_RES }, { "q", A_Q },     { "k", A_K2 },   { "v", A_V2 },
     { "ctx", A_CTX },
     { "gate", A_GATE }, { "up", A_UP }, { "tmp", A_TMP }, { "ple", A_PLE }, { "emb", A_EMB },
-    { "scr", A_SCR }, { "pb", A_PB }, { "pbs", A_PBS }, { "qpk", A_QPK }, { "kpk", A_KPK },
-    { "qps", A_QPS }, { "ksc", A_KSC }, { "kbq", A_KBSQ }, { "vpk", A_VPK },
-    { "vsc", A_VSC }, { "vbq", A_VBSQ },
 };
 
 static void dump_regions(e2_gpu *g, int rows, int seq_len) {
@@ -1013,19 +967,29 @@ static int run_chunk(e2_gpu *g, const int32_t *ids, const uint8_t *valid, int ro
     /* Reset the full mask because cached graphs also serve differently padded batches. */
     memset(g->valid, 1, (size_t)E2_GPU_MAX_ROWS);
     if (valid) memcpy(g->valid, valid, (size_t)rows);
+    const int nseq = rows / seq_len;
+    float *result = g->embout;
+    for (size_t i = 0; i < (size_t)nseq * E2_EMBED_DIM; i++) result[i] = NAN;
     double t0 = now_ms();
     if (e2_l0_graph_run(g->l0, gr)) return fail(g, "run: %s", e2_l0_error(g->l0));
     g->last_ms = now_ms() - t0;
-    const int nseq = seq_len > 0 ? rows / seq_len : 1;
-    memcpy(out, g->embout, sizeof(float) * 768 * (size_t)nseq);
     g->calls++;
     if (g->dump_dir && g->calls == g->dump_call) dump_regions(g, rows, seq_len);
+    for (int b = 0; b < nseq; b++) {
+        int live = !valid;
+        if (valid)
+            for (int i = 0; i < seq_len; i++) live |= valid[(size_t)b * seq_len + i];
+        const float *p = result + (size_t)b * E2_EMBED_DIM;
+        if (live ? !e2_valid_embedding(p) : !e2_valid_floats(p, E2_EMBED_DIM, 0.f, 0.f))
+            return invalid_output(g, "GPU text inference produced an invalid or unwritten embedding");
+    }
+    memcpy(out, result, sizeof(float) * E2_EMBED_DIM * (size_t)nseq);
     return 0;
 }
 
 int e2_gpu_text_embed(e2_gpu *g, const int32_t *ids, int n_ids, float *out768) {
     char verr[256];
-    if (!g) return fail(NULL, "GPU context is NULL");
+    if (begin_call(g)) return -1;
     if (n_ids <= 0 || n_ids > E2_MAX_SEQ) return fail(g, "sequence length %d out of range", n_ids);
     if (!out768) return fail(g, "output pointer is NULL");
     if (e2_valid_ids(ids, (size_t)n_ids, verr, sizeof verr)) return fail(g, "%s", verr);
@@ -1035,7 +999,7 @@ int e2_gpu_text_embed(e2_gpu *g, const int32_t *ids, int n_ids, float *out768) {
 int e2_gpu_text_embed_batch(e2_gpu *g, const int32_t *ids, const uint8_t *valid, int batch,
                             int seq_len, float *out) {
     char verr[256];
-    if (!g) return fail(NULL, "GPU context is NULL");
+    if (begin_call(g)) return -1;
     if (batch <= 0 || seq_len <= 0 || seq_len > E2_MAX_SEQ ||
         (size_t)batch > SIZE_MAX / (size_t)seq_len / sizeof(*ids) ||
         (size_t)batch > SIZE_MAX / E2_EMBED_DIM / sizeof(*out))
@@ -1060,7 +1024,7 @@ int e2_gpu_text_embed_batch(e2_gpu *g, const int32_t *ids, const uint8_t *valid,
 }
 
 int e2_gpu_audio_embed(e2_gpu *g, const float *pcm, int n_samples, float *out768) {
-    if (!g) return fail(NULL, "GPU context is NULL");
+    if (begin_call(g)) return -1;
     if (!pcm || n_samples <= 0) return fail(g, "empty audio input");
     if (!out768) return fail(g, "output pointer is NULL");
     float *soft = malloc(sizeof(float) * (size_t)E2_A_MAX_TOK * 512);
@@ -1555,7 +1519,7 @@ static e2_graph *agraph_for(e2_gpu *g, int S) {
 }
 
 int e2_gpu_audio_soft(e2_gpu *g, const float *pcm, int n_samples, float *soft, int *n_soft) {
-    if (!g) return fail(NULL, "GPU context is NULL");
+    if (begin_call(g)) return -1;
     e2_audio *a = (e2_audio *)g->m->audio;
     if (!a) return fail(g, "the model has no audio tower");
     if (!pcm || n_samples <= 0) return fail(g, "empty audio input");
@@ -1568,12 +1532,12 @@ int e2_gpu_audio_soft(e2_gpu *g, const float *pcm, int n_samples, float *soft, i
     memcpy(g->axin, fx, sizeof(float) * (size_t)S * 1024);
     e2_graph *gr = agraph_for(g, S);
     if (!gr) return -1;
+    float *result = g->asoft;
+    for (size_t i = 0; i < (size_t)S * 512; i++) result[i] = NAN;
     const double t0 = now_ms();
     if (e2_l0_graph_run(g->l0, gr)) return fail(g, "audio run: %s", e2_l0_error(g->l0));
     g->last_ms = now_ms() - t0;
     g->calls++;
-    memcpy(soft, g->asoft, sizeof(float) * (size_t)S * 512);
-    if (n_soft) *n_soft = S;
     {
         const char *ad = getenv("E2_GPU_AUDIO_DUMP");
         if (ad) {
@@ -1600,6 +1564,10 @@ int e2_gpu_audio_soft(e2_gpu *g, const float *pcm, int n_samples, float *soft, i
             }
         }
     }
+    if (!e2_valid_floats(result, (size_t)S * 512, -FLT_MAX, FLT_MAX))
+        return invalid_output(g, "GPU audio inference produced invalid or unwritten soft tokens");
+    memcpy(soft, result, sizeof(float) * (size_t)S * 512);
+    if (n_soft) *n_soft = S;
     return 0;
 }
 
@@ -1615,9 +1583,12 @@ static int vision_soft_tokens(e2_gpu *g, const float *pixels, const int32_t *pos
                               int n_patches, float *soft, int *n_soft_out) {
     e2_model *m = g->m;
     char verr[256];
+    if (!m->vision) return fail(g, "vision tower not loaded");
     if (n_patches <= 0 || n_patches > E2_V_MAX_PATCHES)
         return fail(g, "patch count %d out of range (max %d)", n_patches, E2_V_MAX_PATCHES);
     if (!pixels) return fail(g, "pixels pointer is NULL");
+    if (!e2_valid_floats(pixels, (size_t)n_patches * E2_V_PATCH, 0.f, 1.f))
+        return fail(g, "image pixels must be finite and in [0,1]");
     /* The positions bound the axial table the patch embedder reads and the pool grid the kernels
      * write to (A_VPOOL holds E2_GPU_VGROUPS rows); both are settled before the gather. */
     int cols = 0, grows = 0;
@@ -1687,6 +1658,9 @@ static int vision_soft_tokens(e2_gpu *g, const float *pixels, const int32_t *pos
     free(scr);
     free(rope);
 
+    for (size_t i = 0; i < (size_t)ng * 512; i++) soft[i] = NAN;
+    if (e2_l0_write(g->l0, aoff_ptr(g, A_VSOFT), sizeof(float) * (size_t)ng * 512, soft))
+        return fail(g, "vision output initialization: %s", e2_l0_error(g->l0));
     double t0 = now_ms();
     if (e2_l0_graph_run(g->l0, gr)) return fail(g, "vision run: %s", e2_l0_error(g->l0));
     g->vlast_ms = now_ms() - t0;
@@ -1745,6 +1719,8 @@ static int vision_soft_tokens(e2_gpu *g, const float *pixels, const int32_t *pos
     if (e2_l0_read(g->l0, aoff_ptr(g, A_VSOFT), sizeof(float) * (size_t)ng * 512, soft)) {
         return fail(g, "soft token read: %s", e2_l0_error(g->l0));
     }
+    if (!e2_valid_floats(soft, (size_t)ng * 512, -FLT_MAX, FLT_MAX))
+        return invalid_output(g, "GPU vision inference produced invalid or unwritten soft tokens");
     *n_soft_out = ng;
     (void)m;
     return 0;
@@ -1752,13 +1728,13 @@ static int vision_soft_tokens(e2_gpu *g, const float *pixels, const int32_t *pos
 
 int e2_gpu_image_embed(e2_gpu *g, const float *pixels, const int32_t *position_ids, int n_patches,
                        float *out768) {
-    if (!g) return fail(NULL, "GPU context is NULL");
+    if (begin_call(g)) return -1;
     if (!out768) return fail(g, "output pointer is NULL");
     float *soft = malloc(sizeof(float) * (size_t)E2_GPU_VGROUPS * 512);
     if (!soft) return fail(g, "oom");
     int n_soft = 0;
     if (vision_soft_tokens(g, pixels, position_ids, n_patches, soft, &n_soft)) { free(soft); return -1; }
-    if (n_soft <= 0) { free(soft); return 0; } /* E2_GPU_VLAYERS: diagnostic run */
+    if (n_soft <= 0) { free(soft); return fail(g, "diagnostic vision graph has no embedding"); }
     const int S = n_soft + 4;
     float *e = calloc((size_t)S * 512, sizeof(float));
     if (!e) { free(soft); return fail(g, "oom"); }
@@ -1780,7 +1756,7 @@ int e2_gpu_image_embed(e2_gpu *g, const float *pixels, const int32_t *position_i
 int e2_gpu_text_image_embed(e2_gpu *g, const int32_t *ids, int n_ids, const float *pixels,
                             const int32_t *position_ids, int n_patches, float *out768) {
     char verr[256];
-    if (!g) return fail(NULL, "GPU context is NULL");
+    if (begin_call(g)) return -1;
     if (n_ids <= 0 || n_ids > E2_MAX_SEQ) return fail(g, "sequence length %d out of range", n_ids);
     if (!out768) return fail(g, "output pointer is NULL");
     if (e2_valid_ids(ids, (size_t)n_ids, verr, sizeof verr)) return fail(g, "%s", verr);
@@ -1792,7 +1768,7 @@ int e2_gpu_text_image_embed(e2_gpu *g, const int32_t *ids, int n_ids, const floa
         free(soft); free(e);
         return -1;
     }
-    if (n_soft <= 0) { free(soft); free(e); return 0; }
+    if (n_soft <= 0) { free(soft); free(e); return fail(g, "diagnostic vision graph has no embedding"); }
     int slot = 0;
     for (int s = 0; s < n_ids; s++) {
         if (ids[s] == 258880) { /* <|image|> */

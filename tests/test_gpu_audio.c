@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "e2.h"
+#include "model.h"
 #include "test_metrics.h"
 #include "e2gpu.h"
 
@@ -77,12 +78,17 @@ int main(int argc, char **argv) {
 
     /* optional synthetic-length mode: e2_test_gpu_audio <model> <fixture> <seconds> */
     if (argc >= 4) {
-        const double sec = atof(argv[3]);
+        char *end;
+        const double sec = strtod(argv[3], &end);
+        if (!*argv[3] || *end || !isfinite(sec) || sec < 161.0 / 16000.0 || sec > 30) return 2;
         const int n = (int)(16000.0 * sec);
         float *sp = malloc(sizeof(float) * (size_t)n);
         float *sout = malloc(sizeof(float) * (size_t)750 * 512);
         if (!sp || !sout) return 2;
         for (int i = 0; i < n; i++) sp[i] = 0.2f * sinf(2.f * 3.14159265f * 220.f * (float)i / 16000.f);
+        float cpu768[768];
+        if (e2_audio_embed(m, sp, n, cpu768)) return 1;
+        const float *cpu_soft = ((e2_audio *)m->audio)->soft;
         const char *sr = getenv("E2_REPS");
         int sreps = sr ? atoi(sr) : 3;
         if (sreps < 1) sreps = 1;
@@ -98,7 +104,7 @@ int main(int argc, char **argv) {
             }
             const double dt = now_ms() - t0;
             if (sn != e2_audio_tokens(n) ||
-                !e2_test_match("synthetic finite soft tokens", sout, sout, (size_t)sn * 512, 0.99))
+                !e2_test_match("synthetic soft tokens vs CPU", sout, cpu_soft, (size_t)sn * 512, 0.99))
                 return 1;
             if (dt < sbest) sbest = dt;
         }
@@ -111,6 +117,7 @@ int main(int argc, char **argv) {
         free(sout);
         e2_gpu_destroy(g);
         e2_free(m);
+        free(text); free(pcm); free(mel); free(mask); free(ref); free(got); free(ids);
         return 0;
     }
 
@@ -171,6 +178,7 @@ int main(int argc, char **argv) {
 
     e2_gpu_destroy(g);
     e2_free(m);
+    free(text); free(pcm); free(mel); free(mask); free(ref); free(got); free(ids);
     printf("OK\n");
     return 0;
 }

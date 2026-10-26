@@ -12,6 +12,7 @@
  * embedder) and, with E2_GPU_DUMP=<dir>, writes the activation to <dir>/gpu_vx.f32 — that is what
  * bisects the port against `E2_DUMP=<dir> e2_test_image`'s v_patch_embed.f32 / v_layer0.f32 / ...
  */
+#include <assert.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,7 +107,8 @@ int main(int argc, char **argv) {
     e2_gpu *g = e2_gpu_create(m);
     if (!g) { fprintf(stderr, "gpu init failed: %s\n", e2_gpu_last_error()); return 1; }
     printf("gpu: %s (upload %.2f s)\n", e2_gpu_device(g), (now_ms() - t0) / 1e3);
-    const int diagnostic = getenv("E2_GPU_VLAYERS") != NULL;
+    const char *vlim = getenv("E2_GPU_VLAYERS");
+    const int diagnostic = vlim && atoi(vlim) >= 0;
     int failures = 0;
 
     { /* image only */
@@ -139,8 +141,19 @@ int main(int argc, char **argv) {
         int checked = 0;
         for (int r = 0; r < reps; r++) {
             const double t = now_ms();
+            if (diagnostic) for (int d = 0; d < 768; d++) gpu[d] = 12345.f;
             if (e2_gpu_image_embed(g, pixels, pos, n_patch, gpu)) {
+                /* A truncated graph can dump stages, but must not claim it produced an embedding. */
+                if (diagnostic && !strcmp(e2_gpu_last_error(), "diagnostic vision graph has no embedding")) {
+                    for (int d = 0; d < 768; d++) assert(gpu[d] == 12345.f);
+                    break;
+                }
                 fprintf(stderr, "gpu: %s\n", e2_gpu_last_error());
+                failures++;
+                break;
+            }
+            if (diagnostic) {
+                fprintf(stderr, "diagnostic graph incorrectly returned an embedding success\n");
                 failures++;
                 break;
             }

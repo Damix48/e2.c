@@ -52,3 +52,51 @@ fi
 sh "$ROOT/tools/export_models.sh" "$WORK/model" "$WORK/out" "$WORK/bin"
 (cd "$WORK/out" && sha256sum -c manifest.sha256)
 echo 'artifact integrity and failed replacement preservation OK'
+
+# The GPU release gate must fail closed without weights, a compiled backend, or real device checks.
+mkdir -p "$WORK/no-weights"
+if sh "$ROOT/tools/check_gpu.sh" "$WORK/no-weights" "$WORK/no-weights-build" 1; then
+    echo 'GPU gate accepted missing weights' >&2; exit 1
+fi
+[ ! -e "$WORK/no-weights-build" ]
+printf tokenizer >"$WORK/model/tokenizer.json"
+cat >"$WORK/bin/cmake" <<'EOF'
+#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -B ]; then
+        mkdir -p "$2"
+        cp /bin/true "$2/e2_test_gpu_soak"
+        break
+    fi
+    shift
+done
+EOF
+cat >"$WORK/bin/ctest" <<'EOF'
+#!/bin/sh
+set -eu
+[ -z "${E2_GPU_ONLY+x}" ] || { echo 'diagnostic override leaked into the gate' >&2; exit 99; }
+[ "${E2_GPU:-}" = "$GPU_GATE_DEVICE" ] || { echo 'device selection lost' >&2; exit 99; }
+case " $* " in
+  *' -N '*)
+    if [ "$GPU_GATE_CASE" = backend ]; then echo 'Total Tests: 0'; exit 0; fi
+    for t in gpu_copy gpu_profile_fallback gpu_l0_runtime gpu_attn_recipe gpu_text gpu_image gpu_audio \
+             gpu_text_reference gpu_validation gpu_shapes gpu_runtime gpu_lifecycle gpu_audio_reference gpu_soak; do
+        echo "Test #1: $t"
+    done ;;
+  *) if [ "$GPU_GATE_CASE" = skipped ]; then echo '1/1 gpu_copy ***Skipped'; else exit 8; fi ;;
+esac
+EOF
+chmod +x "$WORK/bin/cmake" "$WORK/bin/ctest"
+for mode in backend skipped failed; do
+    if GPU_GATE_CASE=$mode GPU_GATE_DEVICE=audit-device E2_GPU=audit-device E2_GPU_ONLY=1 sh "$ROOT/tools/check_gpu.sh" "$WORK/model" "$WORK/gate-$mode" 1 \
+        >"$WORK/gate-$mode.log" 2>&1; then
+        echo "GPU gate accepted $mode checks" >&2; exit 1
+    fi
+    case "$mode" in
+      backend) grep -q 'required Intel GPU test missing' "$WORK/gate-$mode.log" ;;
+      skipped) grep -q 'refuses skipped or missing checks' "$WORK/gate-$mode.log" ;;
+    esac
+    ! grep -E 'diagnostic override leaked|device selection lost' "$WORK/gate-$mode.log"
+done
+echo 'GPU gate missing-checkpoint/backend, skipped-check and failing-check rejection OK'

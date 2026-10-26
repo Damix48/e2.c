@@ -148,7 +148,7 @@ int main(void) {
         /* 5. profiling was switched off on this graph, so its timestamp buffer must still be freed */
         frees = 0;
         e2_l0_graph_free(g_l0, gr);
-        check(frees == 1, "profile buffer freed although profiling was switched off");
+        check(frees == 2, "profile buffer and completion cookie freed although profiling was switched off");
     }
 
     /* 4. a rejected barrier propagates as a failure and is not turned into another launch. */
@@ -169,7 +169,7 @@ int main(void) {
         check(ts_calls == 2 && launch_calls == 1, "profiled graph: both timestamps around one launch");
         frees = 0;
         e2_l0_graph_free(g_l0, gr);
-        check(frees == 1, "profiled graph: timestamp buffer freed");
+        check(frees == 2, "profiled graph: timestamp buffer and completion cookie freed");
     }
 
     e2_l0_free(g_l0, dev_a);

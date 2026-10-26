@@ -8,8 +8,7 @@
  * whole inference. The command list also lets a fixed shape be recorded once and replayed: the graph
  * of an embedding depends on nothing but the sequence length.
  *
- * Everything here is deliberately small: one context, one in-order queue, no events (a single fence
- * per submission), no images, no SVM.
+ * One context and queue; every submission waits and checks a fresh completion cookie. No images.
  */
 #ifndef E2_L0_H
 #define E2_L0_H
@@ -24,6 +23,12 @@ typedef struct e2_graph e2_graph; /* one recorded command list */
 
 e2_l0 *e2_l0_create(char *err, size_t errn);
 void e2_l0_destroy(e2_l0 *g);
+/* Execution/output failures retire the context. A pending submission's resources live until exit. */
+int e2_l0_ready(e2_l0 *g);
+int e2_l0_invalidate(e2_l0 *g, const char *reason);
+
+/* Fixed upper bound per queue wait; a supervisor must also bound blocking driver calls. */
+#define E2_L0_TIMEOUT_NS UINT64_C(30000000000)
 
 const char *e2_l0_device_name(e2_l0 *g);
 uint32_t e2_l0_eu_count(e2_l0 *g);
@@ -56,7 +61,7 @@ e2_graph *e2_l0_graph_begin(e2_l0 *g, int barrier);
 int e2_l0_append(e2_l0 *g, e2_graph *gr, const char *kernel, uint32_t gx, uint32_t gy, uint32_t gz,
                  uint32_t lx, uint32_t ly, uint32_t lz, int nargs, ...);
 int e2_l0_graph_close(e2_l0 *g, e2_graph *gr);
-/* Submit and wait. Returns 0 on success. */
+/* Submit, wait at most 30 s, and verify completion. Failure retires the context; never retry it. */
 int e2_l0_graph_run(e2_l0 *g, e2_graph *gr);
 void e2_l0_graph_free(e2_l0 *g, e2_graph *gr);
 

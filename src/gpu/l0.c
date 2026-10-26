@@ -18,6 +18,9 @@ struct e2_l0 {
     uint32_t eus, clock;
     uint64_t timer_res; /* device timestamp cycles per second */
     int prof;
+    int failed, pending;
+    void *stage; /* owned copy scratch: a timed-out transfer must not reference caller memory */
+    uint64_t *copy_done;
     char name[256];
     char err[2048];
 };
@@ -27,7 +30,7 @@ struct e2_graph {
     int barrier; /* append a barrier after each kernel: the graph is strictly sequential */
     int prof;
     void *ts; /* shared uint64: 2 timestamps per kernel */
-    int nts;  /* timestamps written */
+    uint64_t *done; /* [expected, observed], the final command copies expected into observed */
     int n;    /* kernels profiled */
     int cap;
     char (*names)[24];
@@ -42,8 +45,16 @@ void e2_l0_set_error(e2_l0 *g, const char *fmt, ...) {
     va_end(ap);
 }
 
+int e2_l0_ready(e2_l0 *g) { return !g->failed; }
+
+int e2_l0_invalidate(e2_l0 *g, const char *reason) {
+    if (!g->failed) e2_l0_set_error(g, "%s; GPU context unusable, restart worker", reason);
+    g->failed = 1;
+    return -1;
+}
+
 #define L0_FAIL(g, expr, r_) do { \
-    if (!(g)->err[0]) e2_l0_set_error(g, "%s -> 0x%x", #expr, r_); } while (0)
+    e2_l0_set_error(g, "%s -> 0x%x", #expr, r_); } while (0)
 #define L0_OK(g, expr) do { ze_result_t r_ = (expr); \
     if (r_ != ZE_RESULT_SUCCESS) { L0_FAIL(g, expr, r_); return -1; } } while (0)
 #define L0_OK_P(g, expr) do { ze_result_t r_ = (expr); \
@@ -121,14 +132,20 @@ fail:
 
 void e2_l0_destroy(e2_l0 *g) {
     if (!g) return;
-    for (int i = 0; i < g->nkernels; i++) zeKernelDestroy(g->kernels[i].k);
-    if (g->mod) zeModuleDestroy(g->mod);
-    if (g->queue) zeCommandQueueDestroy(g->queue);
-    if (g->ctx) zeContextDestroy(g->ctx);
+    /* A timeout is not cancellation: the device may still use every allocation and command list. */
+    if (!g->pending) {
+        e2_l0_free(g, g->stage);
+        e2_l0_free(g, g->copy_done);
+        for (int i = 0; i < g->nkernels; i++) zeKernelDestroy(g->kernels[i].k);
+        if (g->mod) zeModuleDestroy(g->mod);
+        if (g->queue) zeCommandQueueDestroy(g->queue);
+        if (g->ctx) zeContextDestroy(g->ctx);
+    }
     free(g);
 }
 
 int e2_l0_reload(e2_l0 *g) {
+    if (g->failed) return -1;
     size_t n = 0;
     const unsigned char *spv = e2_l0_spirv(&n);
     if (!spv || !n) { e2_l0_set_error(g, "no embedded SPIR-V"); return -1; }
@@ -154,6 +171,7 @@ int e2_l0_reload(e2_l0 *g) {
 }
 
 ze_kernel_handle_t e2_l0_kernel(e2_l0 *g, const char *name) {
+    if (g->failed) return NULL;
     for (int i = 0; i < g->nkernels; i++)
         if (!strcmp(g->kernels[i].name, name)) return g->kernels[i].k;
     if (g->nkernels >= (int)(sizeof g->kernels / sizeof g->kernels[0])) {
@@ -175,6 +193,7 @@ ze_kernel_handle_t e2_l0_kernel(e2_l0 *g, const char *name) {
 }
 
 void *e2_l0_alloc(e2_l0 *g, size_t bytes) {
+    if (g->failed) return NULL;
     if (!bytes) bytes = 8;
     ze_device_mem_alloc_desc_t desc = { .stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC };
     void *p = NULL;
@@ -185,9 +204,10 @@ void *e2_l0_alloc(e2_l0 *g, size_t bytes) {
     return p;
 }
 
-void e2_l0_free(e2_l0 *g, void *p) { if (p) zeMemFree(g->ctx, p); }
+void e2_l0_free(e2_l0 *g, void *p) { if (p && !g->pending) zeMemFree(g->ctx, p); }
 
-void *e2_l0_alloc_host(e2_l0 *g, size_t bytes) {
+static void *e2_l0_alloc_host(e2_l0 *g, size_t bytes) {
+    if (g->failed) return NULL;
     if (!bytes) bytes = 8;
     ze_host_mem_alloc_desc_t desc = { .stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC };
     void *p = NULL;
@@ -201,6 +221,7 @@ void *e2_l0_alloc_host(e2_l0 *g, size_t bytes) {
 /* Memory both sides touch: the driver guarantees device access to shared memory, while host memory is
  * only promised to the CPU (reading token ids from it produced garbage rather than an error). */
 void *e2_l0_alloc_shared(e2_l0 *g, size_t bytes) {
+    if (g->failed) return NULL;
     if (!bytes) bytes = 8;
     ze_host_mem_alloc_desc_t hdesc = { .stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC };
     ze_device_mem_alloc_desc_t ddesc = { .stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC };
@@ -212,30 +233,76 @@ void *e2_l0_alloc_shared(e2_l0 *g, size_t bytes) {
     return p;
 }
 
-/* A one-off copy: record it, run it, wait. These happen at load time or once per call (the input
- * embeddings and the output vector), so the round trip is irrelevant. */
-static int copy_and_run(e2_l0 *g, void *dst, const void *src, size_t bytes) {
-    ze_command_list_desc_t cldesc = { .stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC };
-    ze_command_list_handle_t list = NULL;
-    L0_OK(g, zeCommandListCreate(g->ctx, g->dev, &cldesc, &list));
-    ze_result_t r = zeCommandListAppendMemoryCopy(list, dst, src, bytes, NULL, 0, NULL);
-    if (r == ZE_RESULT_SUCCESS) r = zeCommandListClose(list);
-    if (r == ZE_RESULT_SUCCESS) r = zeCommandQueueExecuteCommandLists(g->queue, 1, &list, NULL);
-    if (r == ZE_RESULT_SUCCESS) r = zeCommandQueueSynchronize(g->queue, UINT64_MAX);
-    zeCommandListDestroy(list);
-    if (r != ZE_RESULT_SUCCESS) { e2_l0_set_error(g, "memory copy -> 0x%x", r); return -1; }
+static ze_result_t append_completion(ze_command_list_handle_t list, uint64_t *done) {
+    ze_result_t r = zeCommandListAppendBarrier(list, NULL, 0, NULL);
+    if (r == ZE_RESULT_SUCCESS)
+        r = zeCommandListAppendMemoryCopy(list, done + 1, done, sizeof *done, NULL, 0, NULL);
+    return r;
+}
+
+static int run_list(e2_l0 *g, ze_command_list_handle_t list, uint64_t *done) {
+    if (g->failed) return -1;
+    volatile uint64_t *cookie = done;
+    cookie[0] = cookie[0] + 1;
+    cookie[1] = ~cookie[0];
+    g->pending = 1;
+    ze_result_t r = zeCommandQueueExecuteCommandLists(g->queue, 1, &list, NULL);
+    if (r == ZE_RESULT_SUCCESS) r = zeCommandQueueSynchronize(g->queue, E2_L0_TIMEOUT_NS);
+    if (r != ZE_RESULT_SUCCESS) {
+        char reason[128];
+        snprintf(reason, sizeof reason, "GPU execute/wait -> 0x%x%s", r,
+                 r == ZE_RESULT_NOT_READY ? " (30 s timeout)" : "");
+        return e2_l0_invalidate(g, reason);
+    }
+    if (cookie[1] != cookie[0])
+        return e2_l0_invalidate(g, "GPU submission has no fresh completion cookie");
+    g->pending = 0;
+    return 0;
+}
+
+/* Bounded, owned staging also keeps a timed-out DMA away from the caller's freed input/output. */
+#define E2_COPY_BYTES (4u << 20)
+static int copy_and_run(e2_l0 *g, void *device, void *host, size_t bytes, int reading) {
+    if (g->failed) return -1;
+    if (!g->stage) g->stage = e2_l0_alloc_host(g, E2_COPY_BYTES);
+    if (!g->copy_done) {
+        g->copy_done = e2_l0_alloc_shared(g, 2 * sizeof(uint64_t));
+        if (g->copy_done) memset(g->copy_done, 0, 2 * sizeof(uint64_t));
+    }
+    if (!g->stage || !g->copy_done) return -1;
+    for (size_t off = 0; off < bytes;) {
+        const size_t n = bytes - off < E2_COPY_BYTES ? bytes - off : E2_COPY_BYTES;
+        void *dev = (char *)device + off, *p = (char *)host + off;
+        if (!reading) memcpy(g->stage, p, n);
+        ze_command_list_desc_t desc = { .stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC };
+        ze_command_list_handle_t list = NULL;
+        L0_OK(g, zeCommandListCreate(g->ctx, g->dev, &desc, &list));
+        ze_result_t r = zeCommandListAppendMemoryCopy(list, reading ? g->stage : dev,
+                                                     reading ? dev : g->stage, n, NULL, 0, NULL);
+        if (r == ZE_RESULT_SUCCESS) r = append_completion(list, g->copy_done);
+        if (r == ZE_RESULT_SUCCESS) r = zeCommandListClose(list);
+        int rc = -1;
+        if (r == ZE_RESULT_SUCCESS) rc = run_list(g, list, g->copy_done);
+        else e2_l0_set_error(g, "recording memory copy -> 0x%x", r);
+        if (!g->pending) zeCommandListDestroy(list);
+        if (rc) return -1;
+        if (reading) memcpy(p, g->stage, n);
+        off += n;
+    }
     return 0;
 }
 
 int e2_l0_write(e2_l0 *g, void *dst, size_t bytes, const void *src) {
-    return copy_and_run(g, dst, src, bytes);
+    return copy_and_run(g, dst, (void *)src, bytes, 0);
 }
 
 int e2_l0_read(e2_l0 *g, const void *src, size_t bytes, void *dst) {
-    return copy_and_run(g, dst, src, bytes);
+    return copy_and_run(g, (void *)src, dst, bytes, 1);
 }
 
 e2_graph *e2_l0_graph_begin(e2_l0 *g, int barrier) {
+    if (g->failed) return NULL;
+    g->err[0] = 0;
     e2_graph *gr = calloc(1, sizeof *gr);
     if (!gr) { e2_l0_set_error(g, "oom"); return NULL; }
     gr->barrier = barrier;
@@ -246,6 +313,13 @@ e2_graph *e2_l0_graph_begin(e2_l0 *g, int barrier) {
         free(gr);
         return NULL;
     }
+    gr->done = e2_l0_alloc_shared(g, 2 * sizeof(uint64_t));
+    if (!gr->done) {
+        zeCommandListDestroy(gr->list);
+        free(gr);
+        return NULL;
+    }
+    memset(gr->done, 0, 2 * sizeof(uint64_t));
     if (gr->prof) {
         gr->cap = 1024;
         gr->ts = e2_l0_alloc_shared(g, sizeof(uint64_t) * (size_t)gr->cap * 2 + 16);
@@ -254,6 +328,7 @@ e2_graph *e2_l0_graph_begin(e2_l0 *g, int barrier) {
             e2_l0_set_error(g, "oom for the profile buffer");
             free(gr->names);
             if (gr->ts) e2_l0_free(g, gr->ts);
+            e2_l0_free(g, gr->done);
             zeCommandListDestroy(gr->list);
             free(gr);
             return NULL;
@@ -328,6 +403,8 @@ int e2_l0_append(e2_l0 *g, e2_graph *gr, const char *kname, uint32_t gx, uint32_
 }
 
 int e2_l0_graph_close(e2_l0 *g, e2_graph *gr) {
+    if (g->failed) return -1;
+    L0_OK(g, append_completion(gr->list, gr->done));
     L0_OK(g, zeCommandListClose(gr->list));
     return 0;
 }
@@ -337,8 +414,7 @@ int e2_l0_graph_close(e2_l0 *g, e2_graph *gr) {
  * track that submission on this driver, which silently turns a wait into a no-op and lets host reads
  * race the kernels (that cost an afternoon - the GEMM looked like it wrote zeros). */
 int e2_l0_graph_run(e2_l0 *g, e2_graph *gr) {
-    L0_OK(g, zeCommandQueueExecuteCommandLists(g->queue, 1, &gr->list, NULL));
-    L0_OK(g, zeCommandQueueSynchronize(g->queue, UINT64_MAX));
+    if (run_list(g, gr->list, gr->done)) return -1;
     if (gr->prof) e2_l0_graph_report(g, gr);
     return 0;
 }
@@ -364,6 +440,10 @@ void e2_l0_graph_report(e2_l0 *g, e2_graph *gr) {
     int *cnt = calloc(1024, sizeof *cnt);
     long *minv = calloc(1024, sizeof *minv);
     long *maxv = calloc(1024, sizeof *maxv);
+    if (!names || !tot || !cnt || !minv || !maxv) {
+        free(names); free(tot); free(cnt); free(minv); free(maxv);
+        return;
+    }
     int nn = 0;
     for (int i = 0; i < gr->n; i++) {
         const long d = (long)(ts[2 * i + 1] - ts[2 * i]);
@@ -388,7 +468,8 @@ void e2_l0_graph_report(e2_l0 *g, e2_graph *gr) {
 
 void e2_l0_graph_free(e2_l0 *g, e2_graph *gr) {
     if (!gr) return;
-    zeCommandListDestroy(gr->list);
+    if (!g->pending) zeCommandListDestroy(gr->list);
+    e2_l0_free(g, gr->done);
     /* Not gated on gr->prof: append() clears that flag when timestamp writes turn out to be
      * unsupported, and the buffers it allocated are still here. */
     if (gr->ts) e2_l0_free(g, gr->ts);

@@ -1,5 +1,5 @@
 /* Graph turnover and padded/chunked attention regression. Compile without finite-only math.
- * Usage: e2_test_gpu_shapes <model_dir> <fixture_dir> [--audio] (audio needs safetensors, not the old cache). */
+ * Usage: e2_test_gpu_shapes <model_dir> <fixture_dir> [--audio] (requires an audio tower). */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

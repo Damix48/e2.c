@@ -26,11 +26,6 @@ enum {
     A_QAC, A_QACS, /* ctx, K=2048, nb=16 */
     A_QAM, A_QAMS, /* mlp intermediate, K=2048, nb=16 */
     A_QAP, A_QAPS, /* ple gate, K=512, nb=4 */
-    A_QPK, A_QPS,  /* attention: Q quantized per (head,row) + its block scales */
-    A_KPK, A_KSC, A_KBSQ, /* attention: K packed into the DPAS A layout (+scale, +block sums) */
-    A_VPK, A_VSC, A_VBSQ, /* attention: V^T packed the same way */
-    A_SCR,         /* attention: bounded (sequence, head, query tile, key) scores */
-    A_PB, A_PBS,   /* attention: the softmax probabilities + their per-128-key-block scales */
     /* ---- vision tower (a separate recorded graph; the regions below are the only memory the two
      * towers do not share, along with the pool/soft-token buffers at the end). */
     A_VX, A_VRES, A_VTMP, A_VQ, A_VK, A_VV, A_VCTX, A_VGATE, A_VUP,
@@ -110,7 +105,6 @@ struct e2_gpu {
     int max_rows;
     int vlayer_limit;     /* E2_GPU_VLAYERS: diagnostic truncation of the vision graph */
     int gemm_dp4a;        /* E2_GPU_DP4A=1: use the dp4a tiled GEMM instead of the XMX one */
-    int attn_dpas;        /* E2_GPU_ATTN_OLD=1: use the scalar k_attn instead of the XMX attention */
     int vattn_old;        /* E2_GPU_VATTN_OLD=1: vision attention the pre-fusion way (A/B) */
     int layer_limit;      /* E2_GPU_LAYERS: diagnostic truncation of the graph */
     int only;             /* E2_GPU_ONLY=1: record only the embedding gather */

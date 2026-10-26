@@ -131,6 +131,9 @@ Options: `E2_WITH_GPU`, `E2_WITH_HIP`, `E2_WITH_PNG`, `E2_WITH_JPEG`, `E2_WITH_W
   tuning knob - this tree already has too many `E2_*` A/B switches, so add one only with a test.
 - If you optimize one backend, verify the others were not regressed; the CPU path is the reference for
   both GPU backends.
+- **Complexity is only paid for with speed.** Reject tiny speed gains that add complexity; prefer
+  substantial wins. Every optimization attempt - accepted or rejected - is written up in
+  [PERFORMANCE.md](PERFORMANCE.md) with numbers and the reason it stands or was reverted.
 - Stick to standard C11; no compiler-specific tricks outside the ISA-specific translation units.
 
 # How To Run
@@ -147,6 +150,30 @@ cmake --build build -j
 
 `E2_THREADS=n` pins the pool (`1` disables it), `E2_REPS=n` makes `e2_test` report the best of n runs.
 The GPU test binaries take the same two arguments and skip with 77 when there is no device.
+
+# Performance Tracking
+
+`PERFORMANCE.md` is the performance log: baseline, what is already optimized, every attempt with its
+numbers and its verdict, and the next targets. Read it before optimizing and record the result in it
+afterwards - an attempt that is not in that file does not exist, and a speed claim that is not in that
+file is not a speed claim.
+
+```bash
+# Structured timings per stage, best of N, load time excluded (the only useful figure on this laptop)
+E2_THREADS=14 taskset -c 0-13 ./build/e2_text_bench models/embeddinggemma-2 tests/fixtures cpu 17 8 21
+E2_REPS=7 ./build/e2_test models/embeddinggemma-2 tests/fixtures
+
+# Serial, alternating A/B against another engine on matched inputs
+python3 tools/bench/bench_compare.py --model-dir models/embeddinggemma-2 --fixture-dir tests/fixtures
+
+# Per-region wall-clock breakdown of one embedding
+E2_PROFILE=1 ./build/e2_test models/embeddinggemma-2 tests/fixtures
+```
+
+Rules for the numbers: same session, same machine, best of N, alternating binaries for any A/B; this
+machine throttles and the iGPU's reported clock is not the clock it runs at. A change that touches the
+arithmetic must move a fidelity number in `tests/`, not merely pass. Accepted and rejected attempts
+both stay in the log, with the cause of the win or of the null result.
 
 # Debugging Notes
 
@@ -179,46 +206,6 @@ Baked into `src/model.h` and checked against the checkpoint at load:
 | head_dim 256 local / 512 global, 5:1 local:global | position table 10240, axial 2D RoPE | attention chunk 12, relative window 12 |
 | sliding window 1024, RoPE theta 1e4 global / 1e6 local | max patches 2520 (280 soft tokens) | mel 128 bins, FFT 512, hop 160 (10 ms) |
 | vocab 262144, context 2048 (8K weights, tables to 2048) | | max 30 s -> 750 soft tokens |
-
-# Known Pitfalls (Historical Bugs)
-
-Each of these cost real debugging time and none of them was caught by an ordinary end-to-end test:
-
-* **Wrong SIMD exponential polynomial.** `1+r*P(r)` instead of `1+r+r*r*P(r)` in the AVX2 and
-  AVX-512 range reduction. It passed every e2e fixture (cos 0.998399); only a 42-case golden corpus
-  made it visible. `test_softmax` is the regression.
-* **Unvalidated patch positions.** Caller-supplied coordinates indexed the axial position table and
-  sized the pool grid: one patch at `(300,300)` produced a 31 MB heap-buffer-overflow write. Also the
-  reason `validation.h` exists - every public entry point validates ids, positions and pointers.
-* **`setjmp`/`longjmp` locals in the JPEG error path.** `buf` and `created` were non-volatile and
-  written between `setjmp` and `longjmp`, so cleanup read indeterminate values and leaked the RGB
-  buffer plus ~12 KiB of libjpeg state on every malformed file. Fuzzing the decode path found it.
-* **PNG row-0 filter state.** A missing zeroed "previous row" for row 0 hid behind every real image
-  happening to start with the Sub or None filter; the filter bytes live inside the compressed stream,
-  so a mutation fuzzer cannot reach them. The 45-case filter matrix in `png.bin` is the regression.
-* **`e2_tensor_exists` must ask both cache kinds.** It probed `Q8C_BF16` only, so the vision tower's
-  probe tensor (an int8-quantized weight, stored as `Q8C_Q8W`) looked absent and a full cache loaded
-  with no vision tower at all. The export verification catches this: it read every file back and the
-  two image shapes failed with "vision tower not loaded" while the text shapes passed.
-* **Attention past 513 tokens.** The blocked attention path only existed for short sequences; the
-  longer window silently used the wrong shape. `test_text_attention` and the 514/2048 rows of
-  [PERFORMANCE.md](PERFORMANCE.md#cpu-single-item) cover it.
-* **Duplicate launches under profiling.** Retrying a timestamp append by falling back to a plain
-  launch ran the kernel twice. `test_l0_profile_fallback` links with `-Wl,--wrap=zeCommandListAppend*`
-  to force each failure mode.
-* **Leaked int8 weights across loads.** The text tower's ~570 MB of quantized weights were not freed
-  by `e2_free` (three cycles retained 143 -> 285 -> 427 MB). `test_lifecycle` checks the heap returns.
-* **The vision softmax and the P quantizer are one kernel by contract.** `e2_softmax_quant_i8` skips
-  writing the fp32 probability row because the int8 quantizer is its only consumer; a second consumer
-  makes that fusion illegal, not just slower.
-
-# Documentation
-
-`docs/llms/` holds a local, unpublished corpus: the long design/performance write-up, an external
-architecture review, the unresolved Intel GPU investigation, and the benchmark runbook. It is ignored
-by git and absent from a clone, so do not link to it from committed files. Everything a reader of this
-repository needs is in `README.md`, `PERFORMANCE.md`, `HARDWARE.md`, `AGENTS.md`, `tools/README.md` and
-`tests/fixtures/README.md`.
 
 # License
 

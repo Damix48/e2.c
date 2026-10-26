@@ -154,7 +154,7 @@ if(E2_WITH_GPU)
     add_library(e2_gpu STATIC src/gpu/l0.c src/gpu/gpu.c ${E2_SPV_EMBED})
     target_compile_options(e2_gpu PRIVATE -ffast-math)
     target_include_directories(e2_gpu PUBLIC ${E2_ZE_INC} PRIVATE src)
-    target_link_libraries(e2_gpu PUBLIC ${E2_ZE_LIB} m)
+    target_link_libraries(e2_gpu PUBLIC e2 ${E2_ZE_LIB} m)
 
     add_executable(e2_test_gpu_text tests/test_gpu_text.c)
     target_link_libraries(e2_test_gpu_text PRIVATE e2_gpu e2)
@@ -242,7 +242,8 @@ if(TARGET e2_gpu)
   add_executable(e2_test_gpu_audio tests/test_gpu_audio.c)
   target_link_libraries(e2_test_gpu_audio PRIVATE e2_gpu e2)
   target_include_directories(e2_test_gpu_audio PRIVATE src)
-  foreach(name l0_copy l0_profile_fallback gpu_attn_recipe)
+  foreach(name l0_copy l0_profile_fallback l0_runtime gpu_attn_recipe gpu_runtime
+               gpu_lifecycle gpu_audio_reference gpu_soak)
     add_executable(e2_test_${name} tests/test_${name}.c)
     target_include_directories(e2_test_${name} PRIVATE src)
     target_link_libraries(e2_test_${name} PRIVATE e2_gpu)
@@ -252,6 +253,17 @@ if(TARGET e2_gpu)
     -Wl,--wrap=zeCommandListAppendWriteGlobalTimestamp
     -Wl,--wrap=zeCommandListAppendBarrier
     -Wl,--wrap=zeMemFree)
+  target_link_options(e2_test_l0_runtime PRIVATE
+    -Wl,--wrap=zeCommandQueueExecuteCommandLists
+    -Wl,--wrap=zeCommandQueueSynchronize
+    -Wl,--wrap=zeCommandListAppendMemoryCopy
+    -Wl,--wrap=zeMemFree)
+  target_link_options(e2_test_gpu_runtime PRIVATE
+    -Wl,--wrap=zeCommandQueueExecuteCommandLists
+    -Wl,--wrap=zeCommandQueueSynchronize)
+  target_link_options(e2_test_gpu_lifecycle PRIVATE
+    -Wl,--wrap=zeMemAllocDevice -Wl,--wrap=zeMemAllocShared
+    -Wl,--wrap=zeMemAllocHost -Wl,--wrap=zeMemFree)
 endif()
 
 add_executable(e2_test_metrics tests/test_metrics.c)
@@ -329,8 +341,9 @@ if(BUILD_TESTING)
   if(TARGET e2_gpu)
     add_test(NAME gpu_copy COMMAND e2_test_l0_copy)
     add_test(NAME gpu_profile_fallback COMMAND e2_test_l0_profile_fallback)
+    add_test(NAME gpu_l0_runtime COMMAND e2_test_l0_runtime)
     add_test(NAME gpu_attn_recipe COMMAND e2_test_gpu_attn_recipe)
-    set_tests_properties(gpu_copy gpu_profile_fallback gpu_attn_recipe
+    set_tests_properties(gpu_copy gpu_profile_fallback gpu_l0_runtime gpu_attn_recipe
                          PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
   endif()
   add_test(NAME text_attention COMMAND e2_test_text_attention)
@@ -362,10 +375,21 @@ if(BUILD_TESTING)
       add_test(NAME gpu_text_reference COMMAND e2_test_text_reference "${E2_MODEL_DIR}" "${E2_FIXTURE_DIR}" gpu)
       add_test(NAME gpu_validation COMMAND e2_test_gpu_validation "${E2_MODEL_DIR}")
       add_test(NAME gpu_shapes COMMAND e2_test_gpu_shapes "${E2_MODEL_DIR}" "${E2_FIXTURE_DIR}" --audio)
-      set_tests_properties(gpu_text_reference gpu_validation gpu_shapes PROPERTIES RUN_SERIAL TRUE)
+      add_test(NAME gpu_runtime COMMAND e2_test_gpu_runtime "${E2_MODEL_DIR}" "${E2_FIXTURE_DIR}")
+      add_test(NAME gpu_lifecycle COMMAND e2_test_gpu_lifecycle "${E2_MODEL_DIR}")
+      add_test(NAME gpu_audio_reference COMMAND e2_test_gpu_audio_reference "${E2_MODEL_DIR}" "${E2_FIXTURE_DIR}")
+      add_test(NAME gpu_soak COMMAND e2_test_gpu_soak "${E2_MODEL_DIR}" "${E2_FIXTURE_DIR}" 2)
     endif()
   endif()
 endif()
+
+# A stuck device must not hang CTest indefinitely, including checkpoint-free GPU checks.
+get_property(e2_tests DIRECTORY PROPERTY TESTS)
+foreach(test IN LISTS e2_tests)
+  if(test MATCHES "^gpu_")
+    set_tests_properties(${test} PROPERTIES RUN_SERIAL TRUE TIMEOUT 180 LABELS "intel-gpu")
+  endif()
+endforeach()
 
 # Assertions and finite-value checks must remain real checks in Release builds too.
 get_property(e2_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)

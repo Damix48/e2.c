@@ -217,7 +217,7 @@ static void cpu_sections(e2_model *m, float *pixels, int32_t *pos) {
 #ifdef E2_TEST_GPU
 /* Intel GPU boundaries. Everything here except the last two calls is refused by the host before a
  * graph is recorded or the device is touched, so these cases run on any machine with the backend. */
-static void gpu_section(e2_model *m, const float *pixels, int32_t *pos) {
+static void gpu_section(e2_model *m, float *pixels, int32_t *pos) {
     printf("Intel GPU boundaries\n");
     e2_gpu *g0 = e2_gpu_create(NULL); /* must be refused, not dereferenced */
     if (g0) {
@@ -229,7 +229,8 @@ static void gpu_section(e2_model *m, const float *pixels, int32_t *pos) {
     }
     e2_gpu *g = e2_gpu_create(m);
     if (!g) {
-        printf("  SKIP no Intel GPU: %s\n", e2_gpu_last_error());
+        printf("  FAIL GPU create: %s\n", e2_gpu_last_error());
+        failures++;
         return;
     }
 
@@ -285,6 +286,25 @@ static void gpu_section(e2_model *m, const float *pixels, int32_t *pos) {
                e2_gpu_text_image_embed(g, (int32_t[]){ 2, 258880, 1 }, 3, pixels, pos, grid, NULL),
                e2_gpu_last_error(), 0);
 
+    grid_positions(pos, 3);
+    pos[18] = pos[19] = -1;
+    const float invalid[] = {NAN, INFINITY, -INFINITY, -0.01f, 1.01f};
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        const int at = (i & 1) ? 9 * PATCH_DIM : 0; /* validate supplied padding pixels too */
+        float saved = pixels[at]; pixels[at] = invalid[i];
+        REJECTED_GPU("gpu nonfinite/out-of-range image", 768,
+                     e2_gpu_image_embed(g, pixels, pos, 10, out));
+        REJECTED_GPU("gpu nonfinite text+image", 768,
+                     e2_gpu_text_image_embed(g, (int32_t[]){2,258880,1}, 3, pixels, pos, 10, out));
+        pixels[at] = saved;
+    }
+    float pcm[3200] = {0};
+    const float bad_pcm[] = {NAN, INFINITY, -INFINITY, -1.01f, 1.01f};
+    for (size_t i = 0; i < sizeof bad_pcm / sizeof bad_pcm[0]; i++) {
+        pcm[0] = bad_pcm[i];
+        REJECTED_GPU("gpu nonfinite/out-of-range PCM", 768,
+                     e2_gpu_audio_embed(g, pcm, 3200, out));
+    }
     REJECTED_GPU("gpu audio NULL pcm", 768, e2_gpu_audio_soft(g, NULL, 3200, out, NULL));
     REJECTED_GPU("gpu audio NULL soft", 768, e2_gpu_audio_soft(g, pixels, 3200, NULL, NULL));
     rejected_n("gpu audio NULL out", e2_gpu_audio_embed(g, pixels, 3200, NULL), e2_gpu_last_error(), 0);

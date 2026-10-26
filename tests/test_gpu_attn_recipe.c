@@ -1,7 +1,8 @@
-/* test_gpu_attn_recipe.c — the text tower's int8 attention path against an independent implementation
- * of its own recipe, at the sequence-length boundaries where the towers change shape.
+/* test_gpu_attn_recipe.c — experimental INT8 attention kernels against an independent recipe.
+ * Production text uses FP32 attention because this recipe missed the length_129 accuracy gate.
+ * Keep this isolated check for future precision work, not as production acceptance.
  *
- * The engine's attention on the XMX engine is four kernels (k_attn_packw for K, k_attn_packw for V^T,
+ * The XMX attention recipe uses four kernel kinds (k_attn_packw for K, k_attn_packw for V^T,
  * k_attn_batch_gemm for the scores, k_attn_softmax, k_attn_batch_gemm for the context) whose
  * arithmetic is documented in src/gpu/kernels/e2.cl. The end-to-end tests only look at a 768-element
  * embedding after 24 layers, so an indexing error in one attention block - or a scale read from the
@@ -24,10 +25,8 @@
  * last the context vector by cosine and by relative L2. Each product's oracle uses the validated packed
  * bytes, so permitted upstream rounding differences cannot masquerade as softmax errors.
  *
- * Coverage: one query tile. The host caps the tile at A_SCR (17 MB) / (4 * sequences * heads * sup)
- * rows, so with the text tower's 4 heads a single sequence is one tile up to sup = 1024 (1024 rows fit
- * at 1114112/sup). Longer sequences are launched as several tiles with a q0 offset, which is the same
- * kernel arguments with a different row base, and is not covered here.
+ * Coverage: one query tile, one sequence, all-valid rows and host-packed Q. This does not prove
+ * end-to-end accuracy, arbitrary masking, or turnover between query tiles.
  *
  * Build: see the e2_test_gpu_attn_recipe target in CMakeLists.txt. No fixtures, no model.
  */

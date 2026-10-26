@@ -1,0 +1,35 @@
+name: Intel GPU release checks
+on:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: Long-lived, checked mixed-workload duration
+        type: choice
+        options: ['300', '3600', '14400']
+        default: '300'
+permissions:
+  contents: read
+concurrency:
+  group: intel-gpu-release
+  cancel-in-progress: false
+jobs:
+  checkpoint-release:
+    # Trusted runner only; never expose a device/checkpoint runner to untrusted PR jobs.
+    runs-on: [self-hosted, linux, x64, intel-gpu]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full Intel GPU software gate
+        env:
+          MODEL: ${{ vars.E2_MODEL_DIR }}
+          SOAK_SECONDS: ${{ inputs.soak_seconds }}
+        run: tools/check_gpu.sh "${MODEL:?Set repository variable E2_MODEL_DIR}" build-gpu-release-check "$SOAK_SECONDS"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: intel-gpu-release-evidence
+          path: |
+            build-gpu-release-check/*.log
+            build-gpu-release-check/*.sha256
+            build-gpu-release-check/models/*.log
+            build-gpu-release-check/models/manifest*

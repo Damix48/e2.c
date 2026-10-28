@@ -242,7 +242,7 @@ if(TARGET e2_gpu)
   add_executable(e2_test_gpu_audio tests/test_gpu_audio.c)
   target_link_libraries(e2_test_gpu_audio PRIVATE e2_gpu e2)
   target_include_directories(e2_test_gpu_audio PRIVATE src)
-  foreach(name l0_copy l0_profile_fallback l0_runtime gpu_attn_recipe gpu_runtime
+  foreach(name l0_copy l0_profile_fallback l0_runtime gpu_attn_recipe gpu_attn_f16 gpu_ffn gpu_norm_i8 gpu_runtime
                gpu_lifecycle gpu_audio_reference gpu_soak)
     add_executable(e2_test_${name} tests/test_${name}.c)
     target_include_directories(e2_test_${name} PRIVATE src)
@@ -343,7 +343,10 @@ if(BUILD_TESTING)
     add_test(NAME gpu_profile_fallback COMMAND e2_test_l0_profile_fallback)
     add_test(NAME gpu_l0_runtime COMMAND e2_test_l0_runtime)
     add_test(NAME gpu_attn_recipe COMMAND e2_test_gpu_attn_recipe)
-    set_tests_properties(gpu_copy gpu_profile_fallback gpu_l0_runtime gpu_attn_recipe
+    add_test(NAME gpu_attn_f16 COMMAND e2_test_gpu_attn_f16)
+    add_test(NAME gpu_ffn COMMAND e2_test_gpu_ffn)
+    add_test(NAME gpu_norm_i8 COMMAND e2_test_gpu_norm_i8)
+    set_tests_properties(gpu_copy gpu_profile_fallback gpu_l0_runtime gpu_attn_recipe gpu_attn_f16 gpu_ffn gpu_norm_i8
                          PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
   endif()
   add_test(NAME text_attention COMMAND e2_test_text_attention)

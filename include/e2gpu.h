@@ -1,7 +1,9 @@
 /* e2gpu.h — EmbeddingGemma 2 on the Intel GPU (Level Zero backend).
  *
- * Projection weights and activation blocks match the CPU engine. Text attention is FP32; vision
- * attention is quantized, so fidelity can differ. Experimental: execution guards contain missing
+ * Projections use the CPU engine's int8 weights and per-128 activation quantization. Text attention
+ * selects FP16/INT8 products by sequence length, with FP32 softmax; vision is quantized.
+ * Fidelity can differ.
+ * Experimental: execution guards contain missing
  * progress/invalid outputs but do not establish the cause of historical intermittent failures.
  * See PRODUCTION.md for the software gate and its limits. Scope: text (single or padded batch), vision,
  * tower, and the audio Conformer; the tokenizer, image preprocessing and audio front end stay on the
@@ -72,7 +74,8 @@ int e2_gpu_audio_embed(e2_gpu *g, const float *pcm, int n_samples, float *out768
 /* kernels recorded and wall time of the last audio pass (tower only, front end excluded) */
 int e2_gpu_audio_stats(e2_gpu *g, long *kernels, double *last_ms);
 
-/* Introspection: kernels recorded for the last shape, calls served, and the time of the last call. */
+/* Last text graph's kernel count, number of text-graph executions, and last graph's wall time.
+ * A batch can execute multiple graphs; these are not whole-batch latency/call counters. */
 int e2_gpu_stats(e2_gpu *g, long *calls, long *kernels_last, double *last_ms);
 /* Last fallible GPU call's error, cleared on success; free/info/stats leave it unchanged.
  * Input validation failures leave output untouched. On runtime failure discard the whole batch:

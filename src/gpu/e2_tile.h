@@ -7,6 +7,9 @@
 #ifndef E2_TILE_H
 #define E2_TILE_H
 
+/* k_rowops: quantize the existing values without adding an RMS normalization. */
+#define E2_ROW_QUANT_ONLY (16 | 2)
+
 /* Workgroup: MG lanes along M (local_id(1)) and NG along N (local_id(0)). N is the fast local
  * dimension on purpose - IGC gives the lanes of one SIMD8 consecutive local_id(0) values, so with N
  * fastest the eight lanes of an instruction share a row and the activation load is a broadcast

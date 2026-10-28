@@ -22,7 +22,6 @@
 #define E2_NM 16
 
 /* rows of attention one work group handles (local_size(1)); the kernel is generic in it */
-static int ATTN_GY = 4;
 
 /* E2_BENCH_GEMM=0|1|2 forces the GEMM the shape table times (gemv / dp4a tiled / XMX dpas);
  * unset picks the kernel the engine ships (dpas for more than E2_NM tokens, gemv below).
@@ -492,7 +491,6 @@ static double bench_shape_q(tdev *t, int M, int reps, double *gbs, double *tmacs
 
 int main(int argc, char **argv) {
     const int check_only = argc > 1 && !strcmp(argv[1], "--check");
-    if (getenv("E2_BENCH_ATTN_GY")) ATTN_GY = atoi(getenv("E2_BENCH_ATTN_GY"));
     if (getenv("E2_BENCH_GEMM")) BENCH_MODE = atoi(getenv("E2_BENCH_GEMM"));
     if (getenv("E2_BENCH_GY")) BENCH_GY = atoi(getenv("E2_BENCH_GY"));
     e2_cpu_init();
@@ -579,76 +577,6 @@ int main(int argc, char **argv) {
         e2_l0_free(G, a);
         e2_l0_free(G, b);
     }
-    /* attention on its own, at the shapes the text tower uses */
-    if (!fast) {
-        /* The shapes the tower uses: a document (one sequence, no clipping), the two head dimensions,
-         * and the batch chunk. qstride is H*D and kvstride is KV*D, as gpu.c passes them. */
-        struct { int rows, H, D, KV, qstride, kvstride, window, seq; } ac[] = {
-            { 196, 4, 256, 2, 1024, 512, 512, 0 },   { 196, 4, 512, 1, 2048, 512, 0, 0 },
-            { 960, 4, 256, 2, 1024, 512, 512, 0 },   { 960, 4, 512, 1, 2048, 512, 0, 0 },
-            { 2048, 4, 256, 2, 1024, 512, 512, 0 },  { 1960, 4, 256, 2, 1024, 512, 512, 196 },
-        };
-        const size_t attn_bytes = (size_t)8192 * 2048 * 4;
-        void *qb = e2_l0_alloc(G, attn_bytes), *kb = e2_l0_alloc(G, attn_bytes), *vb = e2_l0_alloc(G, attn_bytes);
-        void *ctx = e2_l0_alloc(G, attn_bytes), *qa = e2_l0_alloc(G, attn_bytes), *asc = e2_l0_alloc(G, attn_bytes);
-        {
-            /* every row of every shape must land inside its buffer, or the probe measures a cache */
-            void *z = calloc(1, attn_bytes);
-            e2_l0_write(G, qb, attn_bytes, z); e2_l0_write(G, kb, attn_bytes, z);
-            e2_l0_write(G, vb, attn_bytes, z); e2_l0_write(G, ctx, attn_bytes, z);
-            e2_l0_write(G, qa, attn_bytes, z); e2_l0_write(G, asc, attn_bytes, z);
-            free(z);
-        }
-        /* the engine always passes a mask, so the probe does too (all-ones: nothing is skipped) */
-        void *valid = NULL;
-        {
-            unsigned char *vb = calloc(8192, 1);
-            memset(vb, 1, 8192);
-            valid = e2_l0_alloc(G, 8192);
-            e2_l0_write(G, valid, 8192, vb);
-            free(vb);
-        }
-        printf("\n%-34s %9s %9s %10s\n", "attention shape", "ms", "GMAC/s", "eff MAC/cyc");
-        for (size_t i = 0; i < sizeof ac / sizeof ac[0]; i++) {
-            const int rows = ac[i].rows, H = ac[i].H, D = ac[i].D, KV = ac[i].KV, win = ac[i].window;
-            const int sq = ac[i].seq ? ac[i].seq : rows;
-            e2_graph *gr = e2_l0_graph_begin(G, 1);
-            int seql = ac[i].seq;
-            OK(e2_l0_append(G, gr, "k_attn", (uint32_t)((rows + ATTN_GY - 1) / ATTN_GY), (uint32_t)H, 1,
-                            32, (uint32_t)ATTN_GY, 1, 15,
-                            &ctx, sizeof ctx, &qb, sizeof qb, &kb, sizeof kb, &vb, sizeof vb, &qa,
-                            sizeof qa, &asc, sizeof asc, &valid, sizeof valid, &rows, sizeof rows, &H,
-                            sizeof H, &D, sizeof D, &KV, sizeof KV, &ac[i].qstride,
-                            sizeof ac[i].qstride, &ac[i].kvstride, sizeof ac[i].kvstride, &win,
-                            sizeof win, &seql, sizeof seql));
-            OK(e2_l0_graph_close(G, gr));
-            double best = 1e9;
-            for (int r = 0; r < 20; r++) {
-                const double t0 = now_ms();
-                OK(e2_l0_graph_run(G, gr));
-                const double dt = now_ms() - t0;
-                if (dt < best) best = dt;
-            }
-            double pairs = 0;
-            for (int r = 0; r < rows; r++) {
-                const int sb = ac[i].seq;
-                const int pos = sb ? r % sb : r;
-                const int slen = sb ? sb : rows;
-                const int lo = (win > 0 && pos - win > 0) ? pos - win : 0;
-                const int hi = (win > 0 && pos + win + 1 < slen) ? pos + win + 1 : slen;
-                pairs += hi - lo;
-            }
-            const double macs = 2.0 * pairs * H * D;
-            char lbl[64];
-            snprintf(lbl, sizeof lbl, "rows=%d H=%d D=%d %s seq=%d", rows, H, D, win ? "sliding" : "full", ac[i].seq);
-            printf("%-34s %9.3f %9.1f %10.3f\n", lbl, best, macs / best / 1e6,
-                   macs / (best * 1e-3) / (128.0 * 2.35e9));
-            e2_l0_graph_free(G, gr);
-        }
-        e2_l0_free(G, qb); e2_l0_free(G, kb); e2_l0_free(G, vb);
-        e2_l0_free(G, ctx); e2_l0_free(G, qa); e2_l0_free(G, asc);
-    }
-
     /* the matrix engine's ceiling for exactly this kernel structure: same tile, same loop shape, no
      * operand loads. Printing it next to the shape table says whether a shape is compute- or load- or
      * dispatch-bound instead of leaving it to inference; the three work-per-sub-group settings are

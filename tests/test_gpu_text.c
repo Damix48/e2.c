@@ -199,9 +199,9 @@ int main(int argc, char **argv) {
             fx = read_fixture(path, &n, &dim);
             if (fx) { memcpy(dids, (const char *)fx + sizeof(float) * (size_t)dim, sizeof(int32_t) * (size_t)n); nd = n; free(fx); }
         }
-        const struct { int batch, seq; const char *label; double ov_ms; } cases[] = {
-            { 8, 17, "8 x 17", 10.7 },
-            { 32, 196, "32 x 196", 280.0 },
+        const struct { int batch, seq; const char *label; } cases[] = {
+            { 8, 17, "8 x 17" },
+            { 32, 196, "32 x 196" },
         };
         for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ci++) {
             const int batch = cases[ci].batch, seq = cases[ci].seq;
@@ -239,9 +239,8 @@ int main(int argc, char **argv) {
             if (bad)
                 printf("batch %-9s FAILED: %s\n", cases[ci].label, e2_gpu_last_error());
             else
-                printf("batch %-9s (%d sequences)  gpu %7.2f ms  %.1f seq/s  kernels %ld   "
-                       "openvino gpu %5.1f ms\n",
-                       cases[ci].label, batch, best, batch / best * 1e3, kernels, cases[ci].ov_ms);
+                printf("batch %-9s (%d sequences)  gpu %7.2f ms  %.1f seq/s  kernels %ld\n",
+                       cases[ci].label, batch, best, batch / best * 1e3, kernels);
             free(ids);
             free(valid);
             free(out);

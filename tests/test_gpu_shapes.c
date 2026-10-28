@@ -42,7 +42,8 @@ static void cache_turnover(e2_gpu *g) {
     const long k1 = kernels(g);
     CHECK(!e2_gpu_text_embed(g, ids, 64, other));
     const long k64 = kernels(g);
-    CHECK(k1 != k64); /* different projection/attention paths */
+    CHECK(k1 == k64); /* all short sequences use the same FP16 attention pipeline */
+    CHECK(g->nslots == 2); /* the different geometries still need separate graphs */
     CHECK(!e2_gpu_text_embed(g, ids, 1, again));
     CHECK(kernels(g) == k1);
     puts("text cache revisit");
@@ -99,7 +100,8 @@ static int read_ids(const char *dir, const char *name, int32_t *ids) {
 }
 
 static void padded_batch(e2_gpu *g, int seq, const int32_t corpus[2][512], const int lengths[2]) {
-    const int per = E2_GPU_MAX_ROWS / seq, batch = per + 1;
+    const int per = seq <= E2_GPU_BATCH_ROWS ? E2_GPU_BATCH_ROWS / seq : 1;
+    const int batch = per + 1;
     const size_t rows = (size_t)batch * seq;
     int32_t *ids = malloc(rows * sizeof *ids);
     uint8_t *valid = malloc(rows);
@@ -129,8 +131,8 @@ static void padded_batch(e2_gpu *g, int seq, const int32_t corpus[2][512], const
 
 /* Arbitrary token IDs and noncontiguous masks: compare equal padded shapes so the scalar/INT8
  * attention threshold and its existing quantization error do not change the reference recipe. */
-static void masked_batch(e2_gpu *g) {
-    enum { S = 196, B = 5 };
+static void masked_batch(e2_gpu *g, int S) {
+    enum { B = 5 };
     int32_t ids[B * S];
     uint8_t valid[B * S];
     float ref[B * 768], out[B * 768];
@@ -143,7 +145,7 @@ static void masked_batch(e2_gpu *g) {
     }
     CHECK(!e2_gpu_text_embed_batch(g, ids, valid, B, S, out));
     for (int b = 0; b < B; b++) compare(out + b * 768, ref + b * 768, 768, 0.999999);
-    puts("noncontiguous masks, every row vs same-shape single: passed");
+    printf("noncontiguous masks S=%d, every row vs same-shape single: passed\n", S);
 }
 
 static void audio_turnover(e2_gpu *g) {
@@ -192,7 +194,8 @@ int main(int argc, char **argv) {
     const int lengths[] = {63, 64, 196, 514, 1025, 2048};
     for (size_t i = 0; i < sizeof lengths / sizeof lengths[0]; i++)
         padded_batch(g, lengths[i], corpus, counts);
-    masked_batch(g);
+    masked_batch(g, 196);
+    masked_batch(g, 512);
     if (argc == 4) audio_turnover(g);
     e2_gpu_destroy(g);
     e2_free(m);

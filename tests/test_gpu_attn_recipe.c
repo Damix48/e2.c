@@ -1,9 +1,9 @@
 /* test_gpu_attn_recipe.c — experimental INT8 attention kernels against an independent recipe.
- * Production text uses FP32 attention because this recipe missed the length_129 accuracy gate.
- * Keep this isolated check for future precision work, not as production acceptance.
+ * Long text uses this unsigned-probability recipe; shorter text uses FP16 attention.
+ * The stage oracle complements, but does not replace, end-to-end embedding checks.
  *
  * The XMX attention recipe uses four kernel kinds (k_attn_packw for K, k_attn_packw for V^T,
- * k_attn_batch_gemm for the scores, k_attn_softmax, k_attn_batch_gemm for the context) whose
+ * k_attn_batch_gemm for the scores, k_attn_softmax, k_attn_i8_ctx for context/quantization) whose
  * arithmetic is documented in src/gpu/kernels/e2.cl. The end-to-end tests only look at a 768-element
  * embedding after 24 layers, so an indexing error in one attention block - or a scale read from the
  * wrong block - can hide behind the softmax of a nearly one-hot row. This test drives the four
@@ -13,10 +13,10 @@
  *   Q   per (token, head) row, one scale per 128-element block           (k_rowops)
  *   K   per (key, kv-head) row, ONE scale over the whole head dim, per-128-block bsq,
  *       keys past the real length written as zero bytes with scale 1     (k_attn_packw)
- *   P   per row, block max mb_b, byte = rte(127 e_k / mb_b), asc = mb_b / (127 l)  (k_attn_softmax)
+ *   P   per row, block max mb_b, byte = rte(255 e_k / mb_b), asc = mb_b / (255 l)  (k_attn_softmax)
  *   V   per (feature, kv-head) row of V^T, ONE scale over the real keys, per-128-key block bsq,
  *       keys past the real length are zero                              (k_attn_packw)
- *   ctx sum_b asc[m,b] * wsc[d] * (dp4a - 128 bsq[b,d])                  (k_attn_batch_gemm)
+ *   ctx sum_b asc[m,b] * wsc[d] * dp4a (P has zero point 0)             (k_attn_i8_ctx)
  *
  * The comparisons are staged so a failure names the stage: the packers' scales (to 1e-6 relative - the
  * device's divide is a fast-math reciprocal), packed bytes (allowing adjacent rounding at a half-integer),
@@ -25,8 +25,8 @@
  * last the context vector by cosine and by relative L2. Each product's oracle uses the validated packed
  * bytes, so permitted upstream rounding differences cannot masquerade as softmax errors.
  *
- * Coverage: one query tile, one sequence, all-valid rows and host-packed Q. This does not prove
- * end-to-end accuracy, arbitrary masking, or turnover between query tiles.
+ * Recipe coverage: one sequence, all-valid rows and host-packed Q. A separate softmax check covers
+ * query/key masks, padding and batch/head/query-tile offsets. End-to-end tests check embedding fidelity.
  *
  * Build: see the e2_test_gpu_attn_recipe target in CMakeLists.txt. No fixtures, no model.
  */
@@ -158,6 +158,8 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
         for (int i = 0; i < D; i++) sv += (double)v[(size_t)r * D + i] * v[(size_t)r * D + i];
         for (int i = 0; i < D; i++) k[(size_t)r * D + i] *= (float)(1.0 / sqrt(ss / D));
         for (int i = 0; i < D; i++) v[(size_t)r * D + i] *= (float)(1.0 / sqrt(sv / D));
+        /* Cover zero-context quantization: neutral bytes and scale 1. */
+        if (S == 63 && KV == 2 && r % KV == 0) memset(v + (size_t)r * D, 0, (size_t)D * sizeof *v);
     }
 
     /* the host half of the recipe: k_rowops' Q quantization, per 128-element block */
@@ -194,7 +196,7 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
     CHECK(!e2_l0_write(g, qpk, nq, qb));
     CHECK(!e2_l0_write(g, qps, sizeof(float) * (size_t)S * H * nbq, qsc));
 
-    const int gy = 4, one = 1, q0 = 0, scores = 0, context = 1;
+    const int gy = 4, one = 1, q0 = 0, wr = 1;
     e2_graph *gr = e2_l0_graph_begin(g, 1);
     CHECK(gr);
     CHECK(!e2_l0_append(g, gr, "k_attn_packw", (uint32_t)((sup + gy - 1) / gy), 1, (uint32_t)KV, 32, gy,
@@ -209,21 +211,22 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
                         &valid_d, sizeof valid_d));
     CHECK(!e2_l0_append(g, gr, "k_attn_batch_gemm", (uint32_t)(tile / E2_DM),
                         (uint32_t)((sup + E2_DN * gy - 1) / (E2_DN * gy)), (uint32_t)H, 8,
-                        (uint32_t)gy, 1, 14, &kpk, sizeof kpk, &ksc_d, sizeof ksc_d, &kbq_d,
+                        (uint32_t)gy, 1, 13, &kpk, sizeof kpk, &ksc_d, sizeof ksc_d, &kbq_d,
                         sizeof kbq_d, &qpk, sizeof qpk, &qps, sizeof qps, &scr_d, sizeof scr_d, &S,
                         sizeof S, &sup, sizeof sup, &D, sizeof D, &H, sizeof H, &KV, sizeof KV, &q0,
-                        sizeof q0, &tile, sizeof tile, &scores, sizeof scores));
+                        sizeof q0, &tile, sizeof tile));
     CHECK(!e2_l0_append(g, gr, "k_attn_softmax", (uint32_t)((S + gy - 1) / gy), 1, (uint32_t)H, 32,
                         gy, 1, 12, &scr_d, sizeof scr_d, &pb_d, sizeof pb_d, &pbs_d, sizeof pbs_d,
                         &valid_d, sizeof valid_d, &S, sizeof S, &sup, sizeof sup, &S, sizeof S,
                         &window, sizeof window, &H, sizeof H, &nbv, sizeof nbv, &q0, sizeof q0,
                         &tile, sizeof tile));
-    CHECK(!e2_l0_append(g, gr, "k_attn_batch_gemm", (uint32_t)(tile / E2_DM),
-                        (uint32_t)((D + E2_DN * gy - 1) / (E2_DN * gy)), (uint32_t)H, 8,
-                        (uint32_t)gy, 1, 14, &vpk, sizeof vpk, &vsc_d, sizeof vsc_d, &vbq_d,
-                        sizeof vbq_d, &pb_d, sizeof pb_d, &pbs_d, sizeof pbs_d, &ctx_d, sizeof ctx_d,
+    CHECK(!e2_l0_append(g, gr, "k_attn_i8_ctx", (uint32_t)(tile / E2_DM),
+                        (uint32_t)(D / 128), (uint32_t)H, 8, 8, 1, 16,
+                        &vpk, sizeof vpk, &vsc_d, sizeof vsc_d, &vbq_d, sizeof vbq_d,
+                        &pb_d, sizeof pb_d, &pbs_d, sizeof pbs_d, &ctx_d, sizeof ctx_d,
                         &S, sizeof S, &sup, sizeof sup, &D, sizeof D, &H, sizeof H, &KV, sizeof KV,
-                        &q0, sizeof q0, &tile, sizeof tile, &context, sizeof context));
+                        &q0, sizeof q0, &tile, sizeof tile, &qpk, sizeof qpk, &qps, sizeof qps,
+                        &wr, sizeof wr));
     CHECK(!e2_l0_graph_close(g, gr));
     CHECK(!e2_l0_graph_run(g, gr));
 
@@ -244,6 +247,21 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
     CHECK(!e2_l0_read(g, vbq_d, sizeof(int) * (size_t)KV * nbv * D, vbq_k));
     CHECK(!e2_l0_read(g, pb_d, nscr, pb_k));
     CHECK(!e2_l0_read(g, pbs_d, sizeof(float) * (size_t)H * tile * nbv, pbs_k));
+
+    uint8_t *cq = malloc(nq);
+    float *cas = malloc((nq / 128) * sizeof *cas);
+    CHECK(cq && cas);
+    CHECK(!e2_l0_read(g, qpk, nq, cq));
+    CHECK(!e2_l0_read(g, qps, (nq / 128) * sizeof *cas, cas));
+    for (size_t b = 0; b < nq / 128; b++) {
+        float mx = 0.f;
+        for (int j = 0; j < 128; j++) mx = fmaxf(mx, fabsf(ctx[b * 128 + j]));
+        const float want = mx > 0.f ? mx / 127.f : 1.f, got = cas[b];
+        CHECK(isfinite(got) && got > 0.f && fabsf(got - want) <= 1e-5f * want);
+        for (int j = 0; j < 128; j++)
+            CHECK(packed_byte_ok(ctx[b * 128 + j] / got, (int)cq[b * 128 + j] - 128));
+    }
+    free(cq); free(cas);
 
     /* ---------------------------------------------------------------- the recipe, on the host */
     /* packers: one scale per row, rte, padded rows zero with scale 1 */
@@ -355,7 +373,7 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
             for (int n = 0; n < S; n++) {
                 eps[n] = (n >= lo_w && n < hi_w) ? exp(s[(size_t)m * sup + n] - m1) : 0.0;
                 l += eps[n];
-                p8[((size_t)m * H + h) * sup + n] = 128; /* masked keys are byte 128, the zero value */
+                p8[((size_t)m * H + h) * sup + n] = 0; /* probabilities are unsigned, with zero point 0 */
             }
             for (int b = 0; b < nbv; b++) {
                 const int lo = b * 128, hi = (b + 1) * 128 < S ? (b + 1) * 128 : S;
@@ -363,15 +381,15 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
                 if (lo < S) {
                     for (int n = lo; n < hi; n++) mb = fmax(mb, eps[n]);
                 }
-                pa[((size_t)m * H + h) * nbv + b] = (mb > 0 && l > 0) ? mb / (127.0 * l) : 0.0;
+                pa[((size_t)m * H + h) * nbv + b] = (mb > 0 && l > 0) ? mb / (255.0 * l) : 0.0;
                 for (int n = lo; n < hi; n++)
                     p8[((size_t)m * H + h) * sup + n] =
-                        (mb > 0 && eps[n] > 0) ? rte((float)(eps[n] * (127.0 / mb))) + 128 : 128;
+                        (mb > 0 && eps[n] > 0) ? fminf(255.f, rintf((float)(eps[n] * (255.0 / mb)))) : 0;
             }
         }
         free(s);
     }
-    /* Centring p8 below already applies the kernel's -128*bsq correction; do not subtract twice. */
+    /* P has zero point 0; unlike Q, the context product must not subtract 128*bsq. */
     for (int h = 0; h < H; h++) {
         const int kvh = h * KV / H;
         for (int b = 0; b < nbv; b++) {
@@ -381,7 +399,7 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
                 for (int d = 0; d < D; d++) {
                     long dot = 0;
                     for (int n = lo; n < hi; n++)
-                        dot += (long)(p8[((size_t)m * H + h) * sup + n] - 128.0) *
+                        dot += (long)p8[((size_t)m * H + h) * sup + n] *
                                (long)vn[((size_t)d * KV + kvh) * sup + n];
                     oref[(size_t)m * qstride + (size_t)h * D + d] +=
                         pa[((size_t)m * H + h) * nbv + b] * vsc[d * KV + kvh] * (double)dot;
@@ -487,6 +505,47 @@ static void run_shape(e2_l0 *g, struct shape sh, unsigned seed) {
     free(ones); free(kbytes); free(vbytes);
 }
 
+/* Equal logits make the unsigned probability bytes and scales exact, including query masks. */
+static void check_softmax_masks(e2_l0 *g) {
+    const int S = 129, N = 256, H = 4, B = 2, tile = 16, M = 2, nb = 2, q0 = 16, window = 0;
+    const size_t count = (size_t)B * H * tile * N, nscale = (size_t)B * H * tile * nb;
+    float *scores = calloc(count, sizeof *scores), *scales = malloc(nscale * 4);
+    uint8_t *prob = malloc(count), valid[258] = {0};
+    CHECK(scores && scales && prob);
+    memset(valid, 1, (size_t)S);
+    valid[16] = valid[128] = 0;
+    void *sd = e2_l0_alloc(g, count * 4), *pd = e2_l0_alloc(g, count);
+    void *ad = e2_l0_alloc(g, nscale * 4), *md = e2_l0_alloc(g, sizeof valid);
+    CHECK(sd && pd && ad && md);
+    CHECK(!e2_l0_write(g, sd, count * 4, scores));
+    CHECK(!e2_l0_write(g, md, sizeof valid, valid));
+    e2_graph *gr = e2_l0_graph_begin(g, 1);
+    CHECK(gr);
+    CHECK(!e2_l0_append(g, gr, "k_attn_softmax", 1, 1, B * H, 32, 4, 1, 12,
+        &sd, sizeof sd, &pd, sizeof pd, &ad, sizeof ad, &md, sizeof md,
+        &M, sizeof M, &N, sizeof N, &S, sizeof S, &window, sizeof window,
+        &H, sizeof H, &nb, sizeof nb, &q0, sizeof q0, &tile, sizeof tile));
+    CHECK(!e2_l0_graph_close(g, gr));
+    CHECK(!e2_l0_graph_run(g, gr));
+    CHECK(!e2_l0_read(g, pd, count, prob));
+    CHECK(!e2_l0_read(g, ad, nscale * 4, scales));
+    for (int z = 0; z < B * H; z++) for (int m = 0; m < M; m++) {
+        const int live = z < H && m == 1;
+        for (int j = 0; j < N; j++)
+            CHECK(prob[((size_t)z * tile + m) * N + j] ==
+                  (live && j < S && valid[j] ? 255 : 0));
+        for (int b = 0; b < nb; b++) {
+            const float want = live && b == 0 ? 1.f / (255.f * 127.f) : 0.f;
+            const float got = scales[((size_t)z * tile + m) * nb + b];
+            CHECK(isfinite(got) && fabsf(got - want) <= 1e-6f * want);
+        }
+    }
+    e2_l0_graph_free(g, gr);
+    e2_l0_free(g, sd); e2_l0_free(g, pd); e2_l0_free(g, ad); e2_l0_free(g, md);
+    free(scores); free(scales); free(prob);
+    puts("unsigned P: masked queries/keys, padding, batch/head and query-tile offsets passed");
+}
+
 int main(void) {
     assert(packed_byte_ok(.5f, 0) && packed_byte_ok(.5f, 1));
     assert(packed_byte_ok(-.5f, 0) && packed_byte_ok(-.5f, -1));
@@ -519,6 +578,7 @@ int main(void) {
     };
     for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++)
         run_shape(g, sizes[i], 7u + (unsigned)i);
+    check_softmax_masks(g);
     e2_l0_destroy(g);
     if (failures) {
         printf("FAILED: %d comparison(s)\n", failures);

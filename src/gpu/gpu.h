@@ -26,6 +26,8 @@ enum {
     A_QAC, A_QACS, /* ctx, K=2048, nb=16 */
     A_QAM, A_QAMS, /* mlp intermediate, K=2048, nb=16 */
     A_QAP, A_QAPS, /* ple gate, K=512, nb=4 */
+    A_TSCR, A_TPROB, /* FP32 scores; FP16 P or unsigned int8 P + block scales */
+    A_TK, A_TV, /* packed FP16 K/V, or int8 K/V with scales and block sums */
     /* ---- vision tower (a separate recorded graph; the regions below are the only memory the two
      * towers do not share, along with the pool/soft-token buffers at the end). */
     A_VX, A_VRES, A_VTMP, A_VQ, A_VK, A_VV, A_VCTX, A_VGATE, A_VUP,
@@ -50,6 +52,7 @@ enum {
 };
 
 #define E2_GPU_MAX_ROWS 2048
+#define E2_GPU_BATCH_ROWS 1024 /* keep batched text activations inside the useful cache working set */
 #define E2_GPU_MAX_NSL 8
 /* Vision shapes: the patch count padded to the two things that need it - E2_DM for the GEMM's
  * unguarded activation reads, and 128 for the key axis of the attention quantization. */
@@ -102,7 +105,6 @@ struct e2_gpu {
     int desc_tensors;
     e2_slot slots[16];
     int nslots;
-    int max_rows;
     int vlayer_limit;     /* E2_GPU_VLAYERS: diagnostic truncation of the vision graph */
     int gemm_dp4a;        /* E2_GPU_DP4A=1: use the dp4a tiled GEMM instead of the XMX one */
     int vattn_old;        /* E2_GPU_VATTN_OLD=1: vision attention the pre-fusion way (A/B) */

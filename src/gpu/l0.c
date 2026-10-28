@@ -154,6 +154,8 @@ int e2_l0_reload(e2_l0 *g) {
     if (g->mod) { zeModuleDestroy(g->mod); g->mod = NULL; }
     ze_module_desc_t mdesc = { .stype = ZE_STRUCTURE_TYPE_MODULE_DESC };
     mdesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    /* Only bulk GEMMs and the fused FFN need 256 GRFs; avoid halving occupancy elsewhere. */
+    mdesc.pBuildFlags = "-ze-opt-large-grf-kernel k_gemm_dpas_large";
     mdesc.inputSize = n;
     mdesc.pInputModule = spv;
     ze_module_build_log_handle_t log = NULL;

@@ -8,11 +8,11 @@
  *    vectors. Graphs are keyed by (rows, sequence length).
  *
  *  - The graph follows the CPU tower in src/text.c, with its projection weights/block sizes and
- *    FP32 text attention. Quantization and summation differences still need reference checks.
- *    Where the CPU pass runs a serial loop over
- *    S x hidden this runs one sub-group per row; where it materializes an (S,S) score block this keeps
- *    an online softmax in registers. The fusions (norm+quantize in one pass, gelu+product+quantize in
- *    one pass, the context quantized inside the attention) exist to keep dependent kernel boundaries
+ *    FP32 accumulation in text attention. Quantization and summation need reference checks.
+ *    Where the CPU pass runs a serial loop over S x hidden this runs one sub-group per row.
+ *    Attention uses packed FP16/INT8 matrix products, materialized scores and FP32 softmax.
+ *    The fusions (norm+quantize, gelu+product+quantize, and context quantization inside attention)
+ *    exist to keep dependent kernel boundaries
  *    down: each one costs a command-list barrier, measured at 2 us on this iGPU against 0.26 us for a
  *    kernel with no dependent successor.
  */
@@ -27,6 +27,8 @@
 #include "../model.h"
 #include "../validation.h"
 #include "gpu.h"
+
+_Static_assert(E2_GPU_BATCH_ROWS <= E2_GPU_MAX_ROWS, "batch working set exceeds GPU workspace");
 
 static char g_err[1024];
 
@@ -183,6 +185,9 @@ static void layout(e2_gpu *g) {
         { A_QAX, R * 512 },      { A_QAXS, R * 4 * 4 },
         { A_QAC, R * 2048 },     { A_QACS, R * 16 * 4 },  { A_QAM, R * 2048 },
         { A_QAMS, R * 16 * 4 },  { A_QAP, R * 512 },      { A_QAPS, R * 4 * 4 },
+        /* Fixed scratch for at most 2048 rows/keys; reused by every layer and cached shape. */
+        { A_TSCR, R * 4 * R * 4 }, { A_TPROB, R * 4 * R * 2 },
+        { A_TK, R * 1024 * 2 }, { A_TV, R * 1024 * 2 },
         /* vision tower. The activations are sized for E2_V_MAX_PATCHES patches, padded to E2_DM
          * (the GEMM reads its activation tile unguarded) and to 128 for the key axis. */
         { A_VX, (size_t)E2_GPU_VP * 768 * 4 },   { A_VRES, (size_t)E2_GPU_VP * 768 * 4 },
@@ -247,7 +252,6 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     if (!g) { fail(NULL, "oom"); return NULL; }
     uint8_t *wbuf = NULL;
     int32_t *desc = NULL;
-    g->max_rows = E2_GPU_MAX_ROWS;
     g->m = m;
     const char *lim = getenv("E2_GPU_LAYERS");
     g->layer_limit = lim ? atoi(lim) : -1;
@@ -527,6 +531,7 @@ e2_gpu *e2_gpu_create(e2_model *m) {
             [A_PLE] = "PLE", [A_EMB] = "EMB",   [A_K2] = "K2",   [A_V2] = "V2",
             [A_QAX] = "QAX", [A_QAXS] = "QAXS", [A_QAC] = "QAC", [A_QACS] = "QACS",
             [A_QAM] = "QAM", [A_QAMS] = "QAMS", [A_QAP] = "QAP", [A_QAPS] = "QAPS",
+            [A_TSCR] = "TSCR", [A_TPROB] = "TPROB", [A_TK] = "TK", [A_TV] = "TV",
             [A_VX] = "VX",   [A_VRES] = "VRES", [A_VTMP] = "VTMP", [A_VQ] = "VQ",
             [A_VK] = "VK",   [A_VV] = "VV",   [A_VCTX] = "VCTX", [A_VQX] = "VQX",
             [A_VQM] = "VQM", [A_VPP] = "VPP", [A_VQPK] = "VQPK", [A_VKPK] = "VKPK",
@@ -607,29 +612,11 @@ static int gemm_gy(int rows) {
     return rows <= 512 ? E2_GEMM_GY_SMALL : E2_GEMM_GY;
 }
 
-/* One or more int8 projections that share their activation input, in one launch (plus the k-slice
- * reduction for the short-sequence path). */
-static int gemm(e2_gpu *g, e2_graph *gr, int rows, int first, int count, int nmax, int tiled) {
+/* One or more int8 projections that share their activation input, in one launch. */
+static int gemm(e2_gpu *g, e2_graph *gr, int rows, int first, int count, int nmax) {
     if (g->limit && g->kernels_last >= g->limit) return 0;
-    void *wbuf = g->wbuf, *acts = g->acts, *part = g->part;
+    void *wbuf = g->wbuf, *acts = g->acts;
     void *d = (char *)g->desc + (size_t)first * E2_DS_STRIDE * 4;
-    /* The split+reduce pair only pays when the tile would be almost entirely padding: it costs two
-     * launches and 16 activation loads per 4 weight loads, where k_gemm_dpas2 needs 3 per k-step.
-     * Measured seq 16 (pair) 7.20 ms vs seq 17 (DPAS) 6.37 ms, and 146 fewer launches. */
-    if (rows <= 4 && !tiled) {
-        const int nsl = 4; /* four k-slices: enough work items to fill 128 EUs at N=512 */
-        const uint32_t gx = (uint32_t)((nmax + 127) / 128);
-        if (e2_l0_append(g->l0, gr, "k_gemv_split", gx, (uint32_t)nsl, (uint32_t)count, 128, 1, 1, 7,
-                         &wbuf, sizeof wbuf, &acts, sizeof acts, &part, sizeof part, &d, sizeof d,
-                         &nsl, sizeof nsl, &rows, sizeof rows, &nmax, sizeof nmax))
-            return -1;
-        if (e2_l0_append(g->l0, gr, "k_gemv_reduce", gx, (uint32_t)count, 1, 128, 1, 1, 6, &acts,
-                         sizeof acts, &part, sizeof part, &d, sizeof d, &nsl, sizeof nsl, &rows,
-                         sizeof rows, &nmax, sizeof nmax))
-            return -1;
-        g->kernels_last += 2;
-        return 0;
-    }
     /* Padded row count: k_gemm_dpas loads its activations unguarded over the E2_DM-tall tile, so the
      * grid rounds M up to E2_DM. The extra rows compute but are never stored (the kernel guards on the
      * real `rows`), and the activation buffer is sized for E2_GPU_MAX_ROWS = 2048, a multiple of E2_DM,
@@ -644,12 +631,15 @@ static int gemm(e2_gpu *g, e2_graph *gr, int rows, int first, int count, int nma
         g->kernels_last++;
         return 0;
     }
-    const int mpad = (rows + E2_DM - 1) / E2_DM * E2_DM;
-    const int gy = gemm_gy(rows); /* sub-groups per work group, each E2_DN features */
-    /* k_gemm_dpas2 is the same tile with a vectorised epilogue (vload8 scales + float8 accumulate);
-     * E2_GPU_GEMM_OLD=1 selects the first version, which is the A/B switch. */
-    const char *kname = getenv("E2_GPU_GEMM_OLD") ? "k_gemm_dpas" : "k_gemm_dpas2";
-    if (e2_l0_append(g->l0, gr, kname, (uint32_t)(mpad / E2_DM),
+    /* Eight-row tiles avoid wasting half the DPAS work on queries and improve occupancy. */
+    const int old = getenv("E2_GPU_GEMM_OLD") != NULL;
+    const int tile = !old && rows <= 128 ? 8 : E2_DM;
+    const int mpad = (rows + tile - 1) / tile * tile;
+    const int gy = gemm_gy(rows);
+    const char *kname = old ? "k_gemm_dpas" :
+                        tile == 8 ? "k_gemm_dpas_small" :
+                        rows > 512 ? "k_gemm_dpas_large" : "k_gemm_dpas2";
+    if (e2_l0_append(g->l0, gr, kname, (uint32_t)(mpad / tile),
                      (uint32_t)((nmax + E2_DN * gy - 1) / (E2_DN * gy)), (uint32_t)count, 8,
                      (uint32_t)gy, 1, 4, &wbuf, sizeof wbuf, &acts, sizeof acts, &d, sizeof d, &rows,
                      sizeof rows))
@@ -713,16 +703,14 @@ static int arowops(e2_gpu *g, e2_graph *gr, int rows, int K, int region_x, int r
     return 0;
 }
 
-/* The audio GEMM always uses the XMX tile, including for a 19-token clip: k_gemv_split's ceiling is
- * 16 rows, and a 19-row audio clip is common enough that the two-row overflow would otherwise select
- * a kernel with the wrong token count. */
+/* Audio projections share their weights across adjacent token subgroups and split K for short clips. */
 static int ageam(e2_gpu *g, e2_graph *gr, int rows, int first, int count, int nmax) {
     if (g->limit && g->kernels_last >= g->limit) return 0;
     void *wbuf = g->wbuf, *acts = g->acts, *part = g->part;
     void *d = (char *)g->desc + (size_t)first * E2_DS_STRIDE * 4;
     const char *ge = getenv("E2_AUDIO_GY");
     const int lgy = ge ? atoi(ge) : (rows <= 128 ? 8 : 32);
-    if (getenv("E2_AUDIO_DPAS_OLD")) return gemm(g, gr, rows, first, count, nmax, 1);
+    if (getenv("E2_AUDIO_DPAS_OLD")) return gemm(g, gr, rows, first, count, nmax);
     const int ntile = (lgy / E2_AMG) * 16;
     const int mtile = E2_DM * E2_AMG; /* rows one work group covers */
     int ksplit = rows <= 128 ? 2 : 1;
@@ -789,10 +777,10 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
     }
     if (g->only == 1) goto done; /* diagnostic: only the embedding gather */
     /* quantize the input for the PLE projection (and the first layer re-quantizes after its norm) */
-    if (rowops(g, gr, rows, 512, A_X, -1, -1, A_QAX, A_QAXS, -1, -1, 16 | 2, 1.f, 1.f)) goto fail2;
+    if (rowops(g, gr, rows, 512, A_X, -1, -1, A_QAX, A_QAXS, -1, -1, E2_ROW_QUANT_ONLY, 1.f, 1.f)) goto fail2;
     if (g->only == 2) goto done;
     /* PLE: project to 24 x 512 per token, then normalize slices (not token-mask rows). */
-    if (gemm(g, gr, rows, m->n_layers * E2_DS_PER_LAYER, 1, m->n_layers * 512, 0)) goto fail2;
+    if (gemm(g, gr, rows, m->n_layers * E2_DS_PER_LAYER, 1, m->n_layers * 512)) goto fail2;
     if (g->only == 3) goto done;
     if (rowops(g, gr, rows * m->n_layers, 512, A_PLE, -1, -1, -1, -1, g->ple_proj_norm_off, -1, 64,
                ple_scale, 1.f))
@@ -807,11 +795,28 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
         const int base = l * E2_DS_PER_LAYER;
         const int rope = L->sliding ? 0 : 1;
         const int D = L->head_dim, H = E2_NUM_HEADS, KV = L->n_kv_heads;
+        const int i8_attn = seq_len >= 512;
+        const int sup = (seq_len + 127) / 128 * 128, tile = (seq_len + 15) / 16 * 16;
+        const int batches = rows / seq_len;
+        void *kp = aoff_ptr(g, A_TK), *vp = aoff_ptr(g, A_TV);
+        const size_t packed = (size_t)batches * KV * sup * D;
+        void *ks = (char *)kp + packed, *kb = (char *)ks + (size_t)batches * KV * sup * 4;
+        void *vs = (char *)vp + packed, *vb = (char *)vs + (size_t)batches * KV * D * 4;
+        void *prob = aoff_ptr(g, A_TPROB);
+        const size_t pbytes = (size_t)batches * H * tile * sup;
+        void *ps = (char *)prob + pbytes;
+        if (i8_attn && (packed + (size_t)batches * KV * sup * (D / 128 + 1) * 4 > g->reg[A_TK].bytes ||
+                       packed + (size_t)batches * KV * D * (sup / 128 + 1) * 4 > g->reg[A_TV].bytes ||
+                       pbytes + pbytes / 128 * 4 > g->reg[A_TPROB].bytes ||
+                       pbytes * 4 > g->reg[A_TSCR].bytes)) {
+            e2_l0_set_error(g->l0, "INT8 attention workspace overflow: rows=%d seq=%d", rows, seq_len);
+            goto fail2;
+        }
         /* 1. residual copy + input norm + activation quantization */
         if (rowops(g, gr, rows, 512, A_X, -1, A_RES, A_QAX, A_QAXS, g->noff[l].n[2], -1, 1 | 2, 1.f, 1.f))
             goto fail2;
         /* 2. q | k | v from the normed input */
-        if (gemm(g, gr, rows, base + E2_DS_Q, 3, H * D, 0)) goto fail2;
+        if (gemm(g, gr, rows, base + E2_DS_Q, 3, H * D)) goto fail2;
         /* 3. per-head RMSNorm + rotary embedding, q and k with rope, v without */
         {
             void *xq = aoff_ptr(g, A_Q), *xk = aoff_ptr(g, A_K2), *xv = aoff_ptr(g, A_V2);
@@ -819,38 +824,98 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
             void *gv = NULL; /* v_norm has no learned scale */
             void *cs = woff_ptr(g, g->cos_off[rope]), *sn = woff_ptr(g, g->sin_off[rope]);
             const int rq = rows * H, rk = rows * KV, rv = rows * KV;
-            KERN("k_norm_rope3", (uint32_t)((rq + 1) / 2), 1, 1, 32, 2, 1, 16, &xq, sizeof xq, &gq,
-                 sizeof gq, &rq, sizeof rq, &xk, sizeof xk, &gk, sizeof gk, &rk, sizeof rk, &xv,
-                 sizeof xv, &gv, sizeof gv, &rv, sizeof rv, &cs, sizeof cs, &sn, sizeof sn, &eps,
-                 sizeof eps, &H, sizeof H, &KV, sizeof KV, &D, sizeof D, &seq_len, sizeof seq_len);
+            if (i8_attn) {
+                void *qa = aoff_ptr(g, A_QAC), *asc = aoff_ptr(g, A_QACS);
+                const int kr = batches * KV * sup, nr = rq > kr ? rq : kr;
+                KERN("k_norm_rope3_i8", (uint32_t)((nr + 1) / 2), 1, 1, 32, 2, 1, 24,
+                     &xq, sizeof xq, &gq, sizeof gq, &rq, sizeof rq, &xk, sizeof xk, &gk, sizeof gk,
+                     &rk, sizeof rk, &xv, sizeof xv, &gv, sizeof gv, &rv, sizeof rv,
+                     &cs, sizeof cs, &sn, sizeof sn, &eps, sizeof eps, &H, sizeof H,
+                     &KV, sizeof KV, &D, sizeof D, &seq_len, sizeof seq_len,
+                     &qa, sizeof qa, &asc, sizeof asc, &kp, sizeof kp, &ks, sizeof ks, &kb, sizeof kb,
+                     &sup, sizeof sup, &valid, sizeof valid, &wr, sizeof wr);
+            } else {
+                KERN("k_norm_rope3", (uint32_t)((rq + 1) / 2), 1, 1, 32, 2, 1, 16, &xq, sizeof xq, &gq,
+                     sizeof gq, &rq, sizeof rq, &xk, sizeof xk, &gk, sizeof gk, &rk, sizeof rk, &xv,
+                     sizeof xv, &gv, sizeof gv, &rv, sizeof rv, &cs, sizeof cs, &sn, sizeof sn, &eps,
+                     sizeof eps, &H, sizeof H, &KV, sizeof KV, &D, sizeof D, &seq_len, sizeof seq_len);
+            }
         }
         /* 4. attention: context, quantized on the way out for the o projection */
         {
             const int window = L->sliding ? L->window : 0;
-            const int kv_stride = KV * D, q_stride = H * D;
-            /* FP32 attention keeps the 0.999 reference gate; INT8 attention failed length_129. */
-            {
-                void *ctx = aoff_ptr(g, A_CTX), *q = aoff_ptr(g, A_Q), *k = aoff_ptr(g, A_K2);
-                void *v = aoff_ptr(g, A_V2);
-                void *qa = aoff_ptr(g, A_QAC), *asc = aoff_ptr(g, A_QACS);
-                const char *attn_kernel = "k_attn";
-                KERN(attn_kernel, (uint32_t)((rows + 3) / 4), (uint32_t)H, 1, 32, 4, 1, 15, &ctx,
-                     sizeof ctx, &q, sizeof q, &k, sizeof k, &v, sizeof v, &qa, sizeof qa, &asc,
-                     sizeof asc, &valid, sizeof valid, &rows, sizeof rows, &H, sizeof H, &D,
-                     sizeof D, &KV, sizeof KV, &q_stride, sizeof q_stride, &kv_stride,
-                     sizeof kv_stride, &window, sizeof window, &seq_len, sizeof seq_len);
+            const int kv_stride = KV * D;
+            /* Select precision by sequence length, not batch size: batching must preserve the recipe. */
+            void *ctx = aoff_ptr(g, A_CTX), *q = aoff_ptr(g, A_Q), *k = aoff_ptr(g, A_K2);
+            void *v = aoff_ptr(g, A_V2);
+            void *qa = aoff_ptr(g, A_QAC), *asc = aoff_ptr(g, A_QACS);
+            if (i8_attn) {
+                const int gy = 4, one = 1, q0 = 0, nbv = sup / 128;
+                void *scores = aoff_ptr(g, A_TSCR);
+                KERN("k_attn_packw", (uint32_t)((D + gy - 1) / gy), 1, (uint32_t)(batches * KV),
+                     32, gy, 1, 13, &v, sizeof v, &vp, sizeof vp, &vs, sizeof vs, &vb, sizeof vb,
+                     &D, sizeof D, &sup, sizeof sup, &one, sizeof one, &kv_stride, sizeof kv_stride,
+                     &D, sizeof D, &seq_len, sizeof seq_len, &seq_len, sizeof seq_len,
+                     &KV, sizeof KV, &valid, sizeof valid);
+                KERN("k_attn_batch_gemm", (uint32_t)(tile / E2_DM),
+                     (uint32_t)((sup + E2_DN * gy - 1) / (E2_DN * gy)), (uint32_t)(batches * H),
+                     8, gy, 1, 13, &kp, sizeof kp, &ks, sizeof ks, &kb, sizeof kb,
+                     &qa, sizeof qa, &asc, sizeof asc, &scores, sizeof scores, &seq_len, sizeof seq_len,
+                     &sup, sizeof sup, &D, sizeof D, &H, sizeof H, &KV, sizeof KV,
+                     &q0, sizeof q0, &tile, sizeof tile);
+                KERN("k_attn_softmax", (uint32_t)((seq_len + gy - 1) / gy), 1, (uint32_t)(batches * H),
+                     32, gy, 1, 12, &scores, sizeof scores, &prob, sizeof prob, &ps, sizeof ps,
+                     &valid, sizeof valid, &seq_len, sizeof seq_len, &sup, sizeof sup,
+                     &seq_len, sizeof seq_len, &window, sizeof window, &H, sizeof H, &nbv, sizeof nbv,
+                     &q0, sizeof q0, &tile, sizeof tile);
+                KERN("k_attn_i8_ctx", (uint32_t)(tile / E2_DM), (uint32_t)(D / 128),
+                     (uint32_t)(batches * H), 8, 8, 1, 16,
+                     &vp, sizeof vp, &vs, sizeof vs, &vb, sizeof vb,
+                     &prob, sizeof prob, &ps, sizeof ps, &ctx, sizeof ctx, &seq_len, sizeof seq_len,
+                     &sup, sizeof sup, &D, sizeof D, &H, sizeof H, &KV, sizeof KV,
+                     &q0, sizeof q0, &tile, sizeof tile, &qa, sizeof qa, &asc, sizeof asc, &wr, sizeof wr);
+            } else {
+                void *scores = aoff_ptr(g, A_TSCR), *prob = aoff_ptr(g, A_TPROB);
+                const int sp = (seq_len + 15) / 16 * 16;
+                const int gy = 4, batches = rows / seq_len;
+                void *kp = aoff_ptr(g, A_TK), *vp = aoff_ptr(g, A_TV);
+                const int pairs = batches * KV * sp * D / 2;
+                KERN("k_attn_f16_pack", (uint32_t)((pairs + 127) / 128), 1, 1, 128, 1, 1,
+                     8, &k, sizeof k, &v, sizeof v, &kp, sizeof kp, &vp, sizeof vp,
+                     &seq_len, sizeof seq_len, &sp, sizeof sp, &D, sizeof D, &KV, sizeof KV);
+                const int context = 0;
+                KERN("k_attn_f16", (uint32_t)((seq_len + 7) / 8),
+                     (uint32_t)((sp + 16 * gy - 1) / (16 * gy)), (uint32_t)(batches * H),
+                     8, gy, 1, 12, &q, sizeof q, &kp, sizeof kp, &vp, sizeof vp,
+                     &scores, sizeof scores, &prob, sizeof prob, &ctx, sizeof ctx,
+                     &seq_len, sizeof seq_len, &sp, sizeof sp, &H, sizeof H,
+                     &D, sizeof D, &KV, sizeof KV, &context, sizeof context);
+                KERN("k_attn_f16_softmax", (uint32_t)((rows + 3) / 4), (uint32_t)H,
+                     1, 32, 4, 1, 7, &scores, sizeof scores, &prob, sizeof prob,
+                     &valid, sizeof valid, &rows, sizeof rows, &seq_len, sizeof seq_len,
+                     &sp, sizeof sp, &window, sizeof window);
+                KERN("k_attn_f16_ctx", (uint32_t)((seq_len + 7) / 8), (uint32_t)(D / 128),
+                     (uint32_t)(batches * H), 8, 8, 1, 11, &vp, sizeof vp,
+                     &prob, sizeof prob, &ctx, sizeof ctx, &seq_len, sizeof seq_len, &sp, sizeof sp,
+                     &H, sizeof H, &D, sizeof D, &KV, sizeof KV, &qa, sizeof qa, &asc, sizeof asc,
+                     &wr, sizeof wr);
             }
         }
         /* 5. o projection from the quantized context */
-        if (gemm(g, gr, rows, base + E2_DS_O, 1, 512, 0)) goto fail2;
+        if (gemm(g, gr, rows, base + E2_DS_O, 1, 512)) goto fail2;
         /* 6. attention residual, then the pre-FFN norm and its quantization (one pass) */
         if (rowops(g, gr, rows, 512, A_X, A_TMP, A_RES, A_QAX, A_QAXS, g->noff[l].n[3],
                    g->noff[l].n[4], 4 | 8 | 32 | 2, 1.f, 1.f))
             goto fail2;
-        /* 7. gate | up */
-        if (gemm(g, gr, rows, base + E2_DS_GATE, 2, 2048, 0)) goto fail2;
-        /* 8. gelu(gate) * up, quantized for the down projection */
-        {
+        /* 7/8. gate | up -> GELU product -> int8, without materializing the FFN tensors. */
+        if (!g->gemm_dp4a && !getenv("E2_GPU_GEMM_OLD")) {
+            void *wb = g->wbuf, *act = g->acts;
+            void *desc = (char *)g->desc + (size_t)(base + E2_DS_GATE) * E2_DS_STRIDE * 4;
+            KERN("k_gemm_dpas_large_gate", (uint32_t)((rows + 15) / 16), 16, 1, 8, 8, 1, 5,
+                 &wb, sizeof wb, &act, sizeof act, &desc, sizeof desc, &rows, sizeof rows, &wr, sizeof wr);
+        } else {
+            /* Keep the separate kernels for the existing arithmetic A/B paths. */
+            if (gemm(g, gr, rows, base + E2_DS_GATE, 2, 2048)) goto fail2;
             void *gate = aoff_ptr(g, A_GATE), *up = aoff_ptr(g, A_UP), *nople = NULL;
             void *qa = aoff_ptr(g, A_QAM), *asc = aoff_ptr(g, A_QAMS);
             const int K = m->intermediate, nb = K / 128, stride = 0, poff = 0;
@@ -860,13 +925,13 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
                  &poff, sizeof poff, &wr, sizeof wr);
         }
         /* 9. down projection */
-        if (gemm(g, gr, rows, base + E2_DS_DOWN, 1, 512, 0)) goto fail2;
+        if (gemm(g, gr, rows, base + E2_DS_DOWN, 1, 512)) goto fail2;
         /* 10. MLP residual + quantization of x for the PLE gate */
         if (rowops(g, gr, rows, 512, A_X, A_TMP, A_RES, A_QAX, A_QAXS, g->noff[l].n[5], -1, 4 | 8 | 2,
                    1.f, 1.f))
             goto fail2;
         /* 11. PLE gate */
-        if (gemm(g, gr, rows, base + E2_DS_PLE_GATE, 1, 512, 0)) goto fail2;
+        if (gemm(g, gr, rows, base + E2_DS_PLE_GATE, 1, 512)) goto fail2;
         /* 12. gate = gelu(gate) * this layer's PLE slice, quantized */
         {
             void *gate = aoff_ptr(g, A_GATE), *ple = aoff_ptr(g, A_PLE), *noup = NULL;
@@ -878,7 +943,7 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
                  &poff, sizeof poff, &wr, sizeof wr);
         }
         /* 13. PLE projection */
-        if (gemm(g, gr, rows, base + E2_DS_PLE_PROJ, 1, 512, 0)) goto fail2;
+        if (gemm(g, gr, rows, base + E2_DS_PLE_PROJ, 1, 512)) goto fail2;
         /* 14. PLE residual (note the aliasing: the residual is x itself) + the layer scalar */
         if (rowops(g, gr, rows, 512, A_X, A_TMP, A_X, -1, -1, g->noff[l].n[6], -1, 4 | 8, 1.f,
                    L->layer_scalar))
@@ -888,7 +953,7 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
     /* final norm (quantized for the embedder projection), the projection, mean pool + L2 */
     if (rowops(g, gr, rows, 512, A_X, -1, -1, A_QAX, A_QAXS, g->final_norm_off, -1, 2, 1.f, 1.f))
         goto fail2;
-    if (gemm(g, gr, rows, m->n_layers * E2_DS_PER_LAYER + 1, 1, 768, 0)) goto fail2;
+    if (gemm(g, gr, rows, m->n_layers * E2_DS_PER_LAYER + 1, 1, 768)) goto fail2;
     {
         void *out = g->embout;
         const int dim = 768, nseq = seq_len > 0 ? rows / seq_len : 1;
@@ -1009,8 +1074,8 @@ int e2_gpu_text_embed_batch(e2_gpu *g, const int32_t *ids, const uint8_t *valid,
      * a vocabulary entry - validated once, up front, not per chunk. */
     if (e2_valid_ids(ids, (size_t)batch * (size_t)seq_len, verr, sizeof verr))
         return fail(g, "%s", verr);
-    /* Sequences beyond what one pass holds are processed in chunks of whole sequences. */
-    int per = g->max_rows / seq_len;
+    /* Bound the batch working set; one long sequence may still use the full 2048-row workspace. */
+    int per = E2_GPU_BATCH_ROWS / seq_len;
     if (per < 1) per = 1;
     for (int b0 = 0; b0 < batch;) {
         const int n = batch - b0 < per ? batch - b0 : per;

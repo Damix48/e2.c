@@ -373,15 +373,15 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas(
  * The disassembly is mostly mov and address arithmetic around the dpas, but the compiler already
  * schedules that better than a hand-rolled pointer (see engine/README.md, the rejected pointer form).
  *
- * The tile is unchanged - see e2_tile.h for why E2_DM is 16. */
-__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
-    __global const char *wbuf, __global const uchar *acts, __global const int *desc, int M) {
+ * The wrappers specialize the token tile to 8 (short text) or 16 rows (all other uses). */
+static inline void e2_gemm_dpas2(
+    __global const char *wbuf, __global const uchar *acts, __global const int *desc, int M, int ntb) {
     const int t = get_global_id(2);
     __global const int *dd = desc + t * E2_DS_STRIDE;
     const int N = dd[4], K = dd[5], nb = dd[6];
     const int lane = get_local_id(0);
     const int sg = get_local_id(1);
-    const int m0 = get_group_id(0) * E2_DM;
+    const int m0 = get_group_id(0) * (ntb * 8);
     const int n0 = (get_group_id(1) * get_local_size(1) + sg) * E2_DN;
     if (n0 >= N) return;
     const int nfb0 = n0 >> 3;
@@ -395,7 +395,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
 
     float8 yacc[E2_NTB][E2_NFB];
 #pragma unroll
-    for (int tc = 0; tc < E2_NTB; tc++)
+    for (int tc = 0; tc < ntb; tc++)
 #pragma unroll
         for (int fb = 0; fb < E2_NFB; fb++) yacc[tc][fb] = (float8)(0.f);
 
@@ -403,7 +403,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
         const int kb = b * E2_BLOCK;
         int8 acc[E2_NTB][E2_NFB];
 #pragma unroll
-        for (int tc = 0; tc < E2_NTB; tc++)
+        for (int tc = 0; tc < ntb; tc++)
 #pragma unroll
             for (int fb = 0; fb < E2_NFB; fb++) acc[tc][fb] = (int8)(0);
 #pragma unroll
@@ -415,7 +415,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
                 av[fb] = *(__global const int8 *)(wt +
                     ((size_t)(k >> 5) * nqb + (size_t)nfb0 + (size_t)fb) * 64 + (size_t)lane * 8);
 #pragma unroll
-            for (int tc = 0; tc < E2_NTB; tc++) {
+            for (int tc = 0; tc < ntb; tc++) {
                 const uint8 bv = *(__global const uint8 *)(qa + (size_t)(m0 + tc * 8 + lane) * K + k);
 #pragma unroll
                 for (int fb = 0; fb < E2_NFB; fb++)
@@ -431,7 +431,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
             const float8 w = vload8(0, wsc + n);
             const int8 bs = vload8(0, bsq + b * N + n);
 #pragma unroll
-            for (int tc = 0; tc < E2_NTB; tc++) {
+            for (int tc = 0; tc < ntb; tc++) {
                 const int row = m0 + tc * 8 + lane;
                 const float a = asc[row * nb + b];
                 yacc[tc][fb] += (float8)(a)*w * convert_float8(acc[tc][fb] - (int8)(128) * bs);
@@ -441,7 +441,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
     const int clamped = dd[10];
     const float clo = as_float(dd[11]), chi = as_float(dd[12]);
 #pragma unroll
-    for (int tc = 0; tc < E2_NTB; tc++) {
+    for (int tc = 0; tc < ntb; tc++) {
         const int row = m0 + tc * 8 + lane;
         if (row < M)
 #pragma unroll
@@ -450,6 +450,125 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
                 if (clamped) v = clamp(v, (float8)(clo), (float8)(chi));
                 vstore8(v, 0, y + row * N + n0 + fb * 8);
             }
+    }
+}
+
+__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas2(
+    __global const char *wbuf, __global const uchar *acts, __global const int *desc, int M) {
+    e2_gemm_dpas2(wbuf, acts, desc, M, 2);
+}
+
+__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas_small(
+    __global const char *wbuf, __global const uchar *acts, __global const int *desc, int M) {
+    e2_gemm_dpas2(wbuf, acts, desc, M, 1);
+}
+
+/* Same 16x16 arithmetic; the separate name selects 256 GRFs for bulk calls in l0.c. */
+__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas_large(
+    __global const char *wbuf, __global const uchar *acts, __global const int *desc, int M) {
+    e2_gemm_dpas2(wbuf, acts, desc, M, 2);
+}
+
+/* Gate/up share an input; keep their outputs in registers/SLM through GELU and quantization.
+ * Eight subgroups cover one 128-feature activation block; two query tiles share each weight load. */
+__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_gemm_dpas_large_gate(
+    __global const char *wbuf, __global uchar *acts, __global const int *desc, int M, int wr) {
+    const int lane = get_local_id(0), sg = get_local_id(1);
+    const int m0 = get_group_id(0) * 16, nbase = get_group_id(1) * 128;
+    const int n0 = nbase + sg * 16, N = 2048;
+    __global const uchar *qa = acts + desc[7];
+    __global const float *asc = (__global const float *)(acts + desc[8]);
+    float8 sums[2][2][2];
+#pragma unroll
+    for (int p = 0; p < 2; p++)
+#pragma unroll
+        for (int tc = 0; tc < 2; tc++)
+#pragma unroll
+            for (int fb = 0; fb < 2; fb++) sums[p][tc][fb] = (float8)(0.f);
+    for (int b = 0; b < 4; b++) {
+        int8 acc[2][2][2];
+#pragma unroll
+        for (int p = 0; p < 2; p++)
+#pragma unroll
+            for (int tc = 0; tc < 2; tc++)
+#pragma unroll
+                for (int fb = 0; fb < 2; fb++) acc[p][tc][fb] = (int8)(0);
+#pragma unroll
+        for (int kw = 0; kw < 128; kw += 32) {
+            int8 av[2][2];
+#pragma unroll
+            for (int p = 0; p < 2; p++) {
+                __global const uint *wt = (__global const uint *)(wbuf + desc[p * E2_DS_STRIDE + 9]);
+#pragma unroll
+                for (int fb = 0; fb < 2; fb++)
+                    av[p][fb] = vload8(0, (__global const int *)wt +
+                        ((size_t)((b * 128 + kw) / 32) * (N / 8) + n0 / 8 + fb) * 64 + lane * 8);
+            }
+#pragma unroll
+            for (int tc = 0; tc < 2; tc++) {
+                const uint8 bv = vload8(0, (__global const uint *)(qa +
+                    (size_t)(m0 + tc * 8 + lane) * 512 + b * 128 + kw));
+#pragma unroll
+                for (int p = 0; p < 2; p++)
+#pragma unroll
+                    for (int fb = 0; fb < 2; fb++)
+                        acc[p][tc][fb] = intel_sub_group_i8_u8_matrix_mad_k32(av[p][fb], bv, acc[p][tc][fb]);
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < 2; p++) {
+            __global const float *ws = (__global const float *)(wbuf + desc[p * E2_DS_STRIDE + 1]);
+            __global const int *bs = (__global const int *)(wbuf + desc[p * E2_DS_STRIDE + 2]);
+#pragma unroll
+            for (int fb = 0; fb < 2; fb++) {
+                const float8 w = vload8(0, ws + n0 + fb * 8);
+                const int8 corr = vload8(0, bs + b * N + n0 + fb * 8) * (int8)(128);
+#pragma unroll
+                for (int tc = 0; tc < 2; tc++)
+                    sums[p][tc][fb] += asc[(m0 + tc * 8 + lane) * 4 + b] * w *
+                                      convert_float8(acc[p][tc][fb] - corr);
+            }
+        }
+    }
+    __local float tile[16 * 128];
+#pragma unroll
+    for (int tc = 0; tc < 2; tc++)
+#pragma unroll
+        for (int fb = 0; fb < 2; fb++) {
+            float8 g = sums[0][tc][fb], up = sums[1][tc][fb];
+            if (desc[10]) g = clamp(g, (float8)(as_float(desc[11])), (float8)(as_float(desc[12])));
+            if (desc[E2_DS_STRIDE + 10])
+                up = clamp(up, (float8)(as_float(desc[E2_DS_STRIDE + 11])), (float8)(as_float(desc[E2_DS_STRIDE + 12])));
+            const float8 u = .7978845608f * (g + .044715f * g * g * g);
+            const float8 e = native_exp(-2.f * fabs(u));
+            const float8 t = copysign((1.f - e) / (1.f + e), u);
+            g = .5f * g * (1.f + t) * up;
+            vstore8(g, 0, tile + (tc * 8 + lane) * 128 + sg * 16 + fb * 8);
+            const int row = m0 + tc * 8 + lane;
+            if (wr && row < M) {
+                vstore8(g, 0, (__global float *)(acts + desc[3]) + row * N + n0 + fb * 8);
+                vstore8(up, 0, (__global float *)(acts + desc[E2_DS_STRIDE + 3]) + row * N + n0 + fb * 8);
+            }
+        }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __global const int *down = desc + 2 * E2_DS_STRIDE;
+#pragma unroll
+    for (int tc = 0; tc < 2; tc++) {
+        const int row = m0 + tc * 8 + sg;
+        if (row < M) {
+            const float16 v = vload16(0, tile + (tc * 8 + sg) * 128 + lane * 16);
+            const float16 a = fabs(v);
+            float8 a8 = fmax(a.lo, a.hi);
+            float4 a4 = fmax(a8.lo, a8.hi);
+            float mx = fmax(fmax(a4.x, a4.y), fmax(a4.z, a4.w));
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) mx = fmax(mx, intel_sub_group_shuffle_xor(mx, o));
+            const float sc = mx > 0.f ? mx / 127.f : 1.f;
+            const int16 r = clamp(convert_int16_rte(v / sc), (int16)(-127), (int16)(127));
+            vstore16(convert_uchar16(r + (int16)(128)), 0,
+                     acts + down[7] + (size_t)row * N + nbase + lane * 16);
+            if (!lane) ((__global float *)(acts + down[8]))[row * 16 + nbase / 128] = sc;
+        }
     }
 }
 
@@ -764,7 +883,7 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_rowops(__global f
         *(__global float4 *)(rowp + k) = n;
         if (flags & 32) /* the o_proj -> ffn path: the value is also the next residual */
             *(__global float4 *)(res + (size_t)row * K + k) = n;
-        if (flags & 2) {
+        if ((flags & 2) && !(flags & 32)) {
             float4 a = fabs(n);
             float amax = e2_sg_max(fmax(fmax(a.x, a.y), fmax(a.z, a.w)));
             float sc = amax > 0.f ? amax / 127.f : 1.f;
@@ -808,10 +927,30 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_rowops(__global f
  * elements of a pair before writing either, and the pairs straddle a lane boundary, so the partner is
  * loaded into a register in the same pass - reading it back after the store would give the rotated
  * value and a silently wrong embedding. */
+static inline int e2_sg_sum_i(int v);
+
+/* Constant quant modes: 0 = FP32, 1 = per-128 Q, 2 = per-head K plus per-128 block sums. */
 static inline void e2_norm_rope_row(__global float *x, int row, int D, __global const float *gamma,
                                     float eps, int rope, __global const float *cs,
-                                    __global const float *sn, int lane) {
+                                    __global const float *sn, int lane, int quant,
+                                    __global uchar *qa, __global float *asc, __global int *bsq,
+                                    int N, int key, int live, int wr) {
     __global float *p = x + (size_t)row * D;
+    if (quant && !live) {
+        for (int b = 0; b < D / 128; b++) {
+            const int d = b * 128 + lane * 4;
+            if (quant == 1) {
+                vstore4((uchar4)(128), 0, qa + (size_t)row * D + d);
+                if (!lane) asc[(size_t)row * (D / 128) + b] = 1.f;
+            } else {
+                vstore4((uchar4)(0), 0, qa + E2_DPAS_OFF(d / 4, key / 8, key % 8, 0, N / 8));
+                if (!lane) { *asc = 1.f; bsq[b * N] = 0; }
+            }
+            if (wr) vstore4((float4)(0.f), 0, p + d);
+        }
+        return;
+    }
+    float4 out[4];
     const int halfd = D / 2;
     const int niter = D / 128; /* D <= 512, so at most four float4 per lane */
     const int off0 = lane * 4;
@@ -841,14 +980,45 @@ static inline void e2_norm_rope_row(__global float *x, int row, int D, __global 
         const float4 gy = gamma ? *(__global const float4 *)(gamma + pd) : (float4)1.f;
         const float4 c = *(__global const float4 *)(cs + d);
         const float4 s4 = *(__global const float4 *)(sn + d);
-        *(__global float4 *)(p + d) = first ? (a * g * c - y * gy * s4) : (a * g * c + y * gy * s4);
+        const float4 value = first ? (a * g * c - y * gy * s4) : (a * g * c + y * gy * s4);
+        if (!quant || wr) *(__global float4 *)(p + d) = value;
+        if (quant == 1) {
+            const float4 ab = fabs(value);
+            const float mx = e2_sg_max(fmax(fmax(ab.x, ab.y), fmax(ab.z, ab.w)));
+            const float sc = mx > 0.f ? mx / 127.f : 1.f;
+            const int4 r = clamp(convert_int4_rte(value / sc), (int4)(-127), (int4)(127));
+            vstore4(convert_uchar4(r + (int4)(128)), 0, qa + (size_t)row * D + d);
+            if (!lane) asc[(size_t)row * niter + j] = sc;
+        } else if (quant == 2) out[j] = value;
+    }
+    if (quant == 2) {
+        float mx = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= niter) break;
+            const float4 a = fabs(out[j]);
+            mx = fmax(mx, fmax(fmax(a.x, a.y), fmax(a.z, a.w)));
+        }
+        mx = e2_sg_max(mx);
+        const float sc = mx > 0.f ? mx / 127.f : 1.f;
+        if (!lane) *asc = sc;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= niter) break;
+            const int d = j * 128 + lane * 4;
+            const int4 r = clamp(convert_int4_rte(out[j] / sc), (int4)(-127), (int4)(127));
+            vstore4(convert_uchar4(r & (int4)(255)), 0,
+                    qa + E2_DPAS_OFF(d / 4, key / 8, key % 8, 0, N / 8));
+            const int sum = e2_sg_sum_i(r.x + r.y + r.z + r.w);
+            if (!lane) bsq[j * N] = sum;
+        }
     }
 }
 
 /* q, k and v normalization in one launch: three independent row ranges, all sub-group uniform, so the
- * sub-group reductions inside e2_norm_rope_row stay valid. Rows of k and v are a quarter of q's, so
+ * sub-group reductions inside e2_norm_rope_row stay valid. K and V have fewer head rows than Q, so
  * the tail work items only do the q part. */
-__attribute__((intel_reqd_sub_group_size(32))) __kernel void k_norm_rope3(
+static inline void e2_norm_rope3(
     __global float *xq, __global const float *gq, int rq, __global float *xk,
     __global const float *gk, int rk, __global float *xv, __global const float *gv, int rv,
     __global const float *costab, __global const float *sintab, float eps, int hq, int hkv, int D,
@@ -858,132 +1028,198 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_norm_rope3(
     if (row < rq) {
         const int pos = (row / hq) % seq_len;
         e2_norm_rope_row(xq, row, D, gq, eps, 1, costab + (size_t)pos * D, sintab + (size_t)pos * D,
-                         lane);
+                         lane, 0, 0, 0, 0, 0, 0, 1, 1);
     }
     if (row < rk) {
         const int pos = (row / hkv) % seq_len;
         e2_norm_rope_row(xk, row, D, gk, eps, 1, costab + (size_t)pos * D, sintab + (size_t)pos * D,
-                         lane);
+                         lane, 0, 0, 0, 0, 0, 0, 1, 1);
     }
     if (row < rv) {
-        e2_norm_rope_row(xv, row, D, gv, eps, 0, costab, sintab, lane);
+        e2_norm_rope_row(xv, row, D, gv, eps, 0, costab, sintab, lane, 0, 0, 0, 0, 0, 0, 1, 1);
     }
 }
 
-/* ------------------------------------------------------------------ attention
- * One work item per (query row, head), lanes spanning the head dimension (D/32 elements each): the dot
- * product of a query row with a key is one FMA per element plus a 32-lane butterfly, the softmax is
- * online so nothing of size S x S exists, and the context is quantized on the way out because it is the
- * input of the o_proj projection (every head dimension here is a multiple of 128, so a 128-element
- * activation block never straddles two heads).
- *
- * The body is specialised on DS = D/32 = 8 (D=256, the sliding layers) and 16 (D=512, the full ones),
- * and that is not a micro-optimisation. With DS a runtime value IGC cannot unroll the per-element loop,
- * and the disassembly of the generic version was 2469 instructions of which **83 were `mad`** - 535
- * `mov`, 381 loads, 194 `sync.nop` and 186 `cmp` wrapped around a multiply-add it should have
- * collapsed. Q, K and V are held as float4 (DS is a multiple of 4 and lane*DS is 16-byte aligned for
- * both), the context accumulates as float4, and only the exponential stays scalar. */
-#define E2_ATTN_BODY(DS)                                                                           \
-    do {                                                                                           \
-        __global float4 *o4 = (__global float4 *)(out + lane * DS);                                \
-        const __global float4 *qp =                                                                \
-            (const __global float4 *)(q + (size_t)row * q_stride + h * D + lane * DS);             \
-        float4 qs[DS / 4], acc[DS / 4];                                                            \
-        _Pragma("unroll") for (int t = 0; t < DS / 4; t++) {                                       \
-            qs[t] = qp[t];                                                                         \
-            acc[t] = (float4)(0.f, 0.f, 0.f, 0.f);                                                 \
-        }                                                                                          \
-        float m = -3.0e38f, l = 0.f; /* -INFINITY is UB under -cl-fast-relaxed-math */                                                              \
-        for (int j = lo; j < hi; j++) {                                                            \
-            const int jrow = j0 + j;                                                               \
-            if (valid && !valid[jrow]) continue;                                                   \
-            const __global float4 *kp =                                                            \
-                (const __global float4 *)(k + (size_t)jrow * kv_stride + kvh * D + lane * DS);     \
-            const __global float4 *vp =                                                            \
-                (const __global float4 *)(v + (size_t)jrow * kv_stride + kvh * D + lane * DS);     \
-            float4 d4 = (float4)(0.f, 0.f, 0.f, 0.f);                                              \
-            _Pragma("unroll") for (int t = 0; t < DS / 4; t++) d4 += qs[t] * kp[t];                \
-            float dots = (d4.x + d4.y) + (d4.z + d4.w);                                            \
-            dots = e2_sg_sum(dots);                                                                \
-            const float mn = fmax(m, dots);                                                        \
-            const float alpha = exp(m - mn);                                                       \
-            const float p = exp(dots - mn);                                                        \
-            l = l * alpha + p;                                                                     \
-            m = mn;                                                                                \
-            _Pragma("unroll") for (int t = 0; t < DS / 4; t++) acc[t] = acc[t] * alpha + p * vp[t];\
-        }                                                                                          \
-        const float inv = l > 0.f ? 1.f / l : 0.f;                                                 \
-        _Pragma("unroll") for (int t = 0; t < DS / 4; t++) o4[t] = acc[t] * inv;                   \
-        if (qa) {                                                                                  \
-            sub_group_barrier(CLK_GLOBAL_MEM_FENCE); /* quantization reads other lanes' stores */    \
-            const int nb = q_stride / E2_BLOCK;                                                    \
-            _Pragma("unroll") for (int b = 0; b < DS / 4; b++) {                                   \
-                const int kk = b * 128 + lane * 4;                                                 \
-                const float4 n = *(const __global float4 *)(out + kk);                             \
-                const float4 a = fabs(n);                                                          \
-                const float amax = e2_sg_max(fmax(fmax(a.x, a.y), fmax(a.z, a.w)));                \
-                const float sc = amax > 0.f ? amax / 127.f : 1.f;                                  \
-                int4 r = convert_int4_rte(n / sc);                                                 \
-                r = clamp(r, (int4)(-127), (int4)(127));                                           \
-                *(__global uchar4 *)(qa + (size_t)row * q_stride + h * D + kk) =                  \
-                    convert_uchar4(r + (int4)(128));                                               \
-                if (lane == 0) asc[(size_t)row * nb + (h * D + kk) / E2_BLOCK] = sc;                \
-            }                                                                                      \
-        }                                                                                          \
-    } while (0)
+__attribute__((intel_reqd_sub_group_size(32))) __kernel void k_norm_rope3(
+    __global float *xq, __global const float *gq, int rq, __global float *xk,
+    __global const float *gk, int rk, __global float *xv, __global const float *gv, int rv,
+    __global const float *costab, __global const float *sintab, float eps, int hq, int hkv, int D,
+    int seq_len) {
+    if (D == 256)
+        e2_norm_rope3(xq, gq, rq, xk, gk, rk, xv, gv, rv, costab, sintab, eps, hq, hkv, 256, seq_len);
+    else
+        e2_norm_rope3(xq, gq, rq, xk, gk, rk, xv, gv, rv, costab, sintab, eps, hq, hkv, 512, seq_len);
+}
 
-__attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn(
-    __global float *ctx, __global const float *q, __global const float *k, __global const float *v,
-    __global uchar *qa, __global float *asc, __global const uchar *valid, int rows, int H, int D,
-    int kv_heads, int q_stride, int kv_stride, int window, int seq_len) {
-    const int row = get_group_id(0) * get_local_size(1) + get_local_id(1);
-    const int h = get_group_id(1);
-    const int lane = get_local_id(0);
-    const int DS = D / 32;
-    if (row >= rows || DS > 16) return;
-    __global float *out = ctx + (size_t)row * q_stride + h * D;
-    if (valid && !valid[row]) {
-        for (int t = 0; t < DS; t++) out[lane * DS + t] = 0.f;
-        if (qa) {
-            const int nb = q_stride / E2_BLOCK;
-            for (int b = 0; b < DS / 4; b++) {
-                const int kk = b * 128 + lane * 4;
-                *(__global uchar4 *)(qa + (size_t)row * q_stride + h * D + kk) =
-                    (uchar4)(128, 128, 128, 128);
-                if (lane == 0) asc[(size_t)row * nb + (h * D + kk) / E2_BLOCK] = 1.f;
-            }
+/* Quantize normalized/rotated Q and pack K while their values are still in registers. */
+static inline void e2_norm_rope3_i8(
+    __global float *xq, __global const float *gq, int rq, __global float *xk,
+    __global const float *gk, int rk, __global float *xv, __global const float *gv, int rv,
+    __global const float *costab, __global const float *sintab, float eps, int H, int KV, int D,
+    int S, __global uchar *qa, __global float *asc, __global uchar *kp, __global float *ks,
+    __global int *kb, int SP, __global const uchar *valid, int wr) {
+    const int r = get_group_id(0) * get_local_size(1) + get_local_id(1), lane = get_local_id(0);
+    if (r < rq) {
+        const int token = r / H, pos = token % S, live = !valid || valid[token];
+        e2_norm_rope_row(xq, r, D, gq, eps, 1, costab + (size_t)pos * D, sintab + (size_t)pos * D,
+                         lane, 1, qa, asc, 0, 0, 0, live, wr);
+    }
+    const int batches = rk / (KV * S);
+    if (r < batches * KV * SP) {
+        const int key = r / KV % SP, head = r % KV, seq = r / (KV * SP), kvz = seq * KV + head;
+        const int token = seq * S + key;
+        const int live = key < S && (!valid || valid[token]);
+        e2_norm_rope_row(xk, key < S ? token * KV + head : 0, D, gk, eps, 1,
+                         costab + (size_t)min(key, S - 1) * D, sintab + (size_t)min(key, S - 1) * D,
+                         lane, 2, kp + (size_t)kvz * SP * D, ks + (size_t)kvz * SP + key,
+                         kb + (size_t)kvz * (D / 128) * SP + key, SP, key, live, wr && key < S);
+    }
+    if (r < rv)
+        e2_norm_rope_row(xv, r, D, gv, eps, 0, costab, sintab, lane, 0, 0, 0, 0, 0, 0, 1, 1);
+}
+
+__attribute__((intel_reqd_sub_group_size(32))) __kernel void k_norm_rope3_i8(
+    __global float *xq, __global const float *gq, int rq, __global float *xk,
+    __global const float *gk, int rk, __global float *xv, __global const float *gv, int rv,
+    __global const float *costab, __global const float *sintab, float eps, int H, int KV, int D,
+    int S, __global uchar *qa, __global float *asc, __global uchar *kp, __global float *ks,
+    __global int *kb, int SP, __global const uchar *valid, int wr) {
+    if (D == 256)
+        e2_norm_rope3_i8(xq, gq, rq, xk, gk, rk, xv, gv, rv, costab, sintab, eps, H, KV, 256, S,
+                         qa, asc, kp, ks, kb, SP, valid, wr);
+    else
+        e2_norm_rope3_i8(xq, gq, rq, xk, gk, rk, xv, gv, rv, costab, sintab, eps, H, KV, 512, S,
+                         qa, asc, kp, ks, kb, SP, valid, wr);
+}
+
+/* Pack two FP16 DPAS A operands; each lane loads eight pairs contiguously in the products.
+ * SP includes zero keys through a multiple of sixteen. */
+__kernel void k_attn_f16_pack(__global const float *k, __global const float *v,
+    __global int *kp, __global int *vp, int S, int SP, int D, int KV) {
+    const int i = get_global_id(0);
+    const int z = i / (SP * D / 2), t = i % (SP * D / 2);
+    const int seq = z / KV, h = z % KV;
+    const int j = t / (D / 2), d = t % (D / 2);
+    half2 a = (half2)(0);
+    if (j < S) a = convert_half2_rte(vload2(0, k + ((size_t)seq * S + j) * KV * D + h * D + d * 2));
+    kp[(size_t)z * SP * D / 2 + ((size_t)(d / 8) * (SP / 8) + j / 8) * 64 + (d % 8) * 8 + j % 8] = as_int(a);
+    const int jp = t / D, f = t % D;
+    half2 b = (half2)(0);
+    if (jp * 2 < S) b.s0 = convert_half_rte(v[((size_t)seq * S + jp * 2) * KV * D + h * D + f]);
+    if (jp * 2 + 1 < S) b.s1 = convert_half_rte(v[((size_t)seq * S + jp * 2 + 1) * KV * D + h * D + f]);
+    vp[(size_t)z * SP * D / 2 + ((size_t)(jp / 8) * (D / 8) + f / 8) * 64 + (jp % 8) * 8 + f % 8] = as_int(b);
+}
+
+/* FP16 XMX attention with FP32 accumulation/softmax; projections remain W8A8.
+ * DPAS operand distribution follows Khronos cl_intel_subgroup_matrix_multiply_accumulate.
+ * Each subgroup computes eight queries by sixteen keys (or context dimensions).
+ * Sequence tiles are padded independently: a subgroup must never mix two sequences. */
+static inline void e2_attn_f16(
+    __global const float *q, __global const int *k, __global const int *v,
+    __global float *scores, __global const half *prob, __global float *ctx,
+    int S, int SP, int H, int D, int KV, int context, __local float *tile, int wr) {
+    const int lane = get_local_id(0), sg = get_local_id(1);
+    const int m = get_group_id(0) * 8 + lane;
+    const int n0 = (get_group_id(1) * get_local_size(1) + sg) * 16;
+    const int z = get_group_id(2), h = z % H, seq = z / H, kv = h * KV / H;
+    const int N = context ? D : SP, K = context ? SP : D;
+    if (n0 >= N) return;
+    float8 acc0 = (float8)(0.f), acc1 = (float8)(0.f);
+    for (int kk = 0; kk < K; kk += 16) {
+        __global const int *packed = (context ? v : k) + (size_t)(seq * KV + kv) * SP * D / 2;
+        const size_t off = ((size_t)(kk / 16) * (N / 8) + n0 / 8) * 64 + lane * 8;
+        const int8 a0 = vload8(0, packed + off);
+        const int8 a1 = vload8(0, packed + off + 64);
+        int8 b = (int8)(0);
+        if (m < S) {
+            if (context) b = as_int8(vload16(0, prob + ((size_t)h * (get_num_groups(2) / H) * S + seq * S + m) * SP + kk));
+            else b = as_int8(convert_half16_rte(vload16(0, q + ((size_t)seq * S + m) * H * D + h * D + kk)));
         }
-        return;
+        acc0 = intel_sub_group_f16_f16_matrix_mad_k16(a0, b, acc0);
+        acc1 = intel_sub_group_f16_f16_matrix_mad_k16(a1, b, acc1);
     }
-    const int slen = seq_len > 0 ? seq_len : rows;
-    const int sb = seq_len > 0 ? seq_len : 0;
-    const int seq = sb ? row / sb : 0;
-    const int pos = sb ? row - seq * sb : row;
-    const int j0 = seq * sb;
-    const int lo = (window > 0 && pos - window > 0) ? pos - window : 0;
-    const int hi0 = slen;
-    const int hi = (window > 0 && pos + window + 1 < hi0) ? pos + window + 1 : hi0;
-    const int kvh = (h * kv_heads) / H;
-    if (DS == 8) {
-        E2_ATTN_BODY(8);
-    } else if (DS == 16) {
-        E2_ATTN_BODY(16);
-    } else {
-        for (int t = 0; t < DS; t++) out[lane * DS + t] = 0.f; /* head dim this model does not have */
+    if (tile) {
+        vstore8(acc0, 0, tile + lane * 128 + sg * 16);
+        vstore8(acc1, 0, tile + lane * 128 + sg * 16 + 8);
+    }
+    if (m < S) {
+        if (context && (!tile || wr)) {
+            __global float *dst = ctx + ((size_t)seq * S + m) * H * D + h * D + n0;
+            vstore8(acc0, 0, dst);
+            vstore8(acc1, 0, dst + 8);
+        } else if (!context) {
+            __global float *dst = scores + ((size_t)h * (get_num_groups(2) / H) * S + seq * S + m) * SP + n0;
+            vstore8(acc0, 0, dst);
+            vstore8(acc1, 0, dst + 8);
+        }
     }
 }
 
-/* ------------------------------------------------------------------ attention on the matrix engine
- * The scalar k_attn above is at the machine's L2 bandwidth *and* at its instruction-issue ceiling at
- * the same time: one key costs two 32-byte loads per lane plus a 32-lane butterfly and two
- * exponentials for 16 MAC. Measured by deleting the loads (0.752 -> 0.511 ms on a 196-token layer)
- * the kernel is ~2/3 instruction-bound, so halving the traffic alone buys at most 1.5x - the
- * reduction has to move to the matrix engine, which is what these three kernels do.
- *
- * The decomposition is the standard one: scores = Q K^T, softmax, context = P V, with the three
- * steps as separate launches and P materialised as int8. The two products run on the XMX engine
- * through the exact layout k_gemm_dpas already solved (weights in A, activations in B, both one
- * 32-byte vector load per k-step), which is why they are one kernel here rather than two:
+__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_f16(
+    __global const float *q, __global const int *k, __global const int *v,
+    __global float *scores, __global const half *prob, __global float *ctx,
+    int S, int SP, int H, int D, int KV, int context) {
+    e2_attn_f16(q, k, v, scores, prob, ctx, S, SP, H, D, KV, context, 0, 0);
+}
+
+/* One workgroup owns a 128-d context block, so quantization needs no global context round trip. */
+__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_f16_ctx(
+    __global const int *v, __global const half *prob, __global float *ctx,
+    int S, int SP, int H, int D, int KV, __global uchar *qa, __global float *asc, int wr) {
+    __local float tile[8 * 128];
+    e2_attn_f16(0, 0, v, 0, prob, ctx, S, SP, H, D, KV, 1, tile, wr);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const int lane = get_local_id(0), sg = get_local_id(1);
+    const int m = get_group_id(0) * 8 + sg, z = get_group_id(2);
+    if (m >= S) return;
+    const int row = z / H * S + m, h = z % H, nbase = get_group_id(1) * 128;
+    const float16 value = vload16(0, tile + sg * 128 + lane * 16);
+    const float16 a = fabs(value);
+    const float8 a8 = fmax(a.lo, a.hi);
+    const float4 a4 = fmax(a8.lo, a8.hi);
+    float mx = fmax(fmax(a4.x, a4.y), fmax(a4.z, a4.w));
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) mx = fmax(mx, intel_sub_group_shuffle_xor(mx, o));
+    const float sc = mx > 0.f ? mx / 127.f : 1.f;
+    const int16 r = clamp(convert_int16_rte(value / sc), (int16)(-127), (int16)(127));
+    vstore16(convert_uchar16(r + (int16)(128)), 0,
+             qa + (size_t)row * H * D + h * D + nbase + lane * 16);
+    if (!lane) asc[(size_t)row * (H * D / 128) + h * (D / 128) + nbase / 128] = sc;
+}
+
+__attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_f16_softmax(
+    __global const float *scores, __global half *prob, __global const uchar *valid,
+    int rows, int S, int SP, int window) {
+    const int row = get_group_id(0) * get_local_size(1) + get_local_id(1);
+    const int h = get_group_id(1), lane = get_local_id(0);
+    if (row >= rows) return;
+    const int base = row / S * S, pos = row % S;
+    const int lo = window > 0 ? max(0, pos - window) : 0;
+    const int hi = window > 0 ? min(S, pos + window + 1) : S;
+    const int active = !valid || valid[row];
+    const size_t off = ((size_t)h * rows + row) * SP;
+    float mx = -3.0e38f;
+    for (int j = lane; j < S; j += 32)
+        if (active && j >= lo && j < hi && (!valid || valid[base + j]))
+            mx = fmax(mx, scores[off + j]);
+    mx = e2_sg_max(mx);
+    float sum = 0.f;
+    for (int j = lane; j < S; j += 32)
+        if (active && j >= lo && j < hi && (!valid || valid[base + j]))
+            sum += native_exp(scores[off + j] - mx);
+    sum = e2_sg_sum(sum);
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    for (int j = lane; j < SP; j += 32) {
+        const float p = active && j >= lo && j < hi && (!valid || valid[base + j])
+                            ? native_exp(scores[off + j] - mx) * inv : 0.f;
+        prob[off + j] = convert_half_rte(p);
+    }
+}
+
+/* ------------------------------------------------------------------ int8 attention on the matrix engine
+ * Scores = Q K^T, FP32 softmax, context = P V, with P materialized as unsigned int8. Both products
+ * share the projection GEMM's DPAS operand layout (weights in A, activations in B, one 32-byte
+ * vector load per k-step) and the explicit-pointer helper below:
  *
  *     C[m][n] = sum_k W[n][k] * X[m][k]
  *
@@ -1061,7 +1297,9 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_packw(
 /* The two attention products, one kernel: `wd` is the packed int8 weight matrix in the DPAS A
  * layout, `qa` the int8 activations biased by +128, and the result is
  *
- *     y[m][n] = sum_b asc[m,b] * wsc[n] * ( dp4a_block - 128 * bsq[b,n] )
+ *     y[m][n] = sum_b asc[m,b] * wsc[n] * ( dp4a_block - zero_point * bsq[b,n] )
+ *
+ * Q uses zero point 128; nonnegative probabilities use the full unsigned range with zero point 0.
  *
  * which is the same arithmetic as k_gemm_dpas, with the descriptor indirection replaced by
  * explicit pointers because the attention weights are packed at run time, per layer and per
@@ -1069,7 +1307,7 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_packw(
 static inline void e2_attn_gemm(
     __global const uchar *wd, __global const float *wsc, __global const int *bsq,
     __global const uchar *qa, __global const float *asc, __global float *y, int N, int K, int nb,
-    int M, int ystride, int xstride, int astride) {
+    int M, int ystride, int xstride, int astride, int zero_point, __local float *tile, int wr) {
     const int lane = get_local_id(0);
     const int sg = get_local_id(1);
     const int m0 = get_group_id(0) * E2_DM;
@@ -1101,7 +1339,7 @@ static inline void e2_attn_gemm(
             for (int tc = 0; tc < E2_NTB; tc++) {
                 const int row = m0 + tc * 8 + lane;
                 const uint8 bv = row < M ?
-                    *(__global const uint8 *)(qa + (size_t)row * xstride + k) : (uint8)(128);
+                    *(__global const uint8 *)(qa + (size_t)row * xstride + k) : (uint8)(zero_point);
 #pragma unroll
                 for (int fb = 0; fb < E2_NFB; fb++)
                     acc[tc][fb] = intel_sub_group_i8_u8_matrix_mad_k32(av[fb], bv, acc[tc][fb]);
@@ -1116,17 +1354,19 @@ static inline void e2_attn_gemm(
             for (int tc = 0; tc < E2_NTB; tc++) {
                 const int row = m0 + tc * 8 + lane;
                 const float a = row < M ? asc[row * astride + b] : 0.f;
-                yacc[tc][fb] += (float8)(a)*w * convert_float8(acc[tc][fb] - (int8)(128) * bs);
+                yacc[tc][fb] += (float8)(a)*w * convert_float8(acc[tc][fb] - (int8)(zero_point) * bs);
             }
         }
     }
 #pragma unroll
     for (int tc = 0; tc < E2_NTB; tc++) {
         const int row = m0 + tc * 8 + lane;
-        if (row < M)
 #pragma unroll
-            for (int fb = 0; fb < E2_NFB; fb++)
+        for (int fb = 0; fb < E2_NFB; fb++) {
+            if (tile) vstore8(yacc[tc][fb], 0, tile + (tc * 8 + lane) * 128 + sg * E2_DN + fb * 8);
+            if (row < M && (!tile || wr))
                 vstore8(yacc[tc][fb], 0, y + row * ystride + n0 + fb * 8);
+        }
     }
 }
 
@@ -1135,7 +1375,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_gemm(
     __global const uchar *wd, __global const float *wsc, __global const int *bsq,
     __global const uchar *qa, __global const float *asc, __global float *y, int N, int K, int nb,
     int M, int ystride, int xstride, int astride) {
-    e2_attn_gemm(wd, wsc, bsq, qa, asc, y, N, K, nb, M, ystride, xstride, astride);
+    e2_attn_gemm(wd, wsc, bsq, qa, asc, y, N, K, nb, M, ystride, xstride, astride, 128, 0, 1);
 }
 
 /* Each z is a (sequence, query head); GQA heads share packed KV, never score/P scratch.
@@ -1143,35 +1383,63 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_gemm(
 __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_batch_gemm(
     __global const uchar *wd, __global const float *wsc, __global const int *bsq,
     __global const uchar *qa, __global const float *asc, __global float *y,
-    int S, int sup, int D, int H, int KV, int q0, int tile, int context) {
+    int S, int sup, int D, int H, int KV, int q0, int tile) {
     const int z = get_group_id(2), seq = z / H, h = z % H;
-    const int kvz = seq * KV + h * KV / H;
-    const int N = context ? D : sup, K = context ? sup : D, nb = K / 128;
-    wd += (size_t)kvz * N * K;
-    wsc += (size_t)kvz * N;
-    bsq += (size_t)kvz * nb * N;
+    const int kvz = seq * KV + h * KV / H, nb = D / 128;
+    wd += (size_t)kvz * sup * D;
+    wsc += (size_t)kvz * sup;
+    bsq += (size_t)kvz * nb * sup;
+    qa += ((size_t)seq * S * H + q0 * H + h) * D;
+    asc += ((size_t)seq * S * H + q0 * H + h) * nb;
+    y += (size_t)z * tile * sup;
+    e2_attn_gemm(wd, wsc, bsq, qa, asc, y, sup, D, nb, min(tile, S - q0),
+                 sup, H * D, H * nb, 128, 0, 1);
+}
+
+/* Each workgroup quantizes sixteen query rows by one 128-feature context block. */
+__attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_i8_ctx(
+    __global const uchar *wd, __global const float *wsc, __global const int *bsq,
+    __global const uchar *prob, __global const float *psc, __global float *ctx,
+    int S, int sup, int D, int H, int KV, int q0, int tile,
+    __global uchar *qa, __global float *asc, int wr) {
+    __local float block[E2_DM * 128];
+    const int z = get_group_id(2), seq = z / H, h = z % H;
+    const int kvz = seq * KV + h * KV / H, nb = sup / 128;
     const int M = min(tile, S - q0);
-    if (context) {
-        qa += (size_t)z * tile * sup;
-        asc += (size_t)z * tile * nb;
-        y += ((size_t)seq * S * H + q0 * H + h) * D;
-        e2_attn_gemm(wd, wsc, bsq, qa, asc, y, N, K, nb, M, H * D, sup, nb);
-    } else {
-        qa += ((size_t)seq * S * H + q0 * H + h) * D;
-        asc += ((size_t)seq * S * H + q0 * H + h) * nb;
-        y += (size_t)z * tile * sup;
-        e2_attn_gemm(wd, wsc, bsq, qa, asc, y, N, K, nb, M, sup, H * D, H * nb);
+    e2_attn_gemm(wd + (size_t)kvz * D * sup, wsc + (size_t)kvz * D,
+                 bsq + (size_t)kvz * nb * D, prob + (size_t)z * tile * sup,
+                 psc + (size_t)z * tile * nb, ctx + ((size_t)(seq * S + q0) * H + h) * D,
+                 D, sup, nb, M, H * D, sup, nb, 0, block, wr);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const int lane = get_local_id(0), sg = get_local_id(1), nbase = get_group_id(1) * 128;
+#pragma unroll
+    for (int t = 0; t < E2_NTB; t++) {
+        const int m = get_group_id(0) * E2_DM + sg + t * 8;
+        if (m >= M) continue;
+        const float16 value = vload16(0, block + (sg + t * 8) * 128 + lane * 16);
+        const float16 a = fabs(value);
+        const float8 a8 = fmax(a.lo, a.hi);
+        const float4 a4 = fmax(a8.lo, a8.hi);
+        float mx = fmax(fmax(a4.x, a4.y), fmax(a4.z, a4.w));
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) mx = fmax(mx, intel_sub_group_shuffle_xor(mx, o));
+        const float sc = mx > 0.f ? mx / 127.f : 1.f;
+        const int16 r = clamp(convert_int16_rte(value / sc), (int16)(-127), (int16)(127));
+        const int row = seq * S + q0 + m;
+        vstore16(convert_uchar16(r + (int16)(128)), 0,
+                 qa + (size_t)row * H * D + h * D + nbase + lane * 16);
+        if (!lane) asc[(size_t)row * (H * D / 128) + h * (D / 128) + nbase / 128] = sc;
     }
 }
 
 /* scores -> P. One sub-group per row: the row's scores are reduced for the max and then for the
  * sum over the sequence's visible keys, and the result is quantized per 128-key block.
  *
- * The block scale is the only subtlety. With q = round(127 * e_k / max_e_b) and asc[m,b] =
- * max_e_b / (127 * l) the dequantized value asc*(q) is e_k/l, i.e. the softmax weight, and no
+ * The block scale is the only subtlety. With q = round(255 * e_k / max_e_b) and asc[m,b] =
+ * max_e_b / (255 * l) the dequantized value asc*(q) is e_k/l, i.e. the softmax weight, and no
  * separate renormalisation is needed: every p_k is rounded against its own 128-key block's largest
  * value, which is the same recipe the activation quantization uses everywhere else in the engine.
- * A masked key writes q = 0 (byte 128, which the mixed-sign GEMM treats as zero) and a block with
+ * A masked key writes byte 0 (the context product has no zero-point correction) and a block with
  * nothing visible gets asc = 0, so a fully masked row produces an all-zero context. */
 __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_softmax(
     __global float *sc, __global uchar *p, __global float *asc, __global const uchar *valid, int M,
@@ -1184,6 +1452,13 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_softmax(
     const int lane = get_local_id(0);
     if (row >= M) return;
     const int pos = q0 + row;
+    if (valid && !valid[kbase + pos]) {
+        for (int b = 0; b < nb; b++) {
+            vstore4((uchar4)(0), 0, p + (size_t)row * N + b * 128 + lane * 4);
+            if (!lane) asc[(size_t)row * nb + b] = 0.f;
+        }
+        return;
+    }
     const int lo = (window > 0 && pos - window > 0) ? pos - window : 0;
     const int hi = (window > 0 && pos + window + 1 < slen) ? pos + window + 1 : slen;
     __global float *srow = sc + (size_t)row * N;
@@ -1230,9 +1505,9 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_softmax(
         const float4 e = *(__global const float4 *)(srow + j0);
         const float mb = maxb[b];
         int4 q = (int4)(0);
-        if (mb > 0.f) q = clamp(convert_int4_rte(e * (127.f / mb)), (int4)(0), (int4)(127));
-        *(__global uchar4 *)(prow + j0) = convert_uchar4(q + (int4)(128));
-        if (lane == 0) asc[(size_t)row * nb + b] = (mb > 0.f && l > 0.f) ? mb / (127.f * l) : 0.f;
+        if (mb > 0.f) q = clamp(convert_int4_rte(e * (255.f / mb)), (int4)(0), (int4)(255));
+        *(__global uchar4 *)(prow + j0) = convert_uchar4(q);
+        if (lane == 0) asc[(size_t)row * nb + b] = (mb > 0.f && l > 0.f) ? mb / (255.f * l) : 0.f;
     }
 }
 
@@ -1258,7 +1533,9 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_gelu_mul_quant(
     if (k >= K) return;
     __global float *gp = gate + (size_t)row * K;
     float4 g = *(__global const float4 *)(gp + k);
-    const float4 t = tanh(0.7978845608f * (g + 0.044715f * g * g * g));
+    const float4 u = 0.7978845608f * (g + 0.044715f * g * g * g);
+    const float4 e = native_exp(-2.f * fabs(u));
+    const float4 t = copysign((1.f - e) / (1.f + e), u);
     g = 0.5f * g * (1.f + t);
     if (up) g *= *(__global const float4 *)(up + (size_t)row * K + k);
     if (ple) g *= *(__global const float4 *)(ple + (size_t)row * stride + ple_off + k);

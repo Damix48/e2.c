@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
         if (b < 6) CHECK(!e2_text_embed_batch(m, batch_ids + b * SEQ, valid + b * SEQ,
                                              1, SEQ, batch_ref[b]));
     }
-    /* 125*17 > 2048: includes a second chunk and exact-zero all-masked sequences. */
+    /* This batch spans multiple chunks, including exact-zero all-masked sequences. */
     struct {
         int np, nids;
         float *pixels, ref[768], cpu[768];

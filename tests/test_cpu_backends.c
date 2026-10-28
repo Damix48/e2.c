@@ -16,12 +16,14 @@ void e2_cpu_init(void) {
         e2_sgemm_nn_range = e2_sgemm_nn_range_scalar;
         e2_i8_quantize = NULL; e2_i8_attn_gemm = NULL; e2_softmax_quant_i8 = NULL;
     } else if (g_test_backend == 1 || g_test_backend == 2) {
+#if defined(__x86_64__) || defined(_M_X64) /* the AVX2/VNNI kernels are x86-only */
         g_active = e2_avx2_kernels();
         e2_sgemm_nn_range = e2_sgemm_nn_range_avx2;
         e2_i8_gemm = g_test_backend == 1 ? e2_i8_gemm_avx2 : e2_i8_gemm_vnni_range;
         e2_i8_quantize = g_test_backend == 1 ? e2_quantize_blocks_avx2 : e2_quantize_blocks_vnni;
         e2_i8_attn_gemm = g_test_backend == 1 ? NULL : e2_i8_attn_gemm_vnni;
         e2_softmax_quant_i8 = e2_softmax_quant_i8_avx2;
+#endif
     }
 }
 int main(int argc, char **argv) {

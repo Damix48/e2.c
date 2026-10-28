@@ -109,6 +109,8 @@ static int check(int M, int N, int K, int outliers) {
         free(ys);
     }
     int kernel_bad = 0;
+    /* The AVX2/VNNI/AVX512 kernels are not compiled outside x86-64, so their symbols only exist there. */
+#if defined(__x86_64__) || defined(_M_X64)
     {
         float *yv = has_avxvnni() ? malloc(sizeof(float) * (size_t)M * N) : NULL;
         float *ya = malloc(sizeof(float) * (size_t)M * N);
@@ -133,6 +135,9 @@ static int check(int M, int N, int K, int outliers) {
         if (!(cv > 0.9995) || !(ca > 0.9995)) kernel_bad = 1;
         free(yv); free(ya);
     }
+#else
+    printf("SIMD int8 kernels skipped (x86-only)\n    ");
+#endif
     e2_i8_gemm(y, qa, ascales, &qw, M, N, 0, N);
 
     for (int m = 0; m < M; m++)

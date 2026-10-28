@@ -50,8 +50,8 @@ class BenchmarkChecks(unittest.TestCase):
             np.testing.assert_array_equal(data["input_ids"], np.tile([2, 1], (8, 1)))
             self.assertEqual(data["input_ids"].dtype, np.int64)
             worker = (root / "query_batch8.bin").read_bytes()
-            self.assertEqual(struct.unpack("<3i", worker[:12]), (0, 8, 2))
-            self.assertEqual(len(worker), 12 + 8 * 2 * 4 + 8 * 768 * 4)
+            self.assertEqual(struct.unpack("<4i", worker[:16]), (0, 8, 2, 1))
+            self.assertEqual(len(worker), 16 + 8 * 2 * 4 + 8 * 768 * 4)
             for broken in (path.read_bytes()[:-1], path.read_bytes() + b"x", struct.pack("<2i", -1, 768)):
                 path.write_bytes(broken)
                 with self.assertRaises(ValueError):
@@ -73,9 +73,10 @@ class BenchmarkChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = root / "bad.bin"
-            for payload in (b"", struct.pack("<3i", 0, 1, -1), struct.pack("<3i", 0, 33, 2),
-                            struct.pack("<3i", 1, 1, 2521), struct.pack("<3i", 2, 1, 480001),
-                            struct.pack("<3i", 0, 1, 2) + b"x"):
+            for payload in (b"", struct.pack("<4i", 0, 1, -1, 1), struct.pack("<4i", 0, 33, 2, 1),
+                            struct.pack("<4i", 1, 1, 2521, 1), struct.pack("<4i", 2, 1, 480001, 1),
+                            struct.pack("<4i", 0, 1, 2, 2), struct.pack("<4i", 1, 1, 2, 0),
+                            struct.pack("<4i", 2, 2, 2, 1), struct.pack("<4i", 0, 1, 2, 1) + b"x"):
                 path.write_bytes(payload)
                 result = subprocess.run([str(worker), str(root / "no-model"), "cpu", str(path),
                                          "1", "0", str(root / "out.f32")], capture_output=True)
@@ -84,9 +85,10 @@ class BenchmarkChecks(unittest.TestCase):
     def test_checked_in_fixtures(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            for name in bench.CASES[:-1]:
+            for name in (n for n in bench.CASES if not n.startswith("audio")):
                 case = bench.prepare_case(name, bench.HERE / "tests/fixtures", root, root)
                 self.assertEqual(case["name"], name)
+                self.assertEqual(case["repeat"], bench.REPEATS.get(name, 1))
             pcm, mel, mask, n = bench.audio_fixture(bench.HERE / "tests/fixtures/audio.bin")
             self.assertEqual(len(pcm), 12000)
             self.assertEqual(mel.shape, (1, mask.shape[1], 128))

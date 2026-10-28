@@ -240,6 +240,8 @@ void (*e2_i8_quantize)(int8_t *, float *, const float *, int, int, float, float)
 e2_i8_attn_fn e2_i8_attn_gemm = NULL;
 e2_sq_fn e2_softmax_quant_i8 = NULL;
 
+/* __builtin_cpu_supports is x86-only: on any other host every SIMD feature collapses to "no". */
+#if defined(__x86_64__) || defined(_M_X64)
 static int cpu_has_avxvnni(void) {
 #if defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
@@ -271,7 +273,6 @@ static int cpu_has_avx512(void) {
 #endif
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
 static int cpu_has_avx2(void) {
 #if defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
@@ -281,6 +282,9 @@ static int cpu_has_avx2(void) {
 #endif
 }
 #else
+static int cpu_has_avxvnni(void) { return 0; }
+static int cpu_has_avx512vnni(void) { return 0; }
+static int cpu_has_avx512(void) { return 0; }
 static int cpu_has_avx2(void) { return 0; }
 #endif
 

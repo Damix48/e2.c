@@ -35,7 +35,8 @@ audio up to 30 s (750 soft tokens, one per 40 ms).
 
 # High-Level Capabilities
 
-- int8 weights **and** activations, dispatched at run time: AVX512-VNNI -> AVX-VNNI -> AVX2 -> scalar.
+- int8 weights **and** activations, dispatched at run time: AVX512-VNNI -> AVX-VNNI -> AVX2 -> NEON
+  (aarch64 dot-product) -> scalar.
 - bf16 path (`E2_INT8=0`): more accurate, 5-9x slower, same blocked attention.
 - Persistent worker pool; every region claims work from a shared counter instead of a fixed slice.
 - Reads the bf16 `model.safetensors` directly (mmap, demand-paged). Optional packed int8 cache
@@ -47,7 +48,7 @@ audio up to 30 s (750 soft tokens, one per 40 ms).
 - Image containers: PNG (in-tree reader, own DEFLATE), JPEG and WebP through the system codecs with
   EXIF orientation applied; each codec is optional at build time.
 - Two GPU backends: Intel Level Zero (all three towers, **experimental**) and AMD HIP (text and
-  vision, **never validated on AMD hardware**).
+  vision, **built and smoke-tested on nucleus's gfx1036, not performance-validated**).
 
 # File Structure
 
@@ -60,12 +61,15 @@ src/model.h             - internal model layout: bf16 pointers into the mmap + f
 src/st.c                - safetensors: mmap + JSON header parser + typed tensor views
 src/q8cache.c           - packed int8 model cache: writer, reader, mmap'd index
 src/int8.c              - weight quantization at load + the scalar int8 GEMM fallback
+src/dispatch.c          - attention precision: capabilities + per-(backend,tower) rules, one query
 src/kernels.c           - scalar reference backend + runtime backend dispatch
 src/kernels_avx2.c      - AVX2 + FMA backend (fp32)
 src/kernels_avx512.c    - AVX-512F/BW/VL/DQ + FMA backend (fp32)
 src/kernels_i8_avx2.c   - int8 GEMM for Haswell..Zen3 (vpmaddubsw)
 src/kernels_i8_vnni.c   - int8 GEMM on AVX-VNNI / AVX512-VNNI (vpdpbusd)
 src/kernels_i8_avx512_vnni.c - int8 GEMM and the packed-operand attention GEMM on AVX512-VNNI
+src/kernels_i8_neon.c   - int8 GEMM + per-block activation quantizer for aarch64 (vdotq_s32)
+src/kernels_neon.c      - aarch64 fp32 kernels: the blocked attention GEMM (selected unconditionally)
 src/threads.c           - persistent worker pool (claim-from-counter, futex sleep)
 src/text.c              - text tower: 24 layers, PLE, q/k/v norms, sliding window, fused regions
 src/vision.c            - vision tower: patch embedder, axial 2D RoPE, 16 layers, 3x3 pooling
@@ -92,6 +96,8 @@ tools/bench/            - bench_compare.py plus the C/HIP benchmark workers
 tests/test_*.c          - one file per test, wired into CTest in CMakeLists.txt
 tests/fixtures/         - frozen reference fixtures (committed, see its README)
 cmake/embed_binary.cmake - SPIR-V blob -> C array
+src/win32/inc/*.h       - POSIX headers Windows lacks, on the include path for WIN32 builds
+src/win32/compat.c      - their Win32 implementations (mmap, pthread_create/join, park, clock, env)
 download_model.sh       - fetch model.safetensors + tokenizer.json into models/ (gitignored)
 download_models.sh      - fetch the published packed int8 models (placeholder repo id for now)
 ```
@@ -105,9 +111,35 @@ run time, the GPU backends are separate libraries (`e2_gpu`, `e2_hip`).
 - **AVX2 / AVX-512**: fp32 kernels, chosen by CPUID.
 - **AVX2 / AVX-VNNI / AVX512-VNNI**: the int8 path, picked in the same dispatch. Needs AVX2 at
   minimum on the host.
+- **NEON int8**: `src/kernels_i8_neon.c`, aarch64 only, built with `-march=armv8.2-a+dotprod` and
+  entered only when `HWCAP_ASIMDDP` is set. Provides the int8 GEMM, the activation quantizer and the
+  packed-operand attention GEMM and the fused softmax+probability quantizer.
+- **NEON fp32**: `src/kernels_neon.c`, the blocked f32 GEMM the attention products go through. ASIMD is
+  in the aarch64 baseline, so this file needs no `-march` flag and no CPU probe.
 - **Intel GPU**: `src/gpu/`, Level Zero, OpenCL C compiled to SPIR-V by `cmake/embed_binary.cmake`.
   Configure drops the backend when `libze_loader` or the SPIR-V toolchain is missing.
-- **AMD GPU**: `src/gpu/hip/`, HIP sources compiled with `hipcc`; dropped when it is missing.
+- **AMD GPU**: `src/gpu/hip/`, HIP sources compiled with `hipcc`; dropped when it is missing. Built
+  and run on nucleus's `gfx1036` with ROCm 7.2 (see HARDWARE.md); `-DE2_HIP_ARCH` picks the target.
+- **Windows (native)**: `src/win32/`. The engine stays POSIX in the source tree; on Windows the build
+  puts `src/win32/inc` on the include path (`unistd.h`, `sys/mman.h`, `pthread.h`, `sched.h` plus a
+  force-included `e2win.h`) and links `src/win32/compat.c`, which implements them over Win32
+  (`CreateFileMapping`, `_beginthreadex`, `QueryPerformanceCounter`, an `SRWLOCK`+condition-variable
+  park, `_putenv_s`, `_fstat64`). Only three engine files carry a `_WIN32` branch: `threads.c` for the
+  park and `st.c`/`q8cache.c` for the 64-bit file size. Needs clang (GNU driver) plus the MSVC linker
+  and SDK, and Ninja: CMake links `-nostdlib` there, so the build locates `clang_rt.builtins` itself -
+  without it `__builtin_cpu_supports()` does not link and there is no backend dispatch. GPU backends
+  and the shell-script test are not built. See PERFORMANCE.md.
+
+The text tower has two attention implementations: fp32 (blocked, `e2_sgemm_nn_range`) and int8 (the
+ordinary `e2_i8_gemm` on both products, `attb_i8` in `src/text.c`). The int8 one only wins once the
+key count is large enough to amortise packing K and V^T per head - below the crossover the packer,
+not the GEMM, is the whole cost. Packing claims heads like every other region; while it was a serial
+loop the crossover sat at 384 keys on x86-64, and parallelising it moved it to 128 on both ISAs. That
+128, the HIP 64 and the Intel GPU 512 are rows of the rule table in `src/dispatch.c`, not literals at
+a call site; `e2_attn_pick()` is the only place a tower asks which precision to use, and
+`tests/test_dispatch.c` asserts the whole matrix on any host. `E2_ATTN_TEXT=f32|i8` and
+`E2_ATTN_IMAGE=f32|i8` override the table (read once, at init); the older `E2_ATTN_I8=0/1` and
+`E2_VATTN_OFF` still work as deprecated aliases.
 
 Options: `E2_WITH_GPU`, `E2_WITH_HIP`, `E2_WITH_PNG`, `E2_WITH_JPEG`, `E2_WITH_WEBP`, `E2_WITH_SNDFILE`, `E2_MODEL_DIR`,
 `E2_FIXTURE_DIR`. See [README.md](README.md#building).
@@ -134,6 +166,12 @@ Options: `E2_WITH_GPU`, `E2_WITH_HIP`, `E2_WITH_PNG`, `E2_WITH_JPEG`, `E2_WITH_W
 - **Complexity is only paid for with speed.** Reject tiny speed gains that add complexity; prefer
   substantial wins. Every optimization attempt - accepted or rejected - is written up in
   [PERFORMANCE.md](PERFORMANCE.md) with numbers and the reason it stands or was reverted.
+- **Attention precision goes through `src/dispatch.c`.** Length thresholds are rows of `k_rules`, never
+  literals at a call site; a tower asks `e2_attn_pick()` and never carries a gate of its own; towers
+  differ by table data, not by code structure; no `#if` in tower files (ISA conditionals live in
+  `kernels.c` and the kernel TUs); a capability is a named flag, never `ptr != NULL`; and precision
+  switches (`E2_ATTN_*`) stay a different namespace from kernel-generation switches (`*_OLD`,
+  `E2_HIP_ATTN=old|lds`).
 - Stick to standard C11; no compiler-specific tricks outside the ISA-specific translation units.
 
 # How To Run
@@ -163,6 +201,11 @@ file is not a speed claim.
 E2_THREADS=14 taskset -c 0-13 ./build/e2_text_bench models/embeddinggemma-2 tests/fixtures cpu 17 8 21
 E2_REPS=7 ./build/e2_test models/embeddinggemma-2 tests/fixtures
 
+# Every CPU backend this host can execute, one JSON line each, reusing the packed cache
+# (scalar is bf16 and needs the checkpoint instead, so it is skipped with a note when a cache is set)
+E2_Q8_READ=$PWD/models/e2/e2-embeddinggemma-2-int8-text.e8cq \
+  ./build/e2_text_bench models/e2 tests/fixtures backends 196 1 5
+
 # Serial, alternating A/B against another engine on matched inputs
 python3 tools/bench/bench_compare.py --model-dir models/embeddinggemma-2 --fixture-dir tests/fixtures
 
@@ -179,7 +222,10 @@ both stay in the log, with the cause of the win or of the null result.
 
 | variable | effect |
 | :-- | :-- |
-| `E2_PROFILE=1` | wall-clock breakdown of one embedding per parallel region, plus GEMM parallelism |
+| `E2_PROFILE=1` | wall-clock breakdown of one embedding per parallel region, plus GEMM parallelism, plus the `attn path` line naming the precision actually picked |
+| `E2_ATTN_TEXT=` / `E2_ATTN_IMAGE=` | `auto\|f32\|f16\|i8`: force a tower's attention precision for an A/B; the old `E2_ATTN_I8=0/1` and `E2_VATTN_OFF` still work as aliases |
+| `E2_ATTN_STAGE=` | `auto\|direct\|lds\|legacy`: kernel generation, not precision (HIP); `legacy` is the pre-fusion scalar fp32 attention, and `E2_HIP_ATTN=old\|lds` / `E2_HIP_ATTN_I8=direct` remain aliases |
+| `E2_CPU_BACKEND=` | `scalar\|avx2\|vnni\|avx512\|neon`: force the CPU backend, downgrade only (it never invents an ISA). `e2_text_bench ... backends` sweeps every backend this host can run |
 | `E2_DUMP=<dir>` | raw f32 intermediates per stage (`x0`, `ple`, `l0_attn_out`, ...) |
 | `E2_REF_ACT=<dir>` | compare those stages against `tests/ref_act/*.f32` and report per stage |
 | `E2_GPU_PROFILE=1` | bracket every device kernel with timestamp writes |

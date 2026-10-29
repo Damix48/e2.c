@@ -283,8 +283,13 @@ int q8c_read_open(const char *path) {
     if (r_base) return r_err(path, NULL, "already open");
     r_fd = open(path, O_RDONLY);
     if (r_fd < 0) return r_err(path, NULL, "cannot open");
+#if defined(_WIN32)
+    struct _stat64 st; /* UCRT's struct stat st_size is 32 bits; the cache is 916 MB */
+    if (_fstat64(r_fd, &st) || st.st_size < Q8C_INDEX_OFF) { r_err(path, NULL, "too small"); goto fail; }
+#else
     struct stat st;
     if (fstat(r_fd, &st) || st.st_size < Q8C_INDEX_OFF) { r_err(path, NULL, "too small"); goto fail; }
+#endif
     r_size = (size_t)st.st_size;
     void *m = mmap(NULL, r_size, PROT_READ, MAP_PRIVATE, r_fd, 0);
     if (m == MAP_FAILED) { r_err(path, NULL, "mmap failed"); goto fail; }

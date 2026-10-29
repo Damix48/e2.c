@@ -1,4 +1,5 @@
 /* A real exported cache with a missing/raw wrong-shaped tensor must fail at load, not inference. */
+#include "test_tmpdir.h"
 #include "e2.h"
 #include "kernels.h"
 #include <assert.h>
@@ -25,8 +26,11 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     e2_cpu_init();
     if (!e2_i8_quantize) { puts("SKIP: packed caches require an int8 backend"); return 77; }
-    char dir[] = "/tmp/e2-model-load-XXXXXX"; assert(mkdtemp(dir));
-    char cache[512]; snprintf(cache, sizeof cache, "%s/model.e8cq", dir);
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/e2-model-load-XXXXXX", e2_test_tmpdir());
+    assert(mkdtemp(dir));
+    char cache[544]; /* dir is 512: leave room for the appended name */
+    snprintf(cache, sizeof cache, "%s/model.e8cq", dir);
     unsetenv("E2_INT8"); unsetenv("E2_Q8_READ");
     assert(!setenv("E2_Q8_WRITE", cache, 1) && !setenv("E2_Q8_TOWERS", "all", 1));
     e2_model *m = e2_load(argv[1]);

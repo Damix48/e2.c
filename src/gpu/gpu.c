@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../dispatch.h"
 #include "../model.h"
 #include "../validation.h"
 #include "gpu.h"
@@ -795,7 +796,7 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
         const int base = l * E2_DS_PER_LAYER;
         const int rope = L->sliding ? 0 : 1;
         const int D = L->head_dim, H = E2_NUM_HEADS, KV = L->n_kv_heads;
-        const int i8_attn = seq_len >= 512;
+        const int i8_attn = e2_attn_pick(E2_BK_INTEL_GPU, E2_TOWER_TEXT, seq_len) == E2_ATTN_I8;
         const int sup = (seq_len + 127) / 128 * 128, tile = (seq_len + 15) / 16 * 16;
         const int batches = rows / seq_len;
         void *kp = aoff_ptr(g, A_TK), *vp = aoff_ptr(g, A_TV);

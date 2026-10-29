@@ -1,3 +1,4 @@
+#include "test_tmpdir.h"
 #include "st.h"
 #include <assert.h>
 #include <stdio.h>
@@ -15,7 +16,8 @@ static void file(const char *path, const char *json, size_t payload) {
     assert(!fclose(f));
 }
 int main(void) {
-    char path[] = "/tmp/e2-st-XXXXXX";
+    char path[512];
+    snprintf(path, sizeof path, "%s/e2-st-XXXXXX", e2_test_tmpdir());
     int fd = mkstemp(path); assert(fd >= 0); close(fd);
     const char *valid = "{\"__metadata__\":{\"format\":\"pt\"},\"x\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[0,8]}}";
     file(path, valid, 8);

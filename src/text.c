@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dispatch.h"
 #include "model.h"
 #include "threads.h"
 #include "validation.h"
@@ -65,6 +66,9 @@ static void prof_flush(int S) {
     double tot = 0;
     for (int i = 0; i < PROF_N; i++) tot += g_prof_ms[i];
     printf("[profile S=%d] total %.2f ms\n", S, tot);
+    printf("   %-10s %s (S=%d, min=%d)\n", "attn path",
+           e2_attn_kind_name(e2_attn_pick(e2_cpu_backend(), E2_TOWER_TEXT, S)), S,
+           e2_attn_min_keys(e2_cpu_backend(), E2_TOWER_TEXT));
     for (int i = 0; i < PROF_N; i++) {
         printf("   %-10s %8.2f ms  %5.1f%%\n", g_prof_name[i], g_prof_ms[i], 100.0 * g_prof_ms[i] / tot);
         g_prof_ms[i] = 0;
@@ -586,7 +590,9 @@ static void e2_dump(const char *name, const float *p, size_t n);
 struct kt_task {
     const float *k;
     float *kt;
-    int S, D, rows, kv_dim, groups;
+    int S;   /* source rows */
+    int ld;  /* destination row stride: >= S when the int8 path zero-pads  */
+    int D, rows, kv_dim, groups;
     _Atomic int next;
 };
 
@@ -602,8 +608,9 @@ static void kt_worker(void *arg, int tid, int nthreads) {
         for (int r = r0; r < r1; r++) {
             const int h = r / t->D, d = r - h * t->D;
             const float *src = t->k + (size_t)(h / t->groups) * t->D + d;
-            float *dst = t->kt + (size_t)r * t->S;
+            float *dst = t->kt + (size_t)r * t->ld;
             for (int n = 0; n < t->S; n++) dst[n] = src[(size_t)n * t->kv_dim];
+            for (int n = t->S; n < t->ld; n++) dst[n] = 0.f;
         }
     }
 }
@@ -612,12 +619,91 @@ struct attb_task {
     float *q, *v, *ctx, *kt, *scores;
     int S, D, GD, kv_dim, H, kv_groups, nblk, window;
     _Atomic int next;
+    /* int8 path: qk/qv are [H] packed operands (K as [keys][D], V^T as [D][keys]) and the rest is
+     * per-worker scratch. qk is NULL when the fp32 path runs. */
+    const e2_q8w *qk, *qv;
+    uint8_t *q8, *p8;
+    float *qs, *ps, *c8;
 };
+
+/* Both attention products are the NT product int8.c already implements - logits is Q[rows,D] x
+ * K[keys,D]^T and context is P[rows,keys] x V^T[D,keys]^T - so this needs no attention-specific
+ * kernel, just the weight GEMM and the activation quantizer. Q and P are the activations, quantized
+ * per E2_I8_BLOCK like every other activation in the tower; K and V^T are packed once per layer,
+ * per head. Probabilities are non-negative, so quantizing them costs no range.
+ *
+ * The GEMM walks output columns in 8s, so the key range start is rounded down and the mask below
+ * zeroes the extra columns.
+ */
+static void attb_i8(struct attb_task *t, int tid) {
+    const e2_kernels *K = e2_k();
+    const int S = t->S, D = t->D;
+    const int nbD = (D + E2_I8_BLOCK - 1) / E2_I8_BLOCK; /* the GEMM reads Q's scales this way */
+    /* The context product's K is the key count, and e2_i8_gemm requires K to be a block multiple
+     * (int8.h). The padded key rows and their scale blocks are zero, so they contribute nothing. */
+    const int Sp = (S + E2_I8_BLOCK - 1) & ~(E2_I8_BLOCK - 1);
+    float *sc = t->scores + (size_t)tid * E2_ATT_BQ * S;
+    uint8_t *q8 = t->q8 + (size_t)tid * E2_ATT_BQ * 512;
+    float *qs = t->qs + (size_t)tid * E2_ATT_BQ * 4;
+    uint8_t *p8 = t->p8 + (size_t)tid * E2_ATT_BQ * Sp; /* rows are Sp apart, not S */
+    float *ps = t->ps + (size_t)tid * E2_ATT_BQ * 32;
+    float *c8 = t->c8 + (size_t)tid * E2_ATT_BQ * 512;
+    const int nbS = (S + E2_I8_BLOCK - 1) / E2_I8_BLOCK, nbsp = Sp / E2_I8_BLOCK;
+    for (;;) {
+        const int it = atomic_fetch_add_explicit(&t->next, 1, memory_order_relaxed);
+        if (it >= t->H * t->nblk) break;
+        const int h = it / t->nblk, blk = it - h * t->nblk;
+        const int m0 = blk * E2_ATT_BQ;
+        int rows = S - m0;
+        if (rows > E2_ATT_BQ) rows = E2_ATT_BQ;
+        int lo = 0, hi = S;
+        if (t->window >= 0) {
+            lo = m0 > t->window ? m0 - t->window : 0;
+            hi = m0 + rows + t->window;
+            if (hi > S) hi = S;
+        }
+        lo &= ~7;
+        /* Q rows are strided by GD, so one quantize call per row rather than one for the block */
+        for (int i = 0; i < rows; i++)
+            e2_i8_quantize((int8_t *)q8 + (size_t)i * D, qs + (size_t)i * nbD,
+                           t->q + (size_t)(m0 + i) * t->GD + (size_t)h * D, 1, D, -INFINITY,
+                           INFINITY);
+        e2_i8_gemm(sc, (const int8_t *)q8, qs, &t->qk[h], rows, S, lo, hi);
+        for (int i = 0; i < rows; i++) {
+            /* this buffer is absolute (column j is key j, stride S), unlike the fp32 one, which
+             * starts its rows at lo - so the window bounds are not lo-relative here */
+            float *row = sc + (size_t)i * S;
+            int first = 0, end = S;
+            if (t->window >= 0) {
+                first = m0 + i - t->window;
+                if (first < 0) first = 0;
+                end = m0 + i + t->window + 1;
+                if (end > S) end = S;
+            }
+            K->softmax(row + first, end - first);
+            memset(row, 0, sizeof(float) * (size_t)first);
+            memset(row + end, 0, sizeof(float) * (size_t)(S - end));
+        }
+        /* one call per row: the quantizer's row stride is its K, which is S, but the GEMM reads
+         * these rows with stride Sp */
+        for (int i = 0; i < rows; i++) {
+            e2_i8_quantize((int8_t *)p8 + (size_t)i * Sp, ps + (size_t)i * nbsp,
+                           sc + (size_t)i * S, 1, S, -INFINITY, INFINITY);
+            memset(p8 + (size_t)i * Sp + S, 0, (size_t)(Sp - S));
+            for (int b = nbS; b < nbsp; b++) ps[(size_t)i * nbsp + b] = 0.f;
+        }
+        e2_i8_gemm(c8, (const int8_t *)p8, ps, &t->qv[h], rows, D, 0, D);
+        for (int i = 0; i < rows; i++)
+            memcpy(t->ctx + (size_t)(m0 + i) * t->GD + (size_t)h * D, c8 + (size_t)i * D,
+                   sizeof(float) * (size_t)D);
+    }
+}
 
 static void attb_worker(void *arg, int tid, int nthreads) {
     struct attb_task *t = arg;
     const e2_kernels *K = e2_k();
     (void)nthreads;
+    if (t->qk) { attb_i8(t, tid); return; }
     float *sc = t->scores + (size_t)tid * E2_ATT_BQ * t->S;
     for (;;) {
         const int it = atomic_fetch_add_explicit(&t->next, 1, memory_order_relaxed);
@@ -654,17 +740,77 @@ static void attb_worker(void *arg, int tid, int nthreads) {
     }
 }
 
-static void attention_blocked(e2_layer *L, float *q, float *k, float *v, float *ctx, float *kt,
-                              float *scores, int S) {
-    const int D = L->head_dim;
-    struct kt_task tk = { k, kt, S, D, E2_NUM_HEADS * D, L->kv_dim, E2_NUM_HEADS / L->n_kv_heads, 0 };
-    atomic_init(&tk.next, 0);
-    e2_parallel(kt_worker, &tk);
-    struct attb_task at = { q, v, ctx, kt, scores, S, D, L->q_dim, L->kv_dim, E2_NUM_HEADS,
-                            E2_NUM_HEADS / L->n_kv_heads, (S + E2_ATT_BQ - 1) / E2_ATT_BQ,
-                            L->sliding ? L->window : -1, 0 };
+/* The int8 attention path needs the weight GEMM and the activation quantizer, both already
+ * dispatched per CPU, plus enough keys that packing K and V^T per head pays for itself. Below the
+ * crossover the packer is the entire cost, not the GEMM.
+ *
+ * Both architectures now cross over at the same place, ~110-128 keys, once the packer stopped being
+ * a serial loop over heads: int8 still loses 24 % at 32 keys, is break-even at 96 and wins 3-5 % at
+ * 128, then 12-13 % at 196 and 28-46 % by 512. The two sweeps are in PERFORMANCE.md; the 128 itself
+ * lives in dispatch.c's rule table, not here.
+ *
+ * E2_ATTN_TEXT=f32|i8 (or the deprecated E2_ATTN_I8=0/1) forces the path either way, and is read once
+ * per process rather than per layer. */
+static int attn_i8_ok(int S) {
+    return e2_attn_pick(e2_cpu_backend(), E2_TOWER_TEXT, S) == E2_ATTN_I8;
+}
+
+/* Packing is per (layer, head) and independent, so it claims heads like everything else. It used to
+ * be a serial loop over heads, which made it the whole cost of short-sequence int8 attention: at 196
+ * keys the packer is ~0.44 ms/layer against ~0.06 ms of int8 GEMM. */
+struct pack_task {
+    const float *k, *kt; /* kt is V^T, already transposed */
+    int S, Sp, D, kv_dim, groups, H;
+    e2_q8w *qk, *qv;
+    _Atomic int next;
+};
+
+static void pack_worker(void *arg, int tid, int nthreads) {
+    struct pack_task *t = arg;
+    (void)tid;
+    (void)nthreads;
+    for (;;) {
+        const int h = atomic_fetch_add_explicit(&t->next, 1, memory_order_relaxed);
+        if (h >= t->H) break;
+        e2_q8w_from_f32_ld(&t->qk[h], t->k + (size_t)(h / t->groups) * t->D, t->S, t->D, t->kv_dim);
+        e2_q8w_from_f32(&t->qv[h], t->kt + (size_t)h * t->D * t->Sp, t->D, t->Sp);
+    }
+}
+
+static void attention_blocked(e2_layer *L, float *q, float *k, float *v, float *ctx, e2_ws *w,
+                              int S) {
+    const int D = L->head_dim, H = E2_NUM_HEADS, groups = H / L->n_kv_heads;
+    e2_q8w qk[E2_NUM_HEADS] = { { 0 } }, qv[E2_NUM_HEADS] = { { 0 } };
+    const int i8 = attn_i8_ok(S);
+    if (i8) {
+        /* V^T is the context product's weight operand. kt_worker is row-wise on both sides, so it
+         * serves V unchanged - the lesson from the vision packer, where the per-dim version was 15x
+         * slower. It reuses the kt slot: the fp32 path that also wants kt never runs alongside. */
+        const int Sp = (S + E2_I8_BLOCK - 1) & ~(E2_I8_BLOCK - 1);
+        struct kt_task tv = { v, w->kt, S, Sp, D, H * D, L->kv_dim, groups, 0 };
+        atomic_init(&tv.next, 0);
+        e2_parallel(kt_worker, &tv);
+        /* K is the head dim for the logits product (always a block multiple) and the key count for
+         * the context product, which needs the zero-padded tail above. */
+        struct pack_task pk = { k, w->kt, S, Sp, D, L->kv_dim, groups, H, qk, qv, 0 };
+        atomic_init(&pk.next, 0);
+        e2_parallel(pack_worker, &pk);
+    } else {
+        struct kt_task tk = { k, w->kt, S, S, D, H * D, L->kv_dim, groups, 0 };
+        atomic_init(&tk.next, 0);
+        e2_parallel(kt_worker, &tk);
+    }
+    struct attb_task at = { q, v, ctx, w->kt, w->asblk, S, D, L->q_dim, L->kv_dim, H, groups,
+                            (S + E2_ATT_BQ - 1) / E2_ATT_BQ, L->sliding ? L->window : -1, 0,
+                            i8 ? qk : NULL, i8 ? qv : NULL, w->att_q8, w->att_p8, w->att_qs,
+                            w->att_ps, w->att_ctx };
     atomic_init(&at.next, 0);
     e2_parallel(attb_worker, &at);
+    if (i8)
+        for (int h = 0; h < H; h++) {
+            e2_q8w_free(&qk[h]);
+            e2_q8w_free(&qv[h]);
+        }
 }
 
 
@@ -728,7 +874,7 @@ static void attention(e2_model *m, e2_layer *L, float *h, int B, int seq_len, e2
             for (int s = 0; blocked && s < S; s++)
                 if (!valid[s]) blocked = 0;
             if (blocked) {
-                attention_blocked(L, q, k, v, ctx, w->kt, w->asblk, S);
+                attention_blocked(L, q, k, v, ctx, w, S);
             } else {
                 struct attn_task t = { m, L, S, valid, q, k, v, ctx, attn, dbg, 0 };
                 atomic_init(&t.next, 0);

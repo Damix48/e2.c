@@ -18,7 +18,7 @@ include(CTest)
 # gated-MLP elementwise products, residual adds, PLE scaling) is plain loops over S x hidden and
 # benefits from the auto-vectorizer; -fno-tree-vectorize left those 4-8x slower than they need to be.
 
-set(E2_SOURCES src/st.c src/kernels.c src/int8.c src/q8cache.c src/e2.c src/text.c src/vision.c src/audio.c src/threads.c
+set(E2_SOURCES src/st.c src/kernels.c src/dispatch.c src/int8.c src/q8cache.c src/e2.c src/text.c src/vision.c src/audio.c src/threads.c
                src/tokenizer.c src/imageproc.c src/png.c src/imagedec.c src/validation.c src/audioproc.c)
 # Input/output validation must keep IEEE finite-value checks real.
 set_source_files_properties(src/validation.c src/audioproc.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
@@ -39,11 +39,55 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mfma")
 endif()
 
+# aarch64: NEON int8 backend, built for the ARMv8.2 dot-product extension. Like the x86 backends this
+# translation unit is only ever entered after e2_cpu_init() has seen HWCAP_ASIMDDP, so a core without
+# the extension never executes a vdotq_u32 and stays on the scalar path.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+  list(APPEND E2_SOURCES src/kernels_i8_neon.c src/kernels_neon.c)
+  set_source_files_properties(src/kernels_i8_neon.c PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+endif()
+
+# Native Windows: the engine is POSIX by construction, so src/win32/inc provides the three missing
+# headers (unistd.h, sys/mman.h, pthread.h) plus a force-included e2win.h, and src/win32/compat.c
+# implements them over the Win32 API. No engine source needs to know: the include path does the work.
+if(WIN32)
+  list(APPEND E2_SOURCES src/win32/compat.c)
+  include_directories("${CMAKE_CURRENT_SOURCE_DIR}/src/win32/inc")
+  add_compile_options(-include "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/inc/e2win.h")
+  add_compile_definitions(_WIN32_WINNT=0x0A00 _CRT_NONSTDC_NO_DEPRECATE _CRT_SECURE_NO_WARNINGS)
+  # CMake links with -nostdlib, so clang_rt.builtins is not added - and that library is where
+  # __cpu_model / __cpu_features2 / __cpu_indicator_init live, which is what
+  # __builtin_cpu_supports() lowers to on x86 (kernels.c's whole runtime dispatch). Ask the compiler
+  # where its builtins are and make them follow the library to every executable.
+  # -Wno-nan-infinity-disabled: with -ffast-math clang warns about the INFINITY sentinels int8.h
+  # uses as "no clamp" bounds. GCC does not have that warning, so Linux builds are unchanged.
+  add_compile_options(-Wno-nan-infinity-disabled)
+  # clang reports a bare "libgcc.a" here on Windows, so glob the builtins out of the compiler's own
+  # install instead: <llvm>/lib/clang/<ver>/lib/windows/clang_rt.builtins-<arch>.lib.
+  get_filename_component(_e2_clang_bin "${CMAKE_C_COMPILER}" DIRECTORY)
+  file(GLOB E2_WIN_BUILTINS_CANDIDATES
+       "${_e2_clang_bin}/../lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+  if(E2_WIN_BUILTINS_CANDIDATES)
+    list(SORT E2_WIN_BUILTINS_CANDIDATES)
+    list(GET E2_WIN_BUILTINS_CANDIDATES -1 E2_WIN_BUILTINS)
+    message(STATUS "e2: compiler builtins ${E2_WIN_BUILTINS}")
+  else()
+    message(WARNING "e2: clang_rt.builtins not found under '${_e2_clang_bin}/../lib/clang'; "
+                    "__builtin_cpu_supports() will not link and runtime dispatch has no backend")
+  endif()
+endif()
+
 add_library(e2 STATIC ${E2_SOURCES})
 target_compile_options(e2 PRIVATE -ffast-math)
 target_include_directories(e2 PUBLIC include PRIVATE src)
 find_package(Threads REQUIRED)
-target_link_libraries(e2 PUBLIC m Threads::Threads)
+target_link_libraries(e2 PUBLIC Threads::Threads)
+if(WIN32 AND EXISTS "${E2_WIN_BUILTINS}")
+  target_link_libraries(e2 INTERFACE "${E2_WIN_BUILTINS}")
+endif()
+if(NOT WIN32)
+  target_link_libraries(e2 PUBLIC m)   # the UCRT carries the C math library directly
+endif()
 
 # Optional media codecs. PNG and WAV have in-tree readers; JPEG and WebP go through the same
 # libraries the HF reference uses (libjpeg-turbo, libwebp), which is what makes their pixels match
@@ -267,9 +311,12 @@ if(TARGET e2_gpu)
 endif()
 
 add_executable(e2_test_metrics tests/test_metrics.c)
-target_link_libraries(e2_test_metrics PRIVATE m)
+if(NOT WIN32)
+  target_link_libraries(e2_test_metrics PRIVATE m)
+endif()
 foreach(name softmax text_attention text_batch lifecycle q8cache validation audio_load
-             st audio_kernels tokenizer_boundary png_transparency threads model_load audio_reference cpu_backends audioproc)
+             st audio_kernels tokenizer_boundary png_transparency threads model_load audio_reference cpu_backends audioproc
+             dispatch)
   add_executable(e2_test_${name} tests/test_${name}.c)
   target_link_libraries(e2_test_${name} PRIVATE e2)
   target_include_directories(e2_test_${name} PRIVATE src)
@@ -302,6 +349,7 @@ add_executable(e2_export_cache tools/export_cache.c)
 target_link_libraries(e2_export_cache PRIVATE e2)
 add_executable(e2_text_bench tools/bench/text_bench.c)
 target_link_libraries(e2_text_bench PRIVATE e2)
+target_include_directories(e2_text_bench PRIVATE src) # e2_cpu_backend_count/name for the sweep mode
 target_compile_options(e2_text_bench PRIVATE -fno-fast-math)
 target_compile_definitions(e2_text_bench PRIVATE E2_BENCH_CPU_BATCH=1)
 if(TARGET e2_gpu)
@@ -324,6 +372,7 @@ set(E2_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" CACHE PATH "Froz
 if(BUILD_TESTING)
   add_test(NAME int8 COMMAND e2_test_int8)
   set_tests_properties(int8 PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME dispatch COMMAND e2_test_dispatch)
   add_test(NAME metrics COMMAND e2_test_metrics)
   if(UNIX)
     add_test(NAME artifacts COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_artifacts.sh" "${CMAKE_CURRENT_SOURCE_DIR}")

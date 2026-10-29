@@ -163,8 +163,14 @@ int st_open(st_file *f, const char *path) {
     memset(f, 0, sizeof *f);
     g_err[0] = 0;
     f->fd = open(path, O_RDONLY);
+#if defined(_WIN32)
+    /* UCRT's struct stat has a 32-bit st_size; the checkpoint is 1.4 GB. */
+    struct _stat64 sb;
+    if (f->fd < 0 || _fstat64(f->fd, &sb) || sb.st_size < 8 || (uint64_t)sb.st_size > SIZE_MAX) goto bad;
+#else
     struct stat sb;
     if (f->fd < 0 || fstat(f->fd, &sb) || sb.st_size < 8 || (uint64_t)sb.st_size > SIZE_MAX) goto bad;
+#endif
     f->size = (size_t)sb.st_size;
     void *base = mmap(NULL, f->size, PROT_READ, MAP_PRIVATE, f->fd, 0);
     if (base == MAP_FAILED) goto bad;

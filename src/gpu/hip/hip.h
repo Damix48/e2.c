@@ -39,14 +39,15 @@ enum {
     HA_NREGION
 };
 
-/* The int8 attention path runs for seq_len >= E2_HIP_ATTN_I8_MIN (shorter shapes stay on the
- * fused fp32 kernel: the pack + softmax launches do not pay for themselves there). */
-#define E2_HIP_ATTN_I8_MIN 64
+/* The int8 attention path runs for seq_len >= the HIP/text threshold in dispatch.c (shorter shapes
+ * stay on the fused fp32 kernel: the pack + softmax launches do not pay for themselves there). The
+ * threshold is a rule, not a constant of this backend; E2_HIP_ATTN_I8_MIN overrides it at run time. */
 /* scores/P scratch cap: nseq*H*S*sup <= this many elements -> every (sequence, head) gets its own
  * slice and the products launch once; larger shapes loop (sequence, head) over one shared slice.
  * 4M elements = 16 MB fp32 scores + 4 MB int8 P, and one max-size (s,h) slice is exactly 4M. */
 #define E2_HIP_A8_SLICES (4 * 1024 * 1024)
-/* seq_len at which the LDS-staged attention products beat the direct-load ones on gfx1036 */
+/* seq_len at which the LDS-staged attention products beat the direct-load ones on gfx1036. This is a
+ * kernel-generation threshold, not a precision one, which is why it stays here and not in the table. */
 #define E2_HIP_A8_LDS_MIN 512
 
 #define E2_HIP_MAX_ROWS 2048

@@ -77,10 +77,18 @@ extern void (*e2_i8_quantize)(int8_t *out, float *scales, const float *x, int M,
 extern void (*e2_sgemm_nn_range)(float *C, int ldc, const float *A, int lda, const float *B, int ldb,
                                  int M, int N, int K, int m0, int m1);
 
-/* Select the best backend for this CPU (AVX2/FMA if available, else scalar). Call once before use. */
+/* Select the best backend for this CPU (AVX2/FMA if available, else scalar). Call once before use.
+ * E2_CPU_BACKEND=<name> downgrades the choice for an A/B; only a backend this CPU can execute is
+ * accepted, so the switch can measure the AVX2 kernels on a VNNI machine but never invent an ISA. */
 void e2_cpu_init(void);
 const e2_kernels *e2_k(void);
 const char *e2_cpu_name(void);
+
+/* The named backends this build carries, in preference order: e2_cpu_backend_name(i) returns NULL for
+ * one this host cannot execute, so a bench can iterate and skip. The names are the E2_CPU_BACKEND
+ * values ("scalar", "avx2", "vnni", "avx512", "neon", whichever apply to the architecture). */
+int e2_cpu_backend_count(void);
+const char *e2_cpu_backend_name(int i);
 
 /* Shared helpers (backend-independent). */
 void e2_bf16_to_f32(float *dst, const uint16_t *src, size_t n);

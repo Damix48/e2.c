@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dispatch.h"
 #include "model.h"
 #include "threads.h"
 #include "validation.h"
@@ -41,6 +42,8 @@ static void vprof_flush(int P) {
     double tot = 0;
     for (int i = 0; i < VPROF_N; i++) tot += g_vprof[i];
     printf("[vprofile P=%d] total %.1f ms\n", P, tot);
+    printf("   %-10s %s (P=%d, no gate)\n", "attn path",
+           e2_attn_kind_name(e2_attn_pick(e2_cpu_backend(), E2_TOWER_IMAGE, E2_ATTN_ANY_KEYS)), P);
     for (int i = 0; i < VPROF_N; i++) {
         printf("   %-10s %8.1f ms  %5.1f%%\n", g_vprof_name[i], g_vprof[i], 100.0 * g_vprof[i] / tot);
         g_vprof[i] = 0;
@@ -578,9 +581,9 @@ static void vattention(e2_vision *v, int h, int P) {
  * One kernel serves both products - C[m][n] = bsc[n] * sum_b asc[m][b] * (A[m] . B[n] - 128*bz).
  * A is unsigned [M][K] with row stride lda, B is packed k-quad-major [K/4][Np][4] so 16 output
  * columns are one 64-byte load, and `ldc` lets the context product write straight into the strided
- * head columns of `att`. The kernel itself lives in kernels_i8_avx512_vnni.c and is reached through
- * the e2_i8_attn_gemm dispatch, so the text tower's attention shares it. */
-static int vattn_have_simd(void) { return e2_i8_attn_gemm != NULL; }
+ * head columns of `att`. The kernel has one form per SIMD backend that has it - AVX-512 VNNI,
+ * AVX-VNNI and NEON (`kernels_i8_avx512_vnni.c`, `kernels_i8_vnni.c`, `kernels_i8_neon.c`). The text
+ * tower does not share it: since Attempt 22, text attention is two ordinary int8 GEMMs. */
 
 /* Scalar form of the same operation, kept as the reference while bringing the SIMD one up
  * (E2_VATTN_REF=1 selects it). */
@@ -799,8 +802,11 @@ static void vatt8_worker(void *arg, int tid, int nthreads) {
 }
 
 static int vattn_int8_ok(e2_model *m) {
-    if (getenv("E2_VATTN_OFF")) return 0; /* A/B: force the fp32 attention */
-    return m->use_int8 && e2_i8_quantize != NULL && vattn_have_simd();
+    /* Image attention has no length gate (2520 patches are effectively fixed), so the key count is
+     * irrelevant; the capability is what decides, and AVX2 answers F32 here. E2_ATTN_IMAGE=f32 (or
+     * the deprecated E2_VATTN_OFF) forces the fp32 path. */
+    return m->use_int8 &&
+           e2_attn_pick(e2_cpu_backend(), E2_TOWER_IMAGE, E2_ATTN_ANY_KEYS) == E2_ATTN_I8;
 }
 
 static void vattn_pack_qk(e2_vision *v, int h, int P) {

@@ -99,8 +99,17 @@ typedef void (*e2_i8_gemm_fn)(float *y, const int8_t *qa, const float *a_scales,
 /* Quantize a bf16/f32 tensor with shape [N, K] into q (allocates). Returns 0 on success. */
 int e2_q8w_from_f32(e2_q8w *q, const float *w, int N, int K);
 int e2_q8w_from_bf16(e2_q8w *q, const uint16_t *w, int N, int K);
+/* Same, from a strided f32 source: element (n,k) is src[n*ld + k]. Lets a projection output
+ * [S][kv_dim] be quantized one head at a time without copying it into a contiguous block. */
+int e2_q8w_from_f32_ld(e2_q8w *q, const float *w, int N, int K, int ld);
 void e2_q8w_free(e2_q8w *q);
 
+/* Precondition for every e2_i8_gemm backend: K must be a multiple of E2_I8_BLOCK. The SIMD kernels
+ * walk k-quads up to the end of each block without looking at K (the scalar reference does not need
+ * this, which is exactly why it can hide), so a short K reads into the next 8-row group. Keeping
+ * that let the kernels keep a constant trip count on the inner loop; a caller whose K is arbitrary
+ * - the attention's context product uses K = keys - zero-pads the weight rows and the activation
+ * rows up to the block. Every projection in the model already has a K that is a multiple of 128. */
 /* The scalar reference GEMM (int8 weights, biased int8 activations); the backends and the GPU
  * compare against it, and it is the fallback on machines without VNNI/AVX2. */
 void e2_i8_gemm_scalar(float *y, const int8_t *qa, const float *a_scales, const e2_q8w *w,

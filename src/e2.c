@@ -162,7 +162,16 @@ static size_t ws_layout(e2_ws *w, float *base, const e2_model *m, size_t S) {
     SLOT(v, S * 1024);
     SLOT(att, S * 2048);
     SLOT(attn, E2_MAX_THREADS * E2_MAX_SEQ); /* one score row per worker */
-    SLOT(kt, E2_NUM_HEADS * 512 * S);        /* blocked attention: transposed K */
+    SLOT(kt, E2_NUM_HEADS * 512 * S);        /* blocked attention: transposed K, or V for int8 */
+    SLOT(att_q8_words, ((size_t)E2_MAX_THREADS * E2_ATT_BQ * 512 + 3) / 4);
+    SLOT(att_qs, (size_t)E2_MAX_THREADS * E2_ATT_BQ * 4); /* D <= 512 -> at most 4 blocks */
+    /* rows are padded up to an E2_I8_BLOCK multiple (see attb_i8): the context product's K is the
+     * key count and e2_i8_gemm requires a block multiple */
+    SLOT(att_p8_words,
+         ((size_t)E2_MAX_THREADS * E2_ATT_BQ * ((S + E2_I8_BLOCK - 1) & ~(size_t)(E2_I8_BLOCK - 1)) +
+           3) / 4);
+    SLOT(att_ps, (size_t)E2_MAX_THREADS * E2_ATT_BQ * 32); /* S <= 2048 -> at most 16 blocks */
+    SLOT(att_ctx, (size_t)E2_MAX_THREADS * E2_ATT_BQ * 512);
     SLOT(asblk, (size_t)e2_nthreads() * E2_ATT_BQ * S);
     SLOT(gate, S * I);
     SLOT(up, S * I);
@@ -188,6 +197,8 @@ int e2_ws_alloc(e2_model *m, int max_seq, int max_patches) {
     if (used != floats) { e2_set_error("workspace layout mismatch"); free(blk); memset(w, 0, sizeof *w); return -1; }
     w->qa = (uint8_t *)w->qa_words;
     w->valid = (uint8_t *)w->valid_words;
+    w->att_q8 = (uint8_t *)w->att_q8_words;
+    w->att_p8 = (uint8_t *)w->att_p8_words;
     return 0;
 }
 
@@ -436,7 +447,7 @@ void e2_free(e2_model *m) {
 void e2_info(const e2_model *m) {
     printf("EmbeddingGemma 2 engine\n");
     printf("  cpu backend : %s, %d threads, weights %s%s\n", e2_cpu_name(), e2_nthreads(),
-           m->use_int8 ? "int8 (VNNI/AVX2)" : "bf16", g_q8_read ? ", packed cache" : "");
+           m->use_int8 ? "int8 (VNNI/AVX2/NEON)" : "bf16", g_q8_read ? ", packed cache" : "");
     if (g_q8_read) printf("  tensors     : from the packed cache (E2_Q8_READ)\n");
     else printf("  tensors     : %zu from safetensors\n", m->st.count);
     printf("  text        : %d layers, hidden %d, ffn %d, heads %d, ple %d\n",

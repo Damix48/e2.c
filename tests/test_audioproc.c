@@ -1,4 +1,5 @@
 /* File decoding, fallback parity, anti-aliasing and malformed inputs; no checkpoint needed. */
+#include "test_tmpdir.h"
 #include "e2.h"
 #include <assert.h>
 #include <math.h>
@@ -198,7 +199,8 @@ static void containers(float *out) {
         SF_INFO info = {0}; info.samplerate = 16000; info.channels = 1; info.format = formats[c];
         if (!sf_format_check(&info)) { printf("SKIP writing %s: not in this libsndfile\n", names[c]); continue; }
         assert(e2_audio_supported_formats() & flags[c]);
-        char path[] = "/tmp/e2-audio-format-XXXXXX";
+        char path[512];
+        snprintf(path, sizeof path, "%s/e2-audio-format-XXXXXX", e2_test_tmpdir());
         int fd = mkstemp(path); assert(fd >= 0); close(fd);
         SNDFILE *sf = sf_open(path, SFM_WRITE, &info); assert(sf);
         assert(sf_writef_double(sf, samples, 16000) == 16000 && !sf_close(sf));

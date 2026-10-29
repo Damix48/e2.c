@@ -9,8 +9,25 @@
 #include <stdlib.h>
 
 static int g_test_backend;
+#if defined(__aarch64__) /* compiled into the same TU as kernels.c above, so declare these by hand */
+extern void e2_i8_gemm_neon(float *, const int8_t *, const float *, const e2_q8w *, int, int, int, int);
+extern void e2_quantize_blocks_neon(int8_t *, float *, const float *, int, int, float, float);
+static int has_neon_dotprod(void) { return cpu_has_neon_dotprod(); }
+#else
+static int has_neon_dotprod(void) { return 0; }
+#endif
 void e2_cpu_init(void) {
     e2_cpu_init_auto();
+    /* Keep dispatch.c's idea of the backend in step with the pointers faked below: text.c now asks
+     * the table rather than testing e2_i8_quantize, so a stale id would pick int8 with no quantizer. */
+    switch (g_test_backend) {
+    case 0: e2_dispatch_set_cpu_backend(E2_BK_CPU_SCALAR); break;
+    case 1: e2_dispatch_set_cpu_backend(E2_BK_CPU_AVX2); break;
+    case 2: e2_dispatch_set_cpu_backend(E2_BK_CPU_VNNI); break;
+    case 3: e2_dispatch_set_cpu_backend(E2_BK_CPU_AVX512); break;
+    case 4: e2_dispatch_set_cpu_backend(E2_BK_CPU_NEON); break;
+    default: break;
+    }
     if (g_test_backend == 0) {
         g_active = &g_scalar;
         e2_sgemm_nn_range = e2_sgemm_nn_range_scalar;
@@ -24,15 +41,27 @@ void e2_cpu_init(void) {
         e2_i8_attn_gemm = g_test_backend == 1 ? NULL : e2_i8_attn_gemm_vnni;
         e2_softmax_quant_i8 = e2_softmax_quant_i8_avx2;
 #endif
+#if defined(__aarch64__)
+    } else if (g_test_backend == 4) {
+        e2_i8_gemm = e2_i8_gemm_neon;
+        e2_i8_quantize = e2_quantize_blocks_neon;
+#endif
     }
 }
 int main(int argc, char **argv) {
     assert(argc == 3);
     unsetenv("E2_Q8_READ"); unsetenv("E2_Q8_WRITE"); unsetenv("E2_INT8");
-    const char *names[] = {"scalar bf16", "AVX2 int8", "AVX-VNNI int8", "AVX512-VNNI int8"};
-    for (int backend = 0; backend < 4; backend++) {
+    /* this test compares backend outputs, so no ambient precision override may leak in */
+    unsetenv("E2_ATTN_TEXT"); unsetenv("E2_ATTN_IMAGE");
+    unsetenv("E2_ATTN_I8"); unsetenv("E2_VATTN_OFF");
+    const char *names[] = {"scalar bf16", "AVX2 int8", "AVX-VNNI int8", "AVX512-VNNI int8", "NEON int8"};
+    const int nbackends = 5;
+    for (int backend = 0; backend < nbackends; backend++) {
         if ((backend == 1 && !cpu_has_avx2()) || (backend == 2 && !cpu_has_avxvnni()) ||
-            (backend == 3 && !cpu_has_avx512vnni())) { printf("unsupported: %s\n", names[backend]); continue; }
+            (backend == 3 && !cpu_has_avx512vnni()) || (backend == 4 && !has_neon_dotprod())) {
+            printf("unsupported: %s\n", names[backend]);
+            continue;
+        }
         g_test_backend = backend;
         e2_model *m = e2_load(argv[1]); assert(m);
         const char *fixtures[] = {"text_query", "text_doc"};

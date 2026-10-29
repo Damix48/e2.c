@@ -7,8 +7,8 @@
  *  - Attention runs on the dot4 datapath (see e2k_attn_scores8 in kernels.hip): Q/K/V quantized
  *    once after norm+RoPE, scores and context through v_dot4, P quantized per 128-key block by the
  *    softmax. The fp32 scalar and fused-blocked kernels stay behind E2_HIP_ATTN=old|lds as the
- *    A/B references. Short shapes (seq_len < E2_HIP_ATTN_I8_MIN) stay on the fused fp32 kernel:
- *    the pack + softmax launches do not pay for themselves there.
+ *    A/B references. Short shapes (below the HIP text threshold in dispatch.c) stay on the fused
+ *    fp32 kernel: the pack + softmax launches do not pay for themselves there.
  *  - The `valid` mask is only used where it is meaningful (the embedding gather, the attention
  *    keys, the mean pool). The norm/quantize rows always run: a padded row's norm is harmless and
  *    running it keeps the kernel's row index equal to the tensor's row index.
@@ -409,7 +409,7 @@ int e2h_launch_all(e2_hip *g, int rows, int seq_len, int from_embeds) {
             const int nb = D / 128;
             /* the int8 dot4 path: Q/K/V quantized once, scores and context through v_dot4.
              * Shapes that outgrow the pack regions (only possible with a lowered
-             * E2_HIP_ATTN_I8_MIN) fall back to the fp32 kernel. */
+             * E2_HIP_ATTN_I8_MIN, which overrides the dispatch table) fall back to fp32. */
             if (g->attn_i8 && S >= g->attn_i8_min &&
                 (size_t)nseq * KV * sup * D <= g->reg[HA_KPK].bytes) {
                 int8_t *qq = (int8_t *)((char *)g->acts + g->reg[HA_QQ].off);

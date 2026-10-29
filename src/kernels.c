@@ -1,8 +1,11 @@
 /* kernels.c — scalar reference backend + backend dispatch. */
+#include "dispatch.h"
 #include "int8.h"
 #include "kernels.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------- shared helpers */
@@ -230,12 +233,23 @@ extern void e2_quantize_blocks_vnni(int8_t *, float *, const float *, int, int, 
 extern void e2_quantize_blocks_avx2(int8_t *, float *, const float *, int, int, float, float);
 extern void e2_quantize_blocks_avx512(int8_t *, float *, const float *, int, int, float, float);
 void e2_i8_gemm_scalar(float *, const int8_t *, const float *, const e2_q8w *, int, int, int, int);
+#if defined(__aarch64__)
+extern void e2_i8_gemm_neon(float *, const int8_t *, const float *, const e2_q8w *, int, int, int, int);
+extern void e2_quantize_blocks_neon(int8_t *, float *, const float *, int, int, float, float);
+extern void e2_i8_attn_gemm_neon(float *, int, const uint8_t *, int, const float *, const uint8_t *,
+                                 const float *, const int32_t *, int, int, int, int);
+extern void e2_softmax_quant_i8_neon(float *, int8_t *, float *, int, int, int);
+#endif
 
 e2_i8_gemm_fn e2_i8_gemm = NULL;
 void (*e2_sgemm_nn_range)(float *, int, const float *, int, const float *, int, int, int, int, int, int) =
     e2_sgemm_nn_range_scalar;
 extern void e2_sgemm_nn_range_avx2(float *, int, const float *, int, const float *, int, int, int, int, int, int);
 extern void e2_sgemm_nn_range_avx512(float *, int, const float *, int, const float *, int, int, int, int, int, int);
+#if defined(__aarch64__)
+extern void e2_sgemm_nn_range_neon(float *, int, const float *, int, const float *, int, int, int, int,
+                                   int, int);
+#endif
 void (*e2_i8_quantize)(int8_t *, float *, const float *, int, int, float, float) = NULL;
 e2_i8_attn_fn e2_i8_attn_gemm = NULL;
 e2_sq_fn e2_softmax_quant_i8 = NULL;
@@ -282,53 +296,200 @@ static int cpu_has_avx2(void) {
 #endif
 }
 #else
-static int cpu_has_avxvnni(void) { return 0; }
-static int cpu_has_avx512vnni(void) { return 0; }
-static int cpu_has_avx512(void) { return 0; }
-static int cpu_has_avx2(void) { return 0; }
+/* Not x86: the probes are only referenced by the x86 rows of the registry and by the tests, so they
+ * are inline stubs rather than static functions - an unused static function is a -Wall warning, and
+ * on aarch64 the library uses none of them. */
+static inline int cpu_has_avxvnni(void) { return 0; }
+static inline int cpu_has_avx512vnni(void) { return 0; }
+static inline int cpu_has_avx512(void) { return 0; }
+static inline int cpu_has_avx2(void) { return 0; }
 #endif
 
-void e2_cpu_init(void) {
-    /* int8 kernels are picked independently of the fp32 ones: the 512-bit path wants AVX512-VNNI,
-     * the 256-bit one either AVX-VNNI or (EVEX) AVX512-VNNI, and AVX2 is the last SIMD fallback. */
-    if (cpu_has_avx512vnni()) {
-        e2_i8_gemm = e2_i8_gemm_avx512;
-        e2_i8_quantize = e2_quantize_blocks_avx512;
-        e2_i8_attn_gemm = e2_i8_attn_gemm_avx512;
-        e2_softmax_quant_i8 = e2_softmax_quant_i8_avx512;
-    } else if (cpu_has_avxvnni()) {
-        e2_i8_gemm = e2_i8_gemm_vnni_range;
-        e2_i8_quantize = e2_quantize_blocks_vnni;
-        e2_i8_attn_gemm = e2_i8_attn_gemm_vnni;
-        e2_softmax_quant_i8 = e2_softmax_quant_i8_avx2;
-    } else if (cpu_has_avx2()) {
-        e2_i8_gemm = e2_i8_gemm_avx2;
-        e2_i8_quantize = e2_quantize_blocks_avx2;
-        e2_softmax_quant_i8 = e2_softmax_quant_i8_avx2; /* no maddubs attention kernel yet */
-    } else {
-        e2_i8_gemm = e2_i8_gemm_scalar;
-        e2_i8_quantize = NULL; /* scalar model path is unused; text.c falls back to bf16 GEMMs */
-    }
-    if (cpu_has_avx512()) {
-        const e2_kernels *k = e2_avx512_kernels();
-        if (k) {
-            e2_sgemm_nn_range = e2_sgemm_nn_range_avx512;
-            g_active = k;
-            g_cpu_name = k->name;
-            return;
-        }
-    }
-    if (cpu_has_avx2()) {
-        const e2_kernels *k = e2_avx2_kernels();
-        if (k) {
-            e2_sgemm_nn_range = e2_sgemm_nn_range_avx2;
-            g_active = k;
-            g_cpu_name = k->name;
-            return;
-        }
-    }
+/* aarch64: the int8 kernels need the ARMv8.2 dot-product extension (vdotq_u32), which is what
+ * Neoverse-N1 and everything newer have. Without it nothing here is ever called. */
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1UL << 20)
+#endif
+static int cpu_has_neon_dotprod(void) { return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0; }
+#endif
+
+/* ---------------------------------------------------------------- backend registry
+ *
+ * One row per backend, in preference order, for each of the two ladders. They are separate because a
+ * CPU can have AVX-512 without VNNI: it then runs the AVX-512 fp32 kernels and the AVX2 int8 ones.
+ * A row is {probe, install, capability id}; the first probe that succeeds installs and stops the
+ * walk, and the last row has no probe so the walk always terminates. Adding a backend is a row plus
+ * a fill function, not another else-if.
+ */
+typedef struct {
+    const char *name; /* E2_CPU_BACKEND value and e2_cpu_backend_name() */
+    int tier;         /* scalar 0 < avx2 1 < vnni 2 < avx512 3; neon 1 on its own architecture */
+    int (*probe)(void); /* NULL = unconditional */
+    void (*install)(void);
+    e2_backend bk; /* the capability id dispatch.c keys its rules on */
+} e2_i8_backend_def;
+
+typedef struct {
+    const char *name;
+    int tier; /* same scale, without vnni: there is no VNNI fp32 backend */
+    int (*probe)(void);
+    int (*install)(void); /* 0 = this row declined, keep walking */
+} e2_f32_backend_def;
+
+#if defined(__x86_64__) || defined(_M_X64)
+static void install_i8_avx512vnni(void) {
+    e2_i8_gemm = e2_i8_gemm_avx512;
+    e2_i8_quantize = e2_quantize_blocks_avx512;
+    e2_i8_attn_gemm = e2_i8_attn_gemm_avx512;
+    e2_softmax_quant_i8 = e2_softmax_quant_i8_avx512;
+}
+static void install_i8_vnni(void) {
+    e2_i8_gemm = e2_i8_gemm_vnni_range;
+    e2_i8_quantize = e2_quantize_blocks_vnni;
+    e2_i8_attn_gemm = e2_i8_attn_gemm_vnni;
+    e2_softmax_quant_i8 = e2_softmax_quant_i8_avx2;
+}
+static void install_i8_avx2(void) {
+    e2_i8_gemm = e2_i8_gemm_avx2;
+    e2_i8_quantize = e2_quantize_blocks_avx2;
+    e2_softmax_quant_i8 = e2_softmax_quant_i8_avx2; /* no maddubs attention kernel */
+}
+static int install_f32_avx512(void) {
+    const e2_kernels *k = e2_avx512_kernels();
+    if (!k) return 0;
+    e2_sgemm_nn_range = e2_sgemm_nn_range_avx512;
+    g_active = k;
+    g_cpu_name = k->name;
+    return 1;
+}
+static int install_f32_avx2(void) {
+    const e2_kernels *k = e2_avx2_kernels();
+    if (!k) return 0;
+    e2_sgemm_nn_range = e2_sgemm_nn_range_avx2;
+    g_active = k;
+    g_cpu_name = k->name;
+    return 1;
+}
+#endif
+
+#if defined(__aarch64__)
+static void install_i8_neon(void) {
+    e2_i8_gemm = e2_i8_gemm_neon;
+    e2_i8_quantize = e2_quantize_blocks_neon;
+    e2_i8_attn_gemm = e2_i8_attn_gemm_neon;
+    e2_softmax_quant_i8 = e2_softmax_quant_i8_neon;
+}
+static int install_f32_neon(void) {
+    e2_sgemm_nn_range = e2_sgemm_nn_range_neon;
+    /* ASIMD is baseline, but there is no NEON elementwise vtable, so g_active stays scalar while the
+     * products and the quantizer run on NEON. The name says what actually runs - it used to report
+     * "scalar" here, which is what HARDWARE.md's machine-identification line then printed. */
+    g_cpu_name = "neon";
+    return 1;
+}
+#endif
+
+static void install_i8_scalar(void) {
+    e2_i8_gemm = e2_i8_gemm_scalar;
+    e2_i8_quantize = NULL; /* the scalar model path is unused; text.c falls back to bf16 GEMMs */
+}
+static int install_f32_scalar(void) {
+    e2_sgemm_nn_range = e2_sgemm_nn_range_scalar;
     g_active = &g_scalar;
     g_cpu_name = "scalar";
+    return 1;
+}
+
+static const e2_i8_backend_def k_i8_backends[] = {
+#if defined(__x86_64__) || defined(_M_X64)
+    { "avx512", 3, cpu_has_avx512vnni, install_i8_avx512vnni, E2_BK_CPU_AVX512 },
+    { "vnni", 2, cpu_has_avxvnni, install_i8_vnni, E2_BK_CPU_VNNI },
+    { "avx2", 1, cpu_has_avx2, install_i8_avx2, E2_BK_CPU_AVX2 },
+#endif
+#if defined(__aarch64__)
+    { "neon", 1, cpu_has_neon_dotprod, install_i8_neon, E2_BK_CPU_NEON },
+#endif
+    { "scalar", 0, NULL, install_i8_scalar, E2_BK_CPU_SCALAR },
+};
+
+static const e2_f32_backend_def k_f32_backends[] = {
+#if defined(__x86_64__) || defined(_M_X64)
+    { "avx512", 3, cpu_has_avx512, install_f32_avx512 },
+    { "avx2", 1, cpu_has_avx2, install_f32_avx2 },
+#endif
+#if defined(__aarch64__)
+    { "neon", 1, NULL, install_f32_neon }, /* no probe: ASIMD is in the baseline */
+#endif
+    { "scalar", 0, NULL, install_f32_scalar },
+};
+
+static const int k_i8_count = (int)(sizeof k_i8_backends / sizeof k_i8_backends[0]);
+static const int k_f32_count = (int)(sizeof k_f32_backends / sizeof k_f32_backends[0]);
+
+/* Install a named backend and make the fp32 vtable follow the same tier, so a forced "avx2" behaves
+ * like an AVX2-only machine rather than an AVX-512 machine with slow int8. Only a tier this CPU can
+ * execute is accepted: the switch may downgrade, never invent an ISA (that is an illegal instruction,
+ * not a slow run). */
+static int apply_backend(const char *name) {
+    const e2_i8_backend_def *row = NULL;
+    for (int i = 0; i < k_i8_count; i++)
+        if (strcmp(k_i8_backends[i].name, name) == 0) row = &k_i8_backends[i];
+    if (!row) {
+        fprintf(stderr, "e2: E2_CPU_BACKEND=%s is not a known backend\n", name);
+        return -1;
+    }
+    if (row->probe && !row->probe()) {
+        fprintf(stderr, "e2: E2_CPU_BACKEND=%s is not supported by this CPU\n", name);
+        return -1;
+    }
+    row->install();
+    e2_dispatch_set_cpu_backend(row->bk);
+    for (int i = 0; i < k_f32_count; i++) {
+        if (k_f32_backends[i].tier > row->tier) continue;
+        if (k_f32_backends[i].probe && !k_f32_backends[i].probe()) continue;
+        if (k_f32_backends[i].install()) break;
+    }
+    return 0;
+}
+
+int e2_cpu_backend_count(void) { return k_i8_count; }
+
+const char *e2_cpu_backend_name(int i) {
+    if (i < 0 || i >= k_i8_count) return NULL;
+    if (k_i8_backends[i].probe && !k_i8_backends[i].probe()) return NULL; /* this host cannot run it */
+    return k_i8_backends[i].name;
+}
+
+static void reset_i8_pointers(void) {
+    e2_i8_gemm = NULL;
+    e2_i8_quantize = NULL;
+    e2_i8_attn_gemm = NULL;
+    e2_softmax_quant_i8 = NULL;
+}
+
+void e2_cpu_init(void) {
+    /* The attention overrides are environment, not CPU: read them once here so no tower reads getenv
+     * per layer (DISPATCH.md phase 3). e2_attn_override() flips them afterwards for an A/B or a test. */
+    e2_attn_env_reload();
+
+    reset_i8_pointers(); /* e2_cpu_init is idempotent: a second call re-selects from a blank slate */
+    for (int i = 0; i < k_i8_count; i++) {
+        if (k_i8_backends[i].probe && !k_i8_backends[i].probe()) continue;
+        k_i8_backends[i].install();
+        e2_dispatch_set_cpu_backend(k_i8_backends[i].bk);
+        break;
+    }
+    for (int i = 0; i < k_f32_count; i++) {
+        if (k_f32_backends[i].probe && !k_f32_backends[i].probe()) continue;
+        if (k_f32_backends[i].install()) break;
+    }
+
+    /* E2_CPU_BACKEND downgrades the selection for an A/B; an unknown or unsupported name is reported
+     * and ignored, leaving the best backend in place. */
+    const char *forced = getenv("E2_CPU_BACKEND");
+    if (forced && forced[0]) (void)apply_backend(forced);
 }
 
 const e2_kernels *e2_k(void) { return g_active; }

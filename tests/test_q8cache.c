@@ -1,6 +1,7 @@
 /* test_q8cache.c — the packed int8 cache round-trips and refuses a corrupt or incompatible file
  * before anything dereferences it. Self-contained: it writes its own small cache into a temp dir, so
  * it needs no model, no fixtures and no arguments. Usage: e2_test_q8cache */
+#include "test_tmpdir.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,9 +180,10 @@ static void patch(uint8_t *b, size_t size, int which) {
 }
 
 int main(void) {
-    char dir[] = "/tmp/e2q8cXXXXXX";
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/e2q8cXXXXXX", e2_test_tmpdir());
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
-    char valid[512], bad[512];
+    char valid[544], bad[544]; /* dir is 512: leave room for the appended name */
     snprintf(valid, sizeof valid, "%s/valid.e8cq", dir);
     snprintf(bad, sizeof bad, "%s/bad.e8cq", dir);
 

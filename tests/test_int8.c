@@ -16,9 +16,14 @@ void e2_i8_gemm_scalar(float *, const int8_t *, const float *, const e2_q8w *, i
 void e2_i8_gemm_vnni(float *, const int8_t *, const float *, const e2_q8w *, int, int, int, int);
 void e2_i8_gemm_avx2(float *, const int8_t *, const float *, const e2_q8w *, int, int, int, int);
 void e2_i8_gemm_avx512(float *, const int8_t *, const float *, const e2_q8w *, int, int, int, int);
+#if defined(__aarch64__)
+void e2_i8_gemm_neon(float *, const int8_t *, const float *, const e2_q8w *, int, int, int, int);
+#endif
 
+/* Only the x86 kernels cross-check against themselves; off x86 the dispatcher never picks them. */
+#if defined(__x86_64__) || defined(_M_X64)
 static int has_avx512vnni(void) {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
            __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq") &&
@@ -29,13 +34,14 @@ static int has_avx512vnni(void) {
 }
 
 static int has_avxvnni(void) {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
     return __builtin_cpu_supports("avxvnni");
 #else
     return 0;
 #endif
 }
+#endif
 
 static double cos_vs(const float *y, const float *x, const float *w, int M, int N, int K) {
     double dot = 0, na = 0, nb = 0;
@@ -138,6 +144,18 @@ static int check(int M, int N, int K, int outliers) {
 #else
     printf("SIMD int8 kernels skipped (x86-only)\n    ");
 #endif
+#if defined(__aarch64__)
+    /* Same check for the NEON kernel: the dispatcher already ran it above, but only for the shape
+     * the model happens to use, and a layout bug in a tail would stay invisible that way. */
+    {
+        float *yn = malloc(sizeof(float) * (size_t)M * N);
+        e2_i8_gemm_neon(yn, qa, ascales, &qw, M, N, 0, N);
+        const double cn = cos_vs(yn, x, w, M, N, K);
+        printf("neon cos=%.6f\n    ", cn);
+        if (!(cn > 0.9995)) kernel_bad = 1;
+        free(yn);
+    }
+#endif
     e2_i8_gemm(y, qa, ascales, &qw, M, N, 0, N);
 
     for (int m = 0; m < M; m++)
@@ -202,6 +220,56 @@ static int check_attention_tail(int K) {
     return bad;
 }
 
+/* The fused softmax+probability quantizer against its own pieces run separately. This kernel had no
+ * test on any backend, so it is checked against the reference path the callers fall back to when it
+ * is NULL: K->softmax per row, then e2_i8_quantize. The two agree analytically (both scale the block
+ * maximum by 127 and fold 1/sum into the block scale), so the only tolerated difference is the
+ * fast polynomial exp moving a value across a rounding boundary. */
+static int check_softmax_quant(int rows, int n) {
+    if (!e2_softmax_quant_i8) return 0;
+    const int nb = (n + E2_I8_BLOCK - 1) / E2_I8_BLOCK;
+    const size_t nf = (size_t)rows * n;
+    float *x = malloc(sizeof(float) * nf), *ref = malloc(sizeof(float) * nf);
+    int8_t *q8 = malloc(nf), *r8 = malloc(nf);
+    float *sc = malloc(sizeof(float) * (size_t)rows * nb);
+    float *rsc = malloc(sizeof(float) * (size_t)rows * nb);
+    if (!x || !ref || !q8 || !r8 || !sc || !rsc) exit(2);
+    for (size_t i = 0; i < nf; i++) x[i] = sinf((float)i * .013f) * 6.0f;
+    memcpy(ref, x, sizeof(float) * nf);
+    e2_softmax_quant_i8(x, q8, sc, rows, n, nb);
+    for (int r = 0; r < rows; r++) e2_k()->softmax(ref + (size_t)r * n, n);
+    e2_i8_quantize(r8, rsc, ref, rows, n, -INFINITY, INFINITY);
+
+    double maxp = 0, maxs = 0;
+    int maxbyte = 0, bad = 0;
+    for (int r = 0; r < rows; r++) {
+        /* x holds the unnormalised exponentials (the 1/sum is folded into the block scales), so
+         * compare the probabilities it implies, not the raw rows */
+        double sum = 0;
+        for (int i = 0; i < n; i++) sum += x[(size_t)r * n + i];
+        for (int i = 0; i < n; i++) {
+            const double d = fabs(x[(size_t)r * n + i] / sum - (double)ref[(size_t)r * n + i]);
+            if (d > maxp) maxp = d;
+        }
+    }
+    for (size_t i = 0; i < nf; i++) {
+        const int db = abs((int)(uint8_t)q8[i] - (int)(uint8_t)r8[i]);
+        if (db > maxbyte) maxbyte = db;
+        if (!isfinite(x[i]) || db > 1) bad = 1;
+    }
+    for (size_t i = 0; i < (size_t)rows * nb; i++) {
+        const double d = fabs((double)sc[i] - (double)rsc[i]);
+        if (d > maxs) maxs = d;
+    }
+    /* probabilities are ~1/n, so compare the scales relatively */
+    if (!(maxs <= 1e-6 * (1.0 / n) + 1e-12)) bad = 1;
+    if (!(maxp <= 2e-6)) bad = 1; /* the polynomial exp, not libm's, is the only difference */
+    printf("softmax+quant rows=%-3d n=%-5d max|dP|=%.3e max|dscale|=%.3e max byte off=%d: %s\n",
+           rows, n, maxp, maxs, maxbyte, bad ? "FAIL" : "OK");
+    free(x); free(ref); free(q8); free(r8); free(sc); free(rsc);
+    return bad;
+}
+
 int main(void) {
     e2_cpu_init();
     printf("backend: %s, int8: %s\n", e2_cpu_name(), e2_i8_quantize ? "yes" : "no");
@@ -215,6 +283,10 @@ int main(void) {
     fails += !check(7, 33, 512, 3); /* odd M, odd N */
     const int tails[] = {1,3,9,129};
     for (int i = 0; i < 4; i++) fails += check_attention_tail(tails[i]);
+    {   /* fused softmax+quantizer: one block, exactly a block, several, and a patch-sized row */
+        const int ns[] = { 32, 128, 200, 1300, 2520 };
+        for (int i = 0; i < 5; i++) fails += check_softmax_quant(i ? 4 : 9, ns[i]);
+    }
     printf("%s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }

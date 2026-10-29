@@ -73,6 +73,161 @@ guess. Format: one block per reference machine, dated, with the command that pro
 | text+audio (30 s)     |       -   |       |
 ```
 
+### 2026-10-28 / Oracle Cloud Ampere A1 (Neoverse-N1), 2 vCPU, 11 GB, aarch64, scalar backend
+
+No baseline existed for a non-x86 host; this is the first one. Release, GCC 15.2.0, no GPU backend.
+Only the **scalar** backend exists here: `CMakeLists.txt` compiles the AVX2/VNNI/AVX-512 translation
+units for x86-64 only, and `e2_cpu_init()` leaves `e2_i8_quantize == NULL`, so `text.c` runs the bf16
+GEMM fallback — **no int8 path at all on aarch64**, even though Neoverse-N1 has `asimddp`. The
+built-in probe reports **11.8 scalar GFLOPS**.
+
+```
+E2_THREADS=2 ./build/e2_text_bench models/embeddinggemma-2 tests/fixtures cpu 15 1 5
+E2_THREADS=2 ./build/e2_text_bench models/embeddinggemma-2 tests/fixtures cpu 196 1 3
+E2_THREADS=2 ./build/e2_test models/embeddinggemma-2 tests/fixtures
+```
+
+| workload | best ms | median ms | notes |
+| :-- | --: | --: | :-- |
+| 15-token query | 373.141 | 373.632 | best of 5 |
+| 196-token document | 5650.346 | 5710.530 | best of 3 |
+| 2 x 15-token queries | 811.871 | 815.562 | best of 3, batch 2 |
+| 2 x 128-token documents | 7439.877 | 7441.639 | best of 3, batch 2 |
+
+Fidelity is bit-identical to the x86 reference on both fixtures (`cos=1.000000`, `max|Δ|=0.00000`), so
+the scalar backend is numerically the reference it claims to be — it is just 81x / 444x slower than
+the Intel laptop's int8 + iGPU numbers above (4.613 ms and 12.734 ms), which is what losing both int8
+and SIMD costs. Thread scaling is poor: 1 -> 2 threads moves the 128-token pair only 8740.562 -> 7439.877 ms
+(1.17x) and the 15-token pair 842.290 -> 811.871 ms (1.04x), i.e. the scalar path is memory-bound
+well before it is core-bound.
+
+`E2_PROFILE=1` on the 196-token document puts ~91-96 % of the profiled region time in `attention`
+(the fused q/k/v/o + score region) and <5 % in `norm`/`gelu`/`elem`/`rope`. Load time is 0.03 s and
+the workspace is 230.2 MB.
+
+These are the **bf16** numbers: aarch64 had no int8 path and no NEON backend when this block was
+written. The table stays as the baseline the next two attempts are measured against. Attempt 20 adds
+a NEON dot-product int8 GEMM (**30.4 ms** / **1281.7 ms**, 12.3x / 4.4x), Attempt 21 adds a NEON
+fp32 GEMM for the attention products (**30.4 ms** / **441.7 ms**, 12.3x / 12.8x) and Attempt 22 moves
+text attention itself to int8 (**30.4 ms** / **396.9 ms**, 12.3x / 14.2x).
+
+### 2026-10-29 / AMD Ryzen 7 9700X (Zen 5), 8 threads, int8
+
+x86-64 with **full-width AVX-512** (`avx512f/bw/vl/dq/vnni/bf16/vbmi/...`), GCC 14.2.0, Zen 5 desktop,
+54 GB. The pool reports 8 threads on 16 hardware threads on purpose - `e2_nthreads()` drops SMT
+siblings, and its comment records that a second logical thread per core measured 1.7x slower here.
+Weights come from the packed cache (`E2_Q8_READ`, 0.01 s load); the AVX2-only laptop numbers further
+up therefore also ran the same int8 weights, so the gap below is the CPU alone.
+
+```
+E2_Q8_READ=$PWD/models/e2/e2-embeddinggemma-2-int8-text.e8cq E2_REPS=7 ./build/e2_test models/e2 tests/fixtures
+E2_Q8_READ=$PWD/models/e2/e2-embeddinggemma-2-int8-text-image.e8cq ./build/e2_test_image models/e2 tests/fixtures
+```
+
+| workload | best ms | notes |
+| :-- | --: | :-- |
+| 15-token query | **3.951** | best of 7, cos 0.999751 (3.91 on a rerun) |
+| 196-token document | **24.918** | best of 7, cos 0.999594 (25.96 on a rerun) |
+| image, 2520 patches | **542.830** | best of 3, cos 0.999795 (569.74 on a rerun) |
+| image + caption (274 ids) | 542.120 | cos 0.999665 (582.55 on a rerun) |
+
+Rerun spread is 2-5 % on this host, larger on the image than on text; treat these as best-case
+latencies, consistent with how the other machines in this file are recorded.
+
+Cross-machine, same packed int8 weights, best of N, load excluded:
+
+| workload | Ampere A1 (2 vCPU, NEON) | Core Ultra 9 285H (AVX2+VNNI) | Ryzen 7 9700X (AVX-512) |
+| :-- | --: | --: | --: |
+| 15-token query | 30.4 ms | 6.19 ms | **3.95 ms** |
+| 196-token document | 380.5 ms | 41.41 ms | **24.92 ms** |
+| image, 2520 patches | 8496 ms | 708 ms | **543 ms** |
+
+The laptop comparison is 6 pinned threads against 8 here, so part of the 1.6x is thread count; the
+instruction set is the other part (AVX-512-VNNI at 512 bits against AVX-VNNI at 256).
+
+`E2_PROFILE=1` on the image puts attention at 250.2 ms (38 %), **elem at 144.4 ms (22 %)**, mlp 118.3
+(18 %), qkv+o 72.1 (11 %), attn_pack 46.1 (7 %). The `elem` share roughly doubles against the Ampere
+numbers purely because everything else got faster: those ops are the memory-bound elementwise vtable,
+and Attempt 23 already established that GCC vectorizes them, so they become the second-largest item on
+a fast machine without being a bug. GEMM regions run at 6.61x parallelism on 8 threads.
+
+The text attention crossover was re-measured here because the fp32 GEMM underneath is much stronger
+than on the other two machines. With best of 9 and two rounds: 196 keys fp32 27.61/26.95 vs int8
+27.14/26.50 (int8 ~2 % ahead), 256 keys break-even, 384 keys fp32 58.01/56.60 vs int8 51.07/52.01
+(+10-12 %). The single-run `reps=7` pass first read 196 keys as 5 % *slower* for int8; that was noise,
+which is the same lesson as the earlier x86 correction two attempts up. `E2_ATT_I8_MIN` = 128 is
+therefore correct on this machine and needs no per-CPU tuning.
+
+`avx512_fp16` is **not** in this CPU's flags, so even here there is no fp16 arithmetic to exploit and
+the fp16-attention idea from the ARM discussion stays untestable on any machine in this set.
+
+**14/14 CTests pass** (no GPU backend: Level Zero and HIP are both absent on this host).
+
+### 2026-10-29 / Intel N100 (Alder Lake-N, 4x Gracemont), 4 threads, int8
+
+Debian, GCC, 4 GB RAM, a fanless 6 W mini-PC on a Proxmox host. `avx2 + avx_vnni + f16c`, **no
+AVX-512**, so this takes the same 256-bit VNNI path as the Core Ultra 9 285H. Weights from the packed
+cache (0.02 s load). `e2_nthreads()` reports 4 - four physical cores, no SMT.
+
+| workload | best ms | notes |
+| :-- | --: | :-- |
+| 15-token query | **22.7** | spaced runs, stable to +-1 % |
+| 196-token document | **329.4** | spaced runs, stable to +-1 % |
+| 512-token document | 957 - 2401 | **not reproducible, see below** |
+| image, 2520 patches | not measured | the 600 MB cache was not worth the transfer for this box |
+
+#### This box has to be measured with gaps, and long sequences cannot be measured at all
+
+The first attempt reported 601 then 760 ms for the 196-token document and 22.5 then 63.3 ms for the
+query - swings that look like contention. They are not: the VM shows **zero steal time**, no other
+process, `performance` governor, and an idle temperature of 49 C. The cause is the power limit. Idle
+freq is **3400 MHz**; after about seven seconds of sustained load all four cores sit at **998 MHz**
+with the temperature only rising to 51 C. It is a 6 W part, so it is PL1, not thermals.
+
+Re-running with 20 s between invocations gives 329.4 / 331.8 / 330.8 / 329.6 ms and 22.69 / 22.81 /
+23.00 ms - stable to about 1 %. So only burst-length work is measurable here. A 512-token document is
+~7 s per invocation and came out 957 ms and then 2401 ms for identical work; that number is reported
+as a range because it is not a measurement, and anything longer is worse.
+
+Attention A/B at 196 keys, spaced, three alternations: fp32 356.6 / 358.6 / 358.9 ms against int8
+342.8 / 332.3 / 389.6 ms. int8 is ahead on two of three but the spread exceeds the difference, so this
+machine neither confirms nor contradicts the 128-key threshold; it is not the machine to settle that
+question on.
+
+**13/14 CTests pass.** The `artifacts` test fails only because it drives `tools/check_gpu.sh`, which
+runs `git rev-parse HEAD` under `set -eu` and git is not installed on this host - the same failure
+mode as the arm-server, which had the `.git` directory missing instead.
+
+#### The Intel GPU backend does not build for this box, and the reason is the hardware
+
+It has an iGPU and a full Level Zero stack: `Alder Lake-N [UHD Graphics]`, device id **0x46D1**,
+OpenCL 3.0 NEO, 24 CUs, `intel-level-zero-gpu` 1.3.30872.22 plus `libze_loader`, and `ocloc` present.
+`-DE2_WITH_GPU=ON` configures cleanly and auto-detects the target
+(`SPIR-V for 0x46d1`), but the ocloc step then fails with three errors:
+
+```
+unknown OpenCL extension 'cl_khr_integer_dot_product' - ignoring
+no matching function for call to 'dot'
+implicit declaration of function 'intel_sub_group_i8_u8_matrix_mad_k32' is invalid in OpenCL
+implicit declaration of function 'intel_sub_group_f16_f16_matrix_mad_k16' is invalid in OpenCL
+```
+
+Two independent causes, both Xe-LP:
+
+- **No XMX.** `intel_sub_group_{i8_u8,f16_f16}_matrix_mad_*` are the DPAS matrix instructions, and
+  Gen12/Xe-LP has no matrix units. The `#ifdef cl_intel_subgroup_matrix_multiply_accumulate` guard in
+  `e2.cl` does not save it because ocloc defines that macro for this target while not actually
+  providing the intrinsics.
+- **Whoever compiles for `0x46d1` does not accept `cl_khr_integer_dot_product`**, so `dot()` - the
+  dp4a the int8 GEMM is built on - has no definition. The *device* advertises the extension in
+  clinfo; the ocloc target does not. That mismatch is a toolchain question, but it is moot given the
+  first point.
+
+So the backend stays Arc-class code and was validated only on an Arc 140T (0x7d51). On this box the
+CPU path is the engine, and that is what the numbers above are. Nothing was left behind: the trial
+`build-gpu/` was removed and the CPU build is untouched; `libze-dev` (1.20.6) stayed installed, which
+is the only system change made. `apt purge libze-dev` undoes it.
+
 ### 2026-10-26 / Core Ultra 9 285H, Arc 140T (0x7d51), 14 CPU threads, int8
 
 Baseline is commit `6edaa1c`; candidate is the Intel attention / small-GEMM change below. Release,
@@ -161,7 +316,8 @@ pre-cache-cap comparison. Other Intel devices and OpenVINO audio were not benchm
 
 What is in the tree and stays unless a measurement says otherwise:
 
-- Runtime ISA dispatch: AVX512-VNNI -> AVX-VNNI -> AVX2 -> scalar, with the scalar path as reference.
+- Runtime ISA dispatch: AVX512-VNNI -> AVX-VNNI -> AVX2 -> NEON dot-product -> scalar, with the
+  scalar path as reference.
 - Claim-from-counter worker pool instead of fixed slices, so no region idles at the tail.
 - Blocked, packed-operand attention; no materialised `(S,S)` logits or `(1,S,S)` bias.
 - Fused regions (softmax+quantizer, PLE, q/k/v norm) - single-consumer kernels by contract.
@@ -609,6 +765,562 @@ for four FP16 attention launches instead of one fused FP32 launch. Kept as reque
 adding a new single-token specialization. Before/after executables, hashes, timings and fidelity
 logs are in ignored `benchmark-results/intel-fp16-only/`. Other GPUs and OpenVINO were not measured.
 
+### Attempt 20: aarch64 NEON int8 GEMM and activation quantizer (ACCEPTED)
+
+Until this point aarch64 had **no int8 path**: `CMakeLists.txt` compiled the AVX2/VNNI/AVX-512
+kernel files only for x86-64 and `e2_cpu_init()` left `e2_i8_quantize NULL`, so `use_int8` was false
+and the text tower ran bf16 weights through pure scalar fp32 GEMMs. New `src/kernels_i8_neon.c`
+provides `e2_i8_gemm_neon` and `e2_quantize_blocks_neon` behind an `HWCAP_ASIMDDP` check, wired in by
+one new branch in the `e2_cpu_init()` chain. No format change: same quantization scheme, same
+quad-interleaved weights, same `bsq`, so the packed `*.e8cq` cache is shared with x86 untouched.
+
+`vdotq_s32` (4 int8 products into 4 int32 lanes) is the ARMv8.2 dot product. Two details differ from
+the x86 kernels and are worth knowing:
+
+- **`vdotq_u32` is unsigned x unsigned in ACLE**, not the mixed u8 x i8 form `vpdpbusd` has; that is
+  `vusdotq_s32`, which needs the i8mm extension. So the kernel flips the stored `a+128` back to
+  signed with a scalar `xor 0x80808080` folded into the broadcast, uses `vdotq_s32`, and therefore
+  **never reads `bsq`** - the accumulator already is the true `sum_k a_i8*b_i8`, so the 128*sum trick
+  the VNNI/AVX2 kernels need disappears instead of costing an extra `vshlq`/`vsubq` per block.
+- **MR is 4, not 8.** Each token holds two int32 and two float accumulators (one per 4-row half of
+  the 32-byte weight vector), i.e. 4 of the 32 NEON registers; 8 tokens want all 32 before the weight
+  and scale vectors get one. Measured below: 6 and 8 are a tie on the query and 1.7 % **slower** on
+  the document, 2 is 17 % slower on the query.
+
+Ampere A1 / Neoverse-N1, 2 vCPU, release GCC 15.2, `E2_THREADS=2`, load excluded, best of 5 (query)
+and best of 3 (document) unless noted. The before column is the bf16 scalar path from the reference
+block above, same session.
+
+| workload | bf16 scalar, ms | NEON int8, ms | speedup |
+| :-- | --: | --: | --: |
+| 15-token query | 373.141 | 30.431 | **12.3x** |
+| 196-token document | 5650.346 | 1281.653 | **4.4x** |
+
+Fidelity stays inside the bar the engine holds itself to: end-to-end cosine **0.999776** (query) and
+**0.999670** (document) against the frozen fixtures, `PASS` in `e2_test`. `e2_test_int8` cross-checks
+the NEON kernel against the float reference on six shapes and it matches `e2_i8_gemm_scalar` to six
+decimals in every one (`neon cos` == `scalar-gemm cos` in the log). The packed-cache load path is
+unchanged but cold load grows 0.03 s -> 0.88 s because the weights now actually get quantized.
+
+MR sweep, three alternating rounds, same session, best of 7 (query) / 3 (document):
+
+| MR | query, ms | document, ms |
+| --: | --: | --: |
+| 2 | 36.069 | 1337.332 |
+| **4** | **30.431** | **1281.653** |
+| 6 | 32.656 | 1298.482 |
+| 8 | 30.471 | 1300.551 |
+
+`E2_PROFILE=1` shows where the remaining time is, and it is no longer the GEMM:
+
+| region | 15-token query | 196-token document |
+| :-- | --: | --: |
+| gemm | 27.37 ms (84 %) | 292.8 ms (22 %) |
+| quantize | 2.55 ms (8 %) | 28.6 ms (2 %) |
+| attention | 1.48 ms (5 %) | 983.3 ms (75 %) |
+
+The document case is now dominated by the **fp32 scalar attention**, because `e2_i8_attn_gemm` and
+`e2_softmax_quant_i8` are still NULL on ARM - the fused packed-operand attention kernel has no NEON
+version yet, so both towers keep their fp32 attention. That is the next win here and it is a much
+larger piece of work than this one; the GEMM side has little left (the probe reports 11.9 GFLOPS and
+the GEMM region already claims work at 1.9x on 2 threads, i.e. it is memory-bound).
+
+**14/14 CTests pass on aarch64** (`int8` no longer skips: it now has a quantizer to test) and
+**21/21 on x86-64**, so no x86 regression. `e2_test_cpu_backends` grew a NEON case and reports
+cosine **0.999785** (query) / **0.999680** (document) through the whole tower on that backend.
+
+### Attempt 21: aarch64 NEON fp32 GEMM for the attention products (ACCEPTED)
+
+Attempt 20 left the 196-token document 75 % fp32 scalar attention, because both attention products -
+logits `Q K^T` and context `P V` - go through `e2_sgemm_nn_range`, which on aarch64 was
+`e2_sgemm_nn_range_scalar`: a naive i-j-k triple loop with a strided B read, i.e. the worst possible
+access pattern for the one product the tower spends most of its time in.
+
+New `src/kernels_neon.c` provides `e2_sgemm_nn_range_neon`. NEON is mandatory in the aarch64 baseline,
+so this file needs **no `-march` flag and no CPUID probe** - unlike the AVX2/AVX-512 backends it is
+always available, and `e2_cpu_init()` selects it unconditionally on that architecture. The structure
+is deliberately identical to `kernels_avx2.c`: 64x64x64 blocking with the A and B panels in L1 and an
+8x8 register tile walking them, so the two files can be read against each other. The tile holds 16
+`float32x4` accumulators - twice the AVX2 count for the same tile, because a NEON register is half as
+wide, which the 32-register aarch64 file can afford.
+
+Ampere A1 / Neoverse-N1, 2 vCPU, `E2_THREADS=2`, release GCC 15.2, load excluded, three alternating
+rounds, best of 5 (query) / 3 (document):
+
+| workload | bf16 scalar | NEON int8 GEMM | + NEON fp32 GEMM | total speedup |
+| :-- | --: | --: | --: | --: |
+| 15-token query | 373.141 | 30.431 | **30.367** | **12.3x** |
+| 196-token document | 5650.346 | 1281.653 | **441.696** | **12.8x** |
+
+The query is untouched (it was already 85 % int8 GEMM, with only 4 % attention); the document drops
+**2.9x**. End-to-end cosine against the frozen fixtures moves 0.999670 -> 0.999628 because the k loop
+is now blocked, i.e. the fp32 accumulation order changed; both are far above the 0.999 bar.
+
+#### Rejected: three attempts to cut the int8 kernel's activation-broadcast overhead
+
+The int8 kernel spends, per k-quad, 3 uops (load, `eor 0x80808080`, `dup`) on the activation broadcast
+for only 2 `sdot`. Loading 8 or 16 activation bytes at once and taking the broadcasts out of
+`vdupq_lane` / `vdupq_laneq` should cut that to 1.5 uops per `sdot`. All three variants were **slower**,
+consistently, and are not in the tree:
+
+| variant | query, ms | document, ms |
+| :-- | --: | --: |
+| baseline (original per-quad broadcast) | **30.6** | **444.2** |
+| 4 k-quads hoisted, 8 weight registers | 32.4 | 468.4 |
+| 2 k-quads hoisted, weights in an `int8x16_t[2]` | 33.6 | 498.2 |
+| 2 k-quads hoisted, weights in named scalars | 33.3 | 478.9 |
+
+The cause is visible in the generated code rather than guessed: `objdump` of the accepted kernel shows
+the compiler already emits `ldp q3, q2, [x3], #32` (both weight halves in one post-indexed 32-byte
+load), keeps all 8 int32 accumulators and both float pairs in registers, and folds the activation
+broadcast into the load where it can. The loop is `sdot`-throughput bound, not issue bound, so removing
+uops from it cannot pay - and every hoisting variant spends the registers the accumulator tile needs.
+Note also that the vector arrays spill: version 3 was 4 % slower than version 4 purely because
+version 3 declared the weights as `int8x16_t wl[2]` instead of two named scalars.
+
+#### Re-measured: MR is still 4 now that the document is GEMM-bound
+
+The Attempt 20 MR sweep was taken when the document was 75 % attention, so it could not resolve the
+GEMM's own optimum. Re-run against the GEMM-bound workload (`MR=8` halves the weight traffic, which
+now matters): MR=4 **452.5 ms**, MR=6 452.0 ms, MR=8 461.0 ms on the document, queries 30.6 / 32.2 /
+30.3. MR=4 confirmed; the register-pressure explanation holds.
+
+#### Where the remaining time is
+
+| region | 15-token query | 196-token document |
+| :-- | --: | --: |
+| gemm (int8) | 28.1 ms (83 %) | 292.0 ms (66 %) |
+| attention (now NEON fp32) | 1.4 ms (4 %) | 115.8 ms (26 %) |
+| quantize | 3.1 ms (9 %) | 28.3 ms (6 %) |
+| rest | 1.3 ms | 11.6 ms |
+
+Both towers of the remaining time are close to hardware limits on this part: the int8 GEMM runs the
+whole document's ~25 GMAC in 292 ms wall with the pool at 1.94x on 2 threads, and the attention's
+~2.3 GMAC of fp32 in 116 ms is ~40 GFLOPS against a ~48 GFLOPS fp32 peak. The next real step is the
+int8 packed-operand attention (`e2_i8_attn_gemm` + `e2_softmax_quant_i8`), which would move 26 % of
+the document from fp32 to int8; it is not attempted here.
+
+**14/14 CTests pass on aarch64, 21/21 and 42/42 on x86-64** (no regression; the x86 files are untouched).
+
+### Attempt 22: int8 attention in the text tower (ACCEPTED on aarch64 only)
+
+The text tower's attention was fp32 on **every** architecture - `grep -c e2_i8_attn_gemm src/text.c`
+returned 0, and the comment in `vision.c` claiming the text tower shares that kernel was stale. So
+the int8 attention machinery (`e2_i8_attn_gemm` / `e2_softmax_quant_i8`) served vision only.
+
+Rather than port those packed-operand kernels, this reuses what already exists: **both attention
+products are the NT product `int8.c` implements**. Logits is `Q[rows,D] x K[keys,D]^T`, and context
+is `P[rows,keys] x V^T[D,keys]^T`, so both go through `e2_i8_gemm` with K packed into the ordinary
+`e2_q8w` layout. No attention-specific kernel on either ISA, and no change to the packed-cache
+format. Per layer, per head: `e2_q8w_from_f32_ld` packs K straight out of the strided projection
+output (new; `ld` is its leading dimension), `kt_worker` transposes V row-wise into V^T (it serves V
+unchanged) and `e2_q8w_from_f32` packs that. Per query block: quantize Q rows, GEMM, softmax+mask,
+quantize the probabilities, GEMM. Both packed operands are then freed.
+
+Accuracy is not the cost here. Same machine, same weights, one alternating variable
+(`E2_VATTN_OFF` on x86 vision, which does use the int8 attention kernel):
+
+| workload | int8 attention | fp32 attention | delta |
+| :-- | --: | --: | --: |
+| image, 2520 patches | 0.999799 | 0.999814 | -0.000015 |
+| image + caption | 0.999721 | 0.999698 | **+0.000023** |
+
++/-2e-5, not even consistently negative. End to end on the text document the cosine moves
+0.999624 (fp32) -> 0.999630 (int8) on x86 and 0.999628 -> 0.999606 on aarch64: noise either way, all
+far above the 0.999 bar. `e2_test_text_attention` cross-checks the int8 path against the row-wise
+fp32 oracle at seven lengths (31..2048, both head sizes) and bounds it at 2e-2, against 2e-5 for the
+fp32 path.
+
+#### Where it wins depends entirely on the fp32 GEMM underneath it
+
+`E2_THREADS=2`, batch 1, load excluded, `e2_text_bench`. Ampere A1 / Neoverse-N1:
+
+| keys | fp32, ms | int8, ms | |
+| --: | --: | --: | :-- |
+| 48 | 85.589 | 129.596 | -51% |
+| 64 | 117.345 | 119.410 | -2% |
+| 96 | 177.558 | 175.149 | +1% |
+| 128 | 248.352 | 235.212 | **+5%** |
+| 196 | 438.902 | 380.605 | **+13%** |
+| 512 | 1677.673 | 1090.149 | **+35%** |
+| 1024 | 4710.493 | 2724.714 | **+42%** |
+| 2048 | 12398.677 | 6735.602 | **+46%** |
+
+Core Ultra 9 285H, same method: `E2_THREADS=6`, `taskset -c 0-5`, best of 9, single runs per length.
+
+| keys | fp32, ms | int8, ms | |
+| --: | --: | --: | :-- |
+| 32 | 8.851 | 10.952 | -24% |
+| 48 | 12.769 | 14.172 | -11% |
+| 64 | 15.335 | 16.493 | -7% |
+| 96 | 21.585 | 22.632 | -5% |
+| 128 | 30.893 | 29.800 | **+4%** |
+| 196 | 45.976 | 40.652 | **+12%** |
+| 256 | 61.350 | 53.009 | **+14%** |
+| 384 | 98.766 | 82.874 | **+16%** |
+| 512 | 160.662 | 115.233 | **+28%** |
+| 768 | 293.048 | 233.182 | **+20%** |
+| 1024 | 447.964 | 335.884 | **+25%** |
+| 2048 | 1089.161 | 739.517 | **+34%** |
+
+#### The packer was the crossover, and it was serial
+
+The tables above are the *final* state. Before the pack was parallelised both architectures crossed
+over far higher (aarch64 64-96 keys, x86-64 ~384), and the reason was measurable in isolation with a
+one-thread microbenchmark: `e2_q8w_from_f32` on a 196x256 matrix runs at **1048 M elem/s** and
+`e2_i8_gemm` at 196x196x256 at **213 GMAC/s**. Per layer at 196 keys that is ~462k elements of packing
+(~0.44 ms) against 78.7 MMAC of int8 GEMM (~0.06 ms across 6 threads) - **~90 % packer, ~10 % GEMM** -
+and the pack was a serial `for (h = 0; h < H; h++)` loop while the GEMMs ran on the pool. It is now one
+more claim-work region (`pack_worker`), which moved the x86-64 crossover from ~384 keys to ~128 and
+flipped 196 keys from -10 % to +12 %.
+
+Both architectures now cross over at the same place, which is why `E2_ATT_I8_MIN` is a single constant
+(128) rather than a per-ISA one.
+
+**Correction, because it was got wrong first.** The first x86 measurement of this was unpinned, on a
+16-core laptop in `powersave` with a browser running, and read the two paths as inseparable from noise
+at both 196 and 2048 keys (fp32 793/829/877 against int8 713/957/932), which led to the path being
+shipped disabled on x86-64. Pinning the pool (`taskset`, fixed `E2_THREADS`) and re-running makes the
+effect consistent across three alternating rounds at every length, and int8 wins by 13-34 % from 512
+keys up. The lesson is the one already in the guidelines - same session, pinned, best of N,
+alternating - and the earlier "not separable" verdict was a property of the measurement, not of the
+kernel.
+
+Net effect on the reference workloads: the 196-token document goes **441.7 -> 396.9 ms** on the Ampere
+A1 (12.8x -> **14.2x** versus the bf16 baseline) and the 15-token query is unchanged at 30.4 ms.
+
+#### Two latent bugs this shook out
+
+- **`e2_i8_gemm` silently required `K % E2_I8_BLOCK == 0`.** Every SIMD backend walks k-quads to the
+  end of each 128-element block without consulting K, so a short K reads into the next 8-row group -
+  the scalar reference does not, which is what let it hide. The context product is the first caller
+  with an arbitrary K (`K = keys`), and it was wrong by 15.5 absolute before this was found. Fixed by
+  padding in the caller (zero weight rows, zero activation rows, zero scale blocks) rather than by
+  clamping in the kernels: clamping the loop bound turns a constant trip count into a dynamic one and
+  measured **5% slower on the whole int8 GEMM** (query 30.6 -> 32.2 ms), so the constant bound stayed
+  and the precondition is now documented in `int8.h`.
+- **Per-thread scratch slices were offset by `BQ*S` while the rows inside were `Sp`-strided**, so
+  workers overwrote each other's probabilities. Caught by the S=31 case, where `Sp/S` is 4.
+
+V^T and the fp32 path's K^T are never alive at the same time, so they share one workspace slot; the
+rest of the int8 scratch costs +9.7 MB (230.2 -> 239.9 MB). An earlier version that gave V^T its own
+16.8 MB slot regressed the 15-token query by 4% on arena size alone.
+
+**14/14 CTests on aarch64, 21/21 on x86-64.** `e2_test_text_attention` grew the seven int8 cases.
+
+### Attempt 23: NEON packed-operand attention GEMM, which is what vision needed (ACCEPTED)
+
+Attempts 20-22 left the largest single block of time in the ARM run untouched: **8.5 s of a 13.9 s
+image was fp32 vision attention**, because `vision.c` gates its int8 path on
+`vattn_have_simd() == (e2_i8_attn_gemm != NULL)` and that kernel had no NEON form. New
+`e2_i8_attn_gemm_neon` in `src/kernels_i8_neon.c` implements the contract from `int8.h`;
+`e2_cpu_init()` now sets it on aarch64.
+
+Only that one kernel was needed. `e2_softmax_quant_i8` stays NULL on ARM deliberately: the callers
+fall back to `K->softmax` + `e2_i8_quantize` (`vision.c` says so explicitly), and both are already
+vectorized, so fusing them is an optimization rather than a prerequisite.
+
+The kernel reuses the two tricks from the weight GEMM in the same file: the activation is un-biased
+on the fly with `xor 0x80` so `vdotq_s32` accumulates the true `sum a_i8*b_i8` and **`bz` is never
+read**, and the B operand's 8 output columns are 32 contiguous bytes = two 128-bit halves. Tile is
+4 query rows x 8 columns (8 int32 + 8 float accumulators + 2 weight vectors = 19 of 32 registers),
+with the row loop split into a fixed 4-row body and a 1-row tail so `i < 4` stays a constant bound -
+the same structure, for the same reason, as the weight GEMM. A 1..3 k remainder quad (only possible
+when K is not a multiple of 4) is done scalar; `K` is arbitrary here (the context product uses
+`K = patches`), so unlike the weight GEMM this contract does not carry the block-multiple
+precondition.
+
+Ampere A1 / Neoverse-N1, 2 vCPU, `E2_THREADS=2`, best of 3, three runs:
+
+| vision workload | fp32 attention | int8 attention | |
+| :-- | --: | --: | :-- |
+| image, 2520 patches | 13882.520 ms | **8487.9 ms** | **1.64x** |
+| image + caption (274 ids) | 14082.420 ms | 8694.6 ms | 1.62x |
+
+Fidelity: image cosine **0.999814 -> 0.999769**, caption **0.999677 -> 0.999690**, both `PASS` and
+both within 5e-5 of the x86 numbers (0.999768 / 0.999661), so this is the same arithmetic x86 has
+been running. Text is unaffected in both directions (`query 30.4 ms / document 380.5 ms`, unchanged).
+
+`E2_PROFILE=1` on the image, before and after:
+
+| region | before | after |
+| :-- | --: | --: |
+| attention | 8505.1 ms (64 %) | 3098.3 ms (38 %) |
+| mlp | 2216.8 ms (17 %) | 2350.8 ms (29 %) |
+| elem | 1258.6 ms (9 %) | 1308.8 ms (16 %) |
+| qkv+o | 1142.3 ms (9 %) | 1158.8 ms (14 %) |
+| attn_pack | 0.0 ms | 170.9 ms |
+
+**Not attempted: the `elem` region, on purpose.** It looked like the obvious next item (1309 ms, 16 %,
+and every one of those ops is still the scalar `e2_k()` vtable entry on aarch64), so the generated code
+was checked before writing a NEON backend for it:
+`objdump` of `scalar_mul` in the arm build shows `ldr q31 / fmul v30.4s / str q30` - GCC already
+auto-vectorizes those loops at `-O3 -ffast-math`. They are memory-bound, and a hand-written NEON
+vtable entry would add a file and move nothing. The same check is worth doing before anyone else
+proposes it.
+
+With attention fixed, ~81 % of the image is now the int8 GEMM (attention 3.1 s + mlp 2.4 s + qkv+o
+1.2 s), derived from the profile and the known shapes. The attention GEMM runs at ~42 GMAC/s against
+**75-111 GMAC/s for the weight GEMMs in the same run** (qkv+o 87 GMAC / 1159 ms, mlp 261 GMAC /
+2351 ms). The gap is not the instruction mix - both kernels issue ~5-6 MAC per uop - it is that vision
+attention materialises a `patches x patches` score matrix per head and layer (2304^2 x 12 heads x 16
+layers, ~1 G fp32 values per image), writing and re-reading it around the softmax. The next win there
+is key-blocking vision attention so the scores stay in cache, as the text tower already does; it is a
+restructuring of `vision.c`, not a kernel.
+
+**14/14 CTests on aarch64** (the `int8` test's attention-tail cases K=1/3/9/129 now run on ARM
+instead of being skipped), **21/21 on x86-64**.
+
+### Attempt 24: NEON fused softmax + probability quantizer (ACCEPTED, but the win was 2 %, not the predicted 25 %)
+
+Attempt 23 left `e2_softmax_quant_i8` NULL on aarch64, so vision ran `K->softmax` per row and then
+`e2_i8_quantize` over the same rows. New `e2_softmax_quant_i8_neon` fuses them, and replaces libm's
+vector `expf` (`_ZGVnN4v_expf` in the scalar softmax - confirmed in the arm object file) with the same
+range-reduction + degree-6 polynomial `exp_ps` the AVX2 kernel uses, `vrndnq_f32`/`vfmsq_f32` for the
+reduction.
+
+The reasoning for doing it was the traffic: done separately, a score row is written by the logits
+GEMM, read and rewritten by softmax, then read again by the quantizer. For a 2304-patch image that
+matrix is `2304^2 x 12 heads x 16 layers` ~ 1 G values, so removing one full read+write pass should
+have been worth ~8 GB and, at the observed bandwidth, a good fraction of the attention region.
+
+**It was worth 2 %.** Ampere A1, `E2_THREADS=2`, best of 3, three runs:
+
+| | before | after |
+| :-- | --: | --: |
+| image, 2520 patches | 8488-8583 ms | **8324-8387 ms** |
+| attention region | 3098.3 ms | 3007.7 ms |
+| image + caption (274 ids) | 8694.6 ms | **8521.8 ms** |
+
+So the score-matrix traffic is not the dominant term I assumed, and the earlier estimate that the
+attention GEMM runs at ~42 GMAC/s while the weight GEMMs run at 75-111 GMAC/s still stands after this
+change: 130.6 GMAC of vision attention in 3008 ms is 43.4 GMAC/s, against qkv+o at 86.9 GMAC / 1135 ms
+= 76.6 and mlp at 260.9 GMAC / 2167 ms = 120.4. Whatever is costing the attention region, it is not
+the softmax pass.
+
+Accuracy is unchanged within noise: image cosine **0.999769 -> 0.999782**, caption 0.999690 ->
+0.999633, against x86's 0.999768 / 0.999661. The fused probabilities agree with
+softmax+quantize run separately to **7.6e-10** and produce **identical int8 bytes** at every length
+tested, on both backends.
+
+#### This kernel had no test at all, on any backend
+
+`grep e2_softmax_quant_i8 tests/` returned only the dispatch override in `test_cpu_backends.c`, so the
+AVX2 and AVX-512 versions have been untested since they were written. `test_int8` now runs
+`check_softmax_quant` over five lengths (32, 128, 200, 1300, 2520 - one block, exactly a block,
+several, and a patch-sized row) against the reference path the callers fall back to. It checks the
+implied probabilities (the fused form leaves the *unnormalised* exponentials in `x` and folds `1/sum`
+into the block scales, which is not the same thing as "softmaxed in place"), the block scales
+relatively, and the quantized bytes. Both x86 backends and the NEON one pass with 0 byte difference.
+
+**14/14 CTests on aarch64, 21/21 on x86-64.**
+
+### 2026-10-29 / AMD Ryzen 9 7940HS (Zen 4), 8 threads, int8, **native Windows 11**
+
+Windows 11 Pro 26200, clang 21 (LLVM) with the MSVC linker and SDK 10.0.26100 from the Visual Studio
+18 Insiders install, CMake 3.31.6, Ninja 1.12.1, 27.8 GB. The pool reports 8 threads on 8C/16T because
+`sysconf(_SC_NPROCESSORS_ONLN)` is answered from `GetLogicalProcessorInformationEx(RelationProcessorCore)`
+- the same "drop the SMT siblings" policy the Linux path gets from `e2_nthreads()`.
+
+```
+set E2_Q8_READ=C:\...\e2-embeddinggemma-2-int8-text.e8cq
+set E2_REPS=7
+build\e2_test.exe models\e2 tests\fixtures
+```
+
+| workload | best ms | notes |
+| :-- | --: | :-- |
+| 15-token query | **4.49** | best of 7, cos 0.999783 |
+| 196-token document | **30.41** | best of 7, cos 0.999596 |
+| image, 2520 patches | **609.21** | cos 0.999763 |
+| image + caption (274 ids) | 870.24 | cos 0.999690 |
+
+Cross-machine, same packed int8 weights, best of N, load excluded:
+
+| workload | Ampere A1 (NEON) | Intel N100 (AVX2+VNNI) | Core Ultra 9 285H (AVX2+VNNI) | Ryzen 9 7940HS (Win, AVX-512) | Ryzen 7 9700X (AVX-512) |
+| :-- | --: | --: | --: | --: | --: |
+| 15-token query | 30.4 ms | 22.7 ms | 6.19 ms | 4.49 ms | **3.95 ms** |
+| 196-token document | 380.5 ms | 329.4 ms | 41.41 ms | 30.41 ms | **24.92 ms** |
+| image, 2520 patches | 8496 ms | n/m | 708 ms | 609 ms | **543 ms** |
+
+Windows lands between the Arrow Lake laptop and the Zen 5 desktop, which is where a Zen 4 mobile part
+with a 256-bit AVX-512 datapath belongs. It is ~13 % off the Zen 5 column on text; part of that is the
+clock and the narrower vector units, and part may be the park: `threads.c` sleeps on an SRWLock +
+`CONDITION_VARIABLE` pair here rather than a futex, and the pool parks ~170 times per embedding. Not
+separated, so not claimed.
+
+**12/12 CTests pass** - 12 rather than 14 because `artifacts` is a POSIX shell script (already
+`if(UNIX)`) and the two GPU tests need Level Zero/HIP, which are not built on Windows.
+
+### The Windows port itself
+
+The engine was POSIX by construction (`mmap` for the safetensors view and the packed cache, `pthreads`
++ `futex` for the worker pool) and `clang -c src/st.c` failed at `#include <sys/mman.h>`. Rather than
+sprinkle `#ifdef _WIN32` through the engine, the port is one directory:
+
+| file | what it is |
+| :-- | :-- |
+| `src/win32/inc/{unistd.h,sys/mman.h,pthread.h,sched.h}` | the four headers Windows lacks, put on the include path |
+| `src/win32/inc/e2win.h` | force-included: `clock_gettime`, `setenv`/`unsetenv`, `mkdtemp`, `truncate`, `sysconf`, `usleep`, `strtok_r`, `rmdir` |
+| `src/win32/compat.c` | the implementations: `CreateFileMapping`+`MapViewOfFile`, `_beginthreadex`, `QueryPerformanceCounter`, `_putenv_s`, `_open(_O_CREAT\|_O_EXCL)` for the two mk*temp, `GetLogicalProcessorInformationEx` for the core count |
+
+No engine source has a `_WIN32` branch except three: `threads.c` (the park), and `st.c`/`q8cache.c`
+where the file size is read, because UCRT's `struct stat` has a **32-bit `st_size`** and the checkpoint
+is 1.4 GB - those two take `_fstat64`. Everything else compiles untouched.
+
+Three toolchain things worth writing down, because each cost a build:
+
+- CMake links with **`-nostdlib`**, so `clang_rt.builtins` is not added - and that library is where
+  `__cpu_model` / `__cpu_features2` / `__cpu_indicator_init` live, which is what
+  `__builtin_cpu_supports()` lowers to on x86, i.e. the entire runtime backend dispatch. `clang
+  --print-libgcc-file-name` answers a bare `libgcc.a` on Windows, so the build globs
+  `<llvm>/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib` from the compiler's own location and
+  links it as an INTERFACE dependency of `e2`.
+- `WaitOnAddress`/`WakeByAddressAll` are not in every Windows SDK's import library, so the park is an
+  `SRWLOCK` + `CONDITION_VARIABLE` pair instead. It has the same "sleep while the word still has the
+  expected value" contract, and the callers re-test the generation in a loop, so a spurious wake costs
+  nothing.
+- `-ffast-math` makes clang warn (`-Wnan-infinity-disabled`) about the `INFINITY` sentinels `int8.h`
+  uses as "no clamp" bounds. That is a clang-only warning, so Windows builds pass
+  `-Wno-nan-infinity-disabled`; GCC on Linux is unchanged.
+
+Five tests spelled `/tmp/...` inline and now go through `tests/test_tmpdir.h`, which picks `%TEMP%` on
+Windows and `/tmp` elsewhere. Linux still passes **21/21** and aarch64 **14/14** with those changes, so
+the port costs the other platforms nothing.
+
+### Which AVX width does this engine actually get? (measured on four machines)
+
+Single-thread, pinned, the same 64x2048x512 int8 GEMM, timing the two int8 kernels the engine carries
+directly. This exists because the Windows column above sits 13 % behind the Zen 5 column and "AVX-512"
+is not one thing across these CPUs.
+
+| CPU | micro-arch | int8 kernel | GMAC/s | notes |
+| :-- | :-- | :-- | --: | :-- |
+| Ryzen 7 9700X | Zen 5, native 512-bit | `e2_i8_gemm_avx512` (zmm vpdpbusd) | **433.2** | |
+| Ryzen 7 9700X | Zen 5 | `e2_i8_gemm_vnni` (ymm vpdpbusd) | 190.2 | same code, 256-bit operands |
+| Ryzen 9 7940HS | Zen 4, double-pumped | `e2_i8_gemm_avx512` | 298.3 | 256-bit datapath |
+| Core Ultra 9 285H | Arrow Lake, no AVX-512 | `e2_i8_gemm_vnni` | 225.8 | |
+
+Two facts worth keeping:
+
+- On Zen 5 the **same kernel at 512-bit is 2.28x the 256-bit form** (433 vs 190). That is the width
+  difference, isolated: identical source, identical arithmetic, only the operand width and the
+  32-register AVX-512 file differ.
+- Zen 4 reaches 298 GMAC/s, which is ~93 % of what a 2x256-bit-per-cycle design can do at its
+  single-core boost - i.e. on Zen 4 a 512-bit instruction costs two uops but keeps the same MAC/cycle
+  as two 256-bit ones, so AVX-512 buys instruction density there and nothing else.
+
+So the 13 % end-to-end gap between the Windows Zen 4 box and the Zen 5 box is *not* the 1.45x kernel
+gap: the document GEMM runs the pool at 6.6x on 8 threads and is bound by weight bandwidth, not by
+per-core int8 throughput. The kernel gap shows up in the single-thread microbenchmark, not in the
+embedding.
+
+#### A hazard this found: never call a backend kernel directly
+
+Probing Zen 4 by calling `e2_i8_gemm_vnni` directly **died with STATUS_ILLEGAL_INSTRUCTION
+(0xC000001D)**. Zen 4 has AVX512-VNNI but **not AVX-VNNI**, the 256-bit VEX form - that one is Intel's
+(Alder Lake and later), and it appears on Zen 5 too but not Zen 4. The engine is correct because
+`cpu_has_avxvnni()` asks `__builtin_cpu_supports("avxvnni")` before dispatching anywhere near that
+object file, and `kernels_i8_vnni.c` is only ever entered through it. Tests that call a backend
+directly (`test_int8`, `test_cpu_backends`) all guard with the matching `cpu_has_*` probe first, and
+that is why they pass everywhere. Keep it that way - a direct call is an illegal instruction on a CPU
+that does not advertise the feature.
+
+Neither Zen 4 nor Zen 5 has `avx512_fp16` (Intel-only so far, absent from both /proc/cpuinfo dumps), so
+the fp16-attention question stays untestable on every machine in this set.
+
+### 2026-10-29 / DISPATCH.md phases 0-5: selection became data, arithmetic untouched
+
+Not an optimization attempt, so there is no speed claim here; it is recorded because the project's
+rule is that a refactor touching the attention path must show the other backends did not move.
+`src/dispatch.c` now holds the capability bitmask and the per-(backend, tower) rules, `e2_attn_pick()`
+is the only selector, and `tests/test_dispatch.c` asserts the whole matrix as data on any host (the
+table is inert, so no kernel is ever probed by calling it).
+
+Verified by rebuilding the same tree on four hosts and comparing the printed fidelity before and after:
+
+| host | backend | ctest | dispatch test | fidelity (before -> after) |
+| :-- | :-- | --: | :-- | :-- |
+| laptop (local) | AVX-VNNI + Level Zero | 43/43 | OK | unchanged |
+| nucleus (Zen 5) | AVX512-VNNI | 15/15 | OK | query 0.999751, doc 0.999594, image 0.999795 - all identical |
+| n100 (Gracemont) | AVX-VNNI | 14/15 | OK | query 0.999772, doc 0.999580 - identical |
+| arm-server (N1) | NEON dotprod | 15/15 | OK | query 0.999776, doc 0.999606, image 0.999782, audio 0.999631 - all identical |
+| minipc (Zen 4, Windows) | AVX512-VNNI | 13/13 | OK | new build, cos 0.999783 / 0.999596, PASS |
+
+The n100's one failure is the known `artifacts` test, which needs `git` and that box has none; it is a
+pre-existing failure and unrelated. Observed timings moved in both directions within each machine's
+run-to-run spread (nucleus query 4.73 -> 3.90 ms, n100 document 317 -> 324 ms, arm document 387 -> 383
+ms), which is what a selection-only change should look like: no fidelity number moved, no consistent
+timing move.
+
+Phase 3 (the `E2_ATTN_TEXT`/`E2_ATTN_IMAGE` names, old names kept as aliases) was then measured the way
+the gate asks: same-model binary pair, alternating, pinned, best-of-N, laptop, `E2_THREADS=6` under
+`taskset -c 0-5`. A = phases 0-2, B = phases 0-3:
+
+| workload | A | B | delta |
+| :-- | --: | --: | --: |
+| query 15 tok (best of 15, 4 rounds) | 5.11 ms | 5.10 ms | -0.2 % |
+| document 196 tok (best of 15, 4 rounds) | 38.90 ms | 39.05 ms | +0.4 % |
+| image 2520 patches (best of 5, 4 rounds) | 907.66 ms | 907.53 ms | -0.01 % |
+
+Phase 3 re-ran the multi-host fidelity checks with the same binaries rebuilt on each box: nucleus
+(0.999751 / 0.999594 / 0.999795), arm-server (0.999776 / 0.999606), n100 (0.999772 / 0.999580) and
+minipc (0.999783 / 0.999596) all matched their phase-0-2 values digit for digit.
+
+**Method note, because it nearly produced a false verdict.** The first pass always ran A and then B in
+each pair, and B looked 1-2.7 % slower on *every* pair - a plausible regression. It was ordering: the
+second binary inherits a warmer machine. Re-running with B first in alternate rounds erased the gap
+(image medians changed from A 917 / B 922 to A 911 / B 908). One level down from the Attempt 22
+correction: alternating the *binaries* is not enough if their order is fixed.
+
+Phases 4-5 add nothing to a per-embed path. The registry walks five rows once inside `e2_cpu_init()`
+(it replaced two else-if ladders, so it is fewer branches at startup, not more), and the `attn path`
+line is printed only inside the `E2_PROFILE` blocks, whose `g_prof_on` / `g_vprof_on` flags are false
+otherwise. The full ctest matrix and the fidelity numbers were repeated on all four hosts after the
+rebuild and did not move.
+
+A final A/B against the phases-0-2 binary, best of 25, eight alternating rounds:
+query **5.35 vs 5.35 ms** and document **40.20 vs 40.40 ms** (+0.5 %). The machine had a browser
+running this session and was much noisier than during the phase-3 pass, so the *minimum* is the number
+to read - and an identical-binary control (the same build copied twice, same protocol) moved the
+document median by up to 4 % while its minimum moved by 0.2 %. That control is the reason not to quote
+the means here.
+
+Phase 4 also fixed `e2_cpu_name()` on aarch64, which reported `"scalar"` while the NEON int8 kernels
+ran; it prints `cpu backend : neon` there now, which is what HARDWARE.md's machine-identification step
+expects to see.
+
+**The one backend that had never been built now is.** nucleus received the full ROCm 7.2 stack (clang
+22, `libamdhip64`, kernels for `gfx1036`), so `-DE2_WITH_HIP=ON -DE2_HIP_ARCH=gfx1036` builds `e2_hip`
+and both HIP tests pass:
+
+| workload | GPU (`gfx1036`, 2 CU) | CPU (8 threads) | cos(gpu, ref) |
+| :-- | --: | --: | --: |
+| text query 15 tok | 12.3 ms | 6.1 ms | 0.999780 |
+| text document 196 tok | 104.3 ms | 32.7 ms | 0.999626 |
+| image 2520 patches | 1990 ms | 673 ms | 0.999778 |
+| image+caption 274 ids | 1999 ms | 588 ms | 0.999661 |
+
+This is a correctness result, not a performance claim: a 2-CU iGPU loses to an 8-core Zen 5 on every
+shape, and there is nothing here worth optimizing. The attention switches were checked against each
+other on the same device rather than by assertion — `E2_ATTN_TEXT=f32` and `E2_HIP_ATTN=lds` produce the
+same document (180.6 vs 180.8 ms, identical cos), `E2_ATTN_STAGE=legacy` and `E2_HIP_ATTN=old` likewise
+(185.8 vs 191.6 ms, identical cos), and `E2_ATTN_TEXT=i8` moves the 15-key query onto int8 (cos 0.999765
+vs 0.999780, 604 vs 460 kernels) because the override drops the 64-key gate. With that, HARDWARE.md's
+"never validated on AMD hardware" becomes "built and smoke-tested on `gfx1036`, not
+performance-validated".
+
+**The registry also bought a measurement tool, and it is the first thing that makes a kernel question
+cheap.** `E2_CPU_BACKEND=<name>` downgrades the selected backend (never invents an ISA), and
+`e2_text_bench ... backends` sweeps every backend the host can execute in one process, reloading the
+model per backend because `use_int8` is decided at load. First use, laptop, 6 pinned threads, packed
+cache, 196-token document, best of 5: **vnni 40.05 ms, avx2 117.48 ms** - the `vpmaddubsw` path is
+2.9x the `vpdpbusd` one *on the whole engine*, not just in a GEMM microbenchmark, which makes the
+AVX2-only row of the dispatch matrix a measured fact rather than a theoretical one. Against the same
+checkpoint on a 15-token query the three backends are 7.58 / 11.62 / 124.80 ms (vnni / avx2 /
+scalar-bf16, best of 2). The scalar row is bf16 and cannot read a packed int8 cache, so the sweep
+skips it with a note when `E2_Q8_READ` is set.
+
 ## Next Targets
 
 - **15-token query**: the tightest case. Pool claim + barrier (~2.5 us per region at 14 threads) is a
@@ -619,6 +1331,21 @@ logs are in ignored `benchmark-results/intel-fp16-only/`. Other GPUs and OpenVIN
   producer/consumer fusions and better arithmetic scheduling must pay for any further complexity.
   Short-query wins still need repeated same-session confirmation.
 - **Audio tower**: chunked local attention width is a fixed 12; nothing measured above or below it.
+- **vision attention key-blocking**: after Attempt 23 an image is 38 % attention, and that kernel
+  runs at ~42 GMAC/s against 75-111 for the weight GEMMs in the same run. The instruction mix is
+  comparable, so the loss is the `patches x patches` score matrix (2304^2 x 12 heads x 16 layers per
+  image) being written and re-read around the softmax. Splitting the key dimension so a score block
+  stays resident, the way `attb_worker` already does for text, is the next win - a `vision.c`
+  restructuring, not a kernel.
+- **why vision attention runs at 43 GMAC/s**: measured, not explained. Attempt 24 removed the
+  score-row traffic that was the obvious suspect and bought 2 %, so the loss is inside the attention
+  GEMM's own loop. Both it and the weight GEMM issue ~5-6 MAC/uop, so a profile of the kernel (not the
+  region) is the next step before changing its tile - the 4x8 tile is register-limited, and the
+  4-query-row shape may simply be too short at `K = 64` for the logits product to amortise its
+  accumulator setup.
+- **text int8 attention below 128 keys**: the pack (still scalar `lrintf` at 1048 M elem/s) and the
+  K/V^T transpose are now the whole cost there, and both are bound by element count rather than by
+  FLOPs. A SIMD `e2_q8w_from_f32` is the only lever that moves this crossover again.
 - **Load time**: ~0.01 s from the packed cache, 1.4 GB checkpoint read otherwise. Only matters for
   cold-start latency, not for throughput.
 

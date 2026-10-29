@@ -6,11 +6,17 @@
 #include "int8.h"
 #include "kernels.h"
 
-typedef float (*e2_getfn)(const void *, size_t);
+/* Source access: `ld` is the source's leading dimension for the strided variant, so a projection
+ * output [S][kv_dim] can be quantized per head without copying it into a contiguous [S][D] block. */
+struct src {
+    const void *p;
+    size_t ld;
+};
+typedef float (*e2_getfn)(const struct src *, size_t n, size_t k);
 
 /* Packs straight into the quad-interleaved layout (see int8.h): the four quantized values of one
  * k-quad of one row are one 4-byte store, and the 8 rows of a block are 4 bytes apart. */
-static int quantize(e2_q8w *q, int N, int K, e2_getfn get, const void *ctx) {
+static int quantize(e2_q8w *q, int N, int K, e2_getfn get, const struct src *ctx) {
     memset(q, 0, sizeof *q);
     q->N = N;
     q->K = K;
@@ -35,7 +41,7 @@ static int quantize(e2_q8w *q, int N, int K, e2_getfn get, const void *ctx) {
     for (int n = 0; n < N; n++) {
         float amax = 0.f;
         for (int k = 0; k < K; k++) {
-            float a = fabsf(get(ctx, (size_t)n * K + k));
+            float a = fabsf(get(ctx, (size_t)n, (size_t)k));
             if (a > amax) amax = a;
         }
         const float scale = amax > 0.f ? amax / 127.0f : 1.0f;
@@ -45,7 +51,7 @@ static int quantize(e2_q8w *q, int N, int K, e2_getfn get, const void *ctx) {
             const int k0 = b * E2_I8_BLOCK;
             const int k1 = (k0 + E2_I8_BLOCK) < K ? (k0 + E2_I8_BLOCK) : K;
             for (int k = k0; k < k1; k++) {
-                int32_t r = (int32_t)lrintf(get(ctx, (size_t)n * K + k) * inv);
+                int32_t r = (int32_t)lrintf(get(ctx, (size_t)n, (size_t)k) * inv);
                 if (r > 127) r = 127;
                 if (r < -127) r = -127;
                 q->w[(size_t)(n >> 3) * kq * 32 + (size_t)(k >> 2) * 32 + (n & 7) * 4 +
@@ -59,15 +65,26 @@ static int quantize(e2_q8w *q, int N, int K, e2_getfn get, const void *ctx) {
     return 0;
 }
 
-static float get_f32(const void *ctx, size_t i) { return ((const float *)ctx)[i]; }
-static float get_bf16(const void *ctx, size_t i) { return e2_bf16f(((const uint16_t *)ctx)[i]); }
+static float get_f32(const struct src *s, size_t n, size_t k) {
+    return ((const float *)s->p)[n * s->ld + k];
+}
+static float get_bf16(const struct src *s, size_t n, size_t k) {
+    return e2_bf16f(((const uint16_t *)s->p)[n * s->ld + k]);
+}
 
 int e2_q8w_from_f32(e2_q8w *q, const float *w, int N, int K) {
-    return quantize(q, N, K, get_f32, (const void *)w);
+    const struct src s = { w, (size_t)K };
+    return quantize(q, N, K, get_f32, &s);
 }
 
 int e2_q8w_from_bf16(e2_q8w *q, const uint16_t *w, int N, int K) {
-    return quantize(q, N, K, get_bf16, (const void *)w);
+    const struct src s = { w, (size_t)K };
+    return quantize(q, N, K, get_bf16, &s);
+}
+
+int e2_q8w_from_f32_ld(e2_q8w *q, const float *w, int N, int K, int ld) {
+    const struct src s = { w, (size_t)ld };
+    return quantize(q, N, K, get_f32, &s);
 }
 
 void e2_q8w_free(e2_q8w *q) {

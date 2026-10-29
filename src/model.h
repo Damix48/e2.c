@@ -84,8 +84,19 @@ typedef struct {
     float *v;      /* S x 1024            */
     float *att;    /* S x 2048            */
     float *attn;   /* max(S, 2*window+1)  */
-    float *kt;     /* [E2_NUM_HEADS * 512, S]: transposed K for the blocked attention */
+    /* [E2_NUM_HEADS * 512, S]: transposed K for the fp32 blocked attention, and transposed V for the
+     * int8 one. The two paths are exclusive, so one buffer serves both. */
+    float *kt;
     float *asblk;  /* [nthreads, E2_ATT_BQ, S]: blocked-attention scores, one block per worker */
+    /* int8 attention scratch, one E2_ATT_BQ-row query block per worker. q8 is the unsigned
+     * (a+128) activation operand for both products, p8 the quantized probabilities, ctx the
+     * [BQ][512] untransposed context the strided head columns are copied out of. */
+    uint8_t *att_q8;
+    float *att_qs;
+    uint8_t *att_p8;
+    float *att_ps;
+    float *att_ctx;
+    float *att_q8_words, *att_p8_words;
     float *gate;   /* S x intermediate    */
     float *up;     /* S x intermediate    */
     float *ple_g;  /* S x ple_dim         */

@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -17,7 +18,12 @@ import time
 import numpy as np
 
 HERE = Path(__file__).resolve().parents[2]  # repository root: this script drives `cmake -S HERE`
-CASES = ("query", "document", "query_batch8", "document_batch32", "image", "audio")
+CASES = ("query", "document", "query_batch8", "document_batch32", "image", "image_batch4",
+         "audio", "audio_batch4")
+# The image and audio towers have no batched entry point in either engine, so their "batch" cases
+# repeat the single call inside one timed call: throughput, not a batched kernel. Text batches are
+# genuine batched calls.
+REPEATS = {"image_batch4": 4, "audio_batch4": 4}
 
 
 def digest(path):
@@ -47,7 +53,11 @@ class Fixture:
             raise ValueError("unexpected fixture tail")
 
 
-def check(output, reference):
+MIN_COSINE = 0.999
+
+
+def cosine(output, reference):
+    """Structure/unit-norm validation plus the worst row cosine; no accuracy gate."""
     a, b = np.asarray(output, dtype=np.float64), np.asarray(reference, dtype=np.float64)
     if a.shape != b.shape or not np.isfinite(a).all() or not np.isfinite(b).all():
         raise ValueError(f"invalid output shape/values: {a.shape}, expected {b.shape}")
@@ -55,10 +65,14 @@ def check(output, reference):
     na, nb = np.linalg.norm(a, axis=1), np.linalg.norm(b, axis=1)
     if np.any(abs(na - 1) > 0.001) or np.any(nb == 0):
         raise ValueError("non-unit or zero output")
-    cosine = float(np.min(np.sum(a * b, axis=1) / (na * nb)))
-    if cosine < 0.999:
-        raise ValueError(f"cosine {cosine:.9f} < 0.999")
-    return cosine
+    return float(np.min(np.sum(a * b, axis=1) / (na * nb)))
+
+
+def check(output, reference, minimum=MIN_COSINE):
+    value = cosine(output, reference)
+    if value < minimum:
+        raise ValueError(f"cosine {value:.9f} < {minimum}")
+    return value
 
 
 def summary(samples):
@@ -69,16 +83,17 @@ def summary(samples):
             "p95_ms": ordered[math.ceil(len(ordered) * 0.95) - 1]}
 
 
-def save_case(out, name, kind, batch, n, payload, feeds, ref, xml, boundary):
+def save_case(out, name, kind, batch, n, payload, feeds, ref, xml, boundary, repeat=1):
     ref = np.asarray(ref, dtype=np.float32).reshape(batch, 768)
     check(ref, ref)
     with open(out / f"{name}.bin", "wb") as f:
-        np.array([kind, batch, n], dtype="<i4").tofile(f)
+        np.array([kind, batch, n, repeat], dtype="<i4").tofile(f)
         for data in payload:
             f.write(np.ascontiguousarray(data).tobytes())
         ref.astype("<f4").tofile(f)
     np.savez(out / f"{name}.npz", reference=ref, **feeds)
-    return {"name": name, "batch": batch, "length": n, "xml": str(xml), "boundary": boundary}
+    return {"name": name, "batch": batch, "length": n, "xml": str(xml), "boundary": boundary,
+            "repeat": repeat}
 
 
 def prepare_case(name, fixture_dir, ir_dir, out):
@@ -95,7 +110,8 @@ def prepare_case(name, fixture_dir, ir_dir, out):
         feeds = {"input_ids": ids.astype(np.int64), "attention_mask": np.ones(ids.shape, np.int64)}
         return save_case(out, name, 0, batch, int(n), [ids], feeds, np.tile(ref, (batch, 1)),
                          ir_dir / "text_int8.xml", "token IDs -> normalized 768d; no tokenization")
-    if name == "image":
+    if name.startswith("image"):
+        repeat = REPEATS.get(name, 1)
         fx = Fixture(fixture_dir / "image.bin")
         n, pd, npos, dim = fx.take("<i4", 4)
         if not 0 < n <= 2520 or (pd, npos, dim) != (768, 2, 768):
@@ -107,7 +123,9 @@ def prepare_case(name, fixture_dir, ir_dir, out):
         return save_case(out, name, 1, 1, int(n), [pixels, pos],
                          {"pixel_values": pixels[None], "image_position_ids": pos[None].astype(np.int64)},
                          ref, ir_dir / "image_int8.xml",
-                         "same padded image patches -> normalized 768d (vision + text); no image decoding/resize")
+                         "same padded image patches -> normalized 768d (vision + text); no image decoding/"
+                         f"resize; one timed call = {repeat} sequential image{'s' if repeat > 1 else ''}",
+                         repeat)
     raise ValueError(name)
 
 
@@ -199,10 +217,11 @@ def ov_worker(spec):
     samples, minimum = [], 1.0
     for r in range(-spec["warmup"], spec["runs"]):
         t = time.perf_counter_ns()
-        request.infer(data)
+        for _ in range(spec.get("repeat", 1)):
+            request.infer(data)
         elapsed = (time.perf_counter_ns() - t) / 1e6
         output = request.get_output_tensor(0).data
-        minimum = min(minimum, check(output, reference))
+        minimum = min(minimum, cosine(output, reference))
         if r >= 0:
             samples.append(elapsed)
     np.asarray(output, dtype=np.float32).tofile(spec["output"])
@@ -228,21 +247,33 @@ def run_logged(command, log, env=None, timeout=1800):
 def render(report):
     lines = ["# e2 vs OpenVINO weight-only INT8", "", f"Started: {report['started']}", "",
              "Warm, synchronous batch-call latency; median of round medians. Speedup = OV/e2 (>1 favors e2).",
-             "Both engines must pass cosine >= 0.999 against the same FP32 reference on EVERY call.", "",
-             "| Case | Device | e2 ms | OV ms | e2 speedup | Status |",
-             "|---|---|---:|---:|---:|---|"]
+             f"Both engines are checked against the same FP32 reference on EVERY call; the gate is "
+             f"cosine >= {MIN_COSINE}.", "",
+             "| Case | Device | e2 ms | OV ms | e2 speedup | e2 cos | OV cos | Status |",
+             "|---|---|---:|---:|---:|---:|---:|---|"]
     for case in report["cases"]:
         for device in report["devices"]:
             rows = [r for r in report["results"] if r["case"] == case["name"] and r["device"] == device]
             groups = {engine: [r for r in rows if r["engine"] == engine] for engine in ("e2", "ov")}
-            values = {}
+            values, worst, accurate = {}, {}, []
             for engine, trials in groups.items():
                 if len(trials) == report["rounds"] and all(t["status"] == "ok" for t in trials):
                     values[engine] = statistics.median(t["median_ms"] for t in trials)
+                    measured = [t.get("minimum_cosine") for t in trials]
+                    if all(c is not None for c in measured):
+                        worst[engine] = min(measured)
+                    accurate.append(all(t.get("accuracy") == "pass" for t in trials))
             ratio = f"{values['ov']/values['e2']:.2f}x" if len(values) == 2 else "—"
             cells = [f"{values[e]:.3f}" if e in values else "—" for e in ("e2", "ov")]
+            coss = [f"{worst[e]:.6f}" if e in worst else "—" for e in ("e2", "ov")]
+            if len(values) != 2:
+                status = "FAILED / incomplete; inspect results.json + logs"
+            elif not all(accurate):
+                status = "ACCURACY FAIL"
+            else:
+                status = "checked"
             lines.append(f"| {case['name']} | {device} | {cells[0]} | {cells[1]} | {ratio} | "
-                         f"{'checked' if len(values) == 2 else 'FAILED / incomplete; inspect results.json + logs'} |")
+                         f"{coss[0]} | {coss[1]} | {status} |")
     if report.get("preparation_errors"):
         lines += ["", "## Preparation failures (NOT benchmark successes)", ""]
         lines += [f"- **{name}**: {error}" for name, error in report["preparation_errors"].items()]
@@ -331,12 +362,26 @@ def main():
         run_logged(["lspci", "-nnk"], out / "lspci.txt")
     except (OSError, RuntimeError) as exc:
         report["lspci_error"] = str(exc)
+    audio_exported = None
     for name in names:
         try:
-            if name == "audio":
-                run_logged([sys.executable, __file__, "--audio-export", "--model-dir", model_dir,
-                            "--fixture-dir", fixture_dir, "--output", out], out / "audio-export.log", env, args.timeout)
-                case = json.loads((out / "audio.case.json").read_text())
+            if name.startswith("audio"):
+                if audio_exported is None:
+                    run_logged([sys.executable, __file__, "--audio-export", "--model-dir", model_dir,
+                                "--fixture-dir", fixture_dir, "--output", out], out / "audio-export.log",
+                               env, args.timeout)
+                    audio_exported = json.loads((out / "audio.case.json").read_text())
+                repeat = REPEATS.get(name, 1)
+                case = dict(audio_exported, name=name, repeat=repeat)
+                case["boundary"] += (f"; one timed call = {repeat} sequential "
+                                     f"clip{'s' if repeat > 1 else ''}")
+                if repeat != 1:
+                    # Same payload, only the header's repeat field differs.
+                    payload = (out / "audio.bin").read_bytes()[16:]
+                    with open(out / f"{name}.bin", "wb") as f:
+                        np.array([2, 1, case["length"], repeat], dtype="<i4").tofile(f)
+                        f.write(payload)
+                    shutil.copyfile(out / "audio.npz", out / f"{name}.npz")
             else:
                 case = prepare_case(name, fixture_dir, ir_dir, out)
             for p in (out / f"{name}.bin", out / f"{name}.npz", Path(case["xml"]), Path(case["xml"]).with_suffix(".bin")):
@@ -365,7 +410,8 @@ def main():
                         else:
                             spec = {"xml": case["xml"], "feeds": str(out / f"{name}.npz"), "device": device,
                                     "threads": args.threads, "runs": args.runs, "warmup": args.warmup,
-                                    "output": str(raw), "result": str(out / f"{stem}.result.json")}
+                                    "repeat": case.get("repeat", 1), "output": str(raw),
+                                    "result": str(out / f"{stem}.result.json")}
                             (out / f"{stem}.spec.json").write_text(json.dumps(spec, indent=2))
                             command = [sys.executable, __file__, "--worker", out / f"{stem}.spec.json"]
                         log = run_logged(command, out / f"{stem}.log", env, args.timeout)
@@ -375,8 +421,14 @@ def main():
                             raise ValueError("missing timing samples")
                         result.update(measurements, **summary(measurements["samples_ms"]), status="ok")
                         ref = np.load(out / f"{name}.npz")["reference"]
-                        check(np.fromfile(raw, dtype=np.float32).reshape(ref.shape), ref)
-                        print(f"{stem}: {result['median_ms']:.3f} ms cos>={result['minimum_cosine']:.6f}", flush=True)
+                        try:
+                            check(np.fromfile(raw, dtype=np.float32).reshape(ref.shape), ref)
+                            result["accuracy"] = "pass"
+                        except ValueError as exc:
+                            result["accuracy"] = f"FAIL: {exc}"
+                        print(f"{stem}: {result['median_ms']:.3f} ms cos>={result['minimum_cosine']:.6f}"
+                              f"{'' if result['accuracy'] == 'pass' else ' ACCURACY ' + result['accuracy']}",
+                              flush=True)
                     except Exception as exc:
                         result.update(status="failed", error=str(exc))
                         print(f"{stem}: FAILED: {exc}", flush=True)
@@ -385,7 +437,8 @@ def main():
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     persist()
     print(out / "REPORT.md")
-    return int(bool(report["preparation_errors"]) or any(r["status"] != "ok" for r in report["results"]))
+    return int(bool(report["preparation_errors"]) or any(r["status"] != "ok" for r in report["results"])
+               or any(r.get("accuracy") != "pass" for r in report["results"]))
 
 
 if __name__ == "__main__":

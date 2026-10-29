@@ -27,6 +27,8 @@
 #if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 #if defined(__x86_64__)
@@ -64,6 +66,27 @@ static void futex_wait(_Atomic unsigned *addr, unsigned expected) {
 }
 static void futex_wake(_Atomic unsigned *addr) {
     syscall(SYS_futex, (unsigned *)addr, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL, NULL, 0);
+}
+#elif defined(_WIN32)
+/* A lock and a condition variable, which is the Win32 spelling of "sleep while *addr == expected".
+ * WaitOnAddress would be the literal translation but it is not in every Windows SDK's import
+ * library, and this costs nothing measurable: there is one pool for the process lifetime, so one
+ * condition variable is all that is needed, and the callers re-test the generation in a loop, so a
+ * spurious wake is harmless. Parking matters - the pool parks ~170 times per embedding. */
+static SRWLOCK g_park_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_park_cv = CONDITION_VARIABLE_INIT;
+
+static void futex_wait(_Atomic unsigned *addr, unsigned expected) {
+    AcquireSRWLockExclusive(&g_park_lock);
+    while (atomic_load_explicit(addr, memory_order_acquire) == expected)
+        SleepConditionVariableSRW(&g_park_cv, &g_park_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&g_park_lock);
+}
+static void futex_wake(_Atomic unsigned *addr) {
+    (void)addr; /* one pool, one condition variable */
+    AcquireSRWLockExclusive(&g_park_lock);
+    WakeAllConditionVariable(&g_park_cv);
+    ReleaseSRWLockExclusive(&g_park_lock);
 }
 #else
 static void futex_wait(_Atomic unsigned *addr, unsigned expected) {

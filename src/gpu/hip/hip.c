@@ -19,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "dispatch.h"
 #include "model.h"
 #include "validation.h"
 #include "hip.h"
@@ -120,17 +121,17 @@ e2_hip *e2_hip_create(e2_model *m) {
     e2h_prof_on = getenv("E2_HIP_PROFILE") != NULL;
     g->gemm_lds = 1;
     { const char *ge = getenv("E2_HIP_GEMM"); if (ge && !strcmp(ge, "direct")) g->gemm_lds = 0; }
-    g->attn_lds = 1;
-    g->attn_i8 = 1;
-    {
-        const char *ae = getenv("E2_HIP_ATTN");
-        if (ae && strcmp(ae, "old") == 0) { g->attn_lds = 0; g->attn_i8 = 0; }
-        if (ae && strcmp(ae, "lds") == 0) g->attn_i8 = 0;
-    }
-    g->attn_i8_min = E2_HIP_ATTN_I8_MIN;
+    /* Attention precision and kernel generation come from dispatch.c; E2_HIP_ATTN and
+     * E2_HIP_ATTN_I8 are parsed there as deprecated aliases of E2_ATTN_TEXT / E2_ATTN_STAGE. `legacy`
+     * is the pre-fusion scalar per-row kernel, which is fp32 by construction, so it overrides the
+     * precision rather than combining with it. */
+    const e2_attn_stage stage = e2_attn_stage_override();
+    g->attn_i8 = stage != E2_ATTN_STAGE_LEGACY &&
+                 e2_attn_pick(E2_BK_HIP, E2_TOWER_TEXT, E2_ATTN_ANY_KEYS) == E2_ATTN_I8;
+    g->attn_lds = stage != E2_ATTN_STAGE_LEGACY;
+    g->attn_i8_lds = stage != E2_ATTN_STAGE_DIRECT;
+    g->attn_i8_min = e2_attn_min_keys(E2_BK_HIP, E2_TOWER_TEXT);
     { const char *am = getenv("E2_HIP_ATTN_I8_MIN"); if (am) g->attn_i8_min = atoi(am); }
-    g->attn_i8_lds = 1;
-    { const char *ai = getenv("E2_HIP_ATTN_I8"); if (ai && strcmp(ai, "direct") == 0) g->attn_i8_lds = 0; }
     const char *ll = getenv("E2_HIP_LAYERS");
     g->layer_limit = ll ? atoi(ll) : -1;
     g->limit = getenv("E2_HIP_LIMIT") ? atoi(getenv("E2_HIP_LIMIT")) : 0;

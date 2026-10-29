@@ -1,4 +1,5 @@
 /* Linker fault injection; no allocator hooks in the engine API. */
+#include "test_tmpdir.h"
 #include "model.h"
 #include "q8cache.h"
 #include <unistd.h>
@@ -63,7 +64,8 @@ int main(void) {
         assert(e2_pool_create(2) == NULL);
         g_fail_at = 0;
     }
-    char path[] = "/tmp/e2-oom-cache-XXXXXX";
+    char path[512];
+    snprintf(path, sizeof path, "%s/e2-oom-cache-XXXXXX", e2_test_tmpdir());
     int fd = mkstemp(path); assert(fd >= 0);
     assert(write(fd, "old", 3) == 3); close(fd);
     for (int i = 1; i <= 2; i++) {

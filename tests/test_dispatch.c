@@ -269,6 +269,8 @@ int main(void) {
     e2_cpu_init();
     assert(e2_cpu_backend() == E2_BK_CPU_SCALAR);
     assert(e2_i8_quantize == NULL); /* so the model loads as bf16, which is what the switch is for */
+    /* ...and no stale kernel may survive from the best row that was selected first */
+    assert(e2_i8_attn_gemm == NULL && e2_softmax_quant_i8 == NULL);
     assert(e2_attn_pick(e2_cpu_backend(), E2_TOWER_TEXT, 2048) == E2_ATTN_F32);
 
     setenv("E2_CPU_BACKEND", "not-a-backend", 1);

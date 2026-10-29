@@ -357,6 +357,12 @@ if(TARGET e2_gpu)
   target_link_libraries(e2_text_bench PRIVATE e2_gpu)
 endif()
 
+# Per-kernel throughput per CPU backend: "which kernel is slow", which the engine benches cannot say.
+add_executable(e2_kernel_bench tools/bench/kernel_bench.c)
+target_link_libraries(e2_kernel_bench PRIVATE e2)
+target_include_directories(e2_kernel_bench PRIVATE src)
+target_compile_options(e2_kernel_bench PRIVATE -fno-fast-math)
+
 # Matched-input worker for tools/bench/bench_compare.py; never compile validation with fast-math.
 add_executable(e2_compare_bench tools/bench/compare_bench.c)
 target_link_libraries(e2_compare_bench PRIVATE e2)

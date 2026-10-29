@@ -428,6 +428,13 @@ static const e2_f32_backend_def k_f32_backends[] = {
 static const int k_i8_count = (int)(sizeof k_i8_backends / sizeof k_i8_backends[0]);
 static const int k_f32_count = (int)(sizeof k_f32_backends / sizeof k_f32_backends[0]);
 
+static void reset_i8_pointers(void) {
+    e2_i8_gemm = NULL;
+    e2_i8_quantize = NULL;
+    e2_i8_attn_gemm = NULL;
+    e2_softmax_quant_i8 = NULL;
+}
+
 /* Install a named backend and make the fp32 vtable follow the same tier, so a forced "avx2" behaves
  * like an AVX2-only machine rather than an AVX-512 machine with slow int8. Only a tier this CPU can
  * execute is accepted: the switch may downgrade, never invent an ISA (that is an illegal instruction,
@@ -444,6 +451,7 @@ static int apply_backend(const char *name) {
         fprintf(stderr, "e2: E2_CPU_BACKEND=%s is not supported by this CPU\n", name);
         return -1;
     }
+    reset_i8_pointers(); /* a downgrade must not leave the previous backend's kernels installed */
     row->install();
     e2_dispatch_set_cpu_backend(row->bk);
     for (int i = 0; i < k_f32_count; i++) {
@@ -460,13 +468,6 @@ const char *e2_cpu_backend_name(int i) {
     if (i < 0 || i >= k_i8_count) return NULL;
     if (k_i8_backends[i].probe && !k_i8_backends[i].probe()) return NULL; /* this host cannot run it */
     return k_i8_backends[i].name;
-}
-
-static void reset_i8_pointers(void) {
-    e2_i8_gemm = NULL;
-    e2_i8_quantize = NULL;
-    e2_i8_attn_gemm = NULL;
-    e2_softmax_quant_i8 = NULL;
 }
 
 void e2_cpu_init(void) {

@@ -1321,6 +1321,47 @@ checkpoint on a 15-token query the three backends are 7.58 / 11.62 / 124.80 ms (
 scalar-bf16, best of 2). The scalar row is bf16 and cannot read a packed int8 cache, so the sweep
 skips it with a note when `E2_Q8_READ` is set.
 
+### 2026-10-29 / CPU kernel microbench, and a vision change rejected before it was written
+
+`tools/bench/kernel_bench.c` is the CPU counterpart of `hip_kernel_bench.hip`: per-kernel GMAC/s (or
+Melem/s) under `E2_CPU_BACKEND`, so a kernel question no longer has to be inferred from a 40 ms total.
+One core, best of 5:
+
+| kernel | laptop vnni | laptop avx2 | nucleus avx512 | nucleus vnni | nucleus avx2 | ARM neon |
+| :-- | --: | --: | --: | --: | --: | --: |
+| `i8_gemm` 64x512x2048 | **229.4** | 57.2 | **234.5** | 191.4 | 59.5 | 51.2 |
+| `attn_gemm` logits 64x2304x64 | 65.8 | - (no kernel) | 123.0 | 52.3 | - | 36.1 |
+| `attn_gemm` context 64x64x2304 | 74.7 | - | 151.2 | 65.7 | - | 43.1 |
+| `q8w_from_f32` (Melem/s) | 1074 | 1054 | 880 | 882 | 801 | 447 |
+| `quantize_blocks` (Melem/s) | 4872 | 4853 | - | - | - | 1664 |
+| `sgemm_nn_range` (fp32) | 44.8 | 44.1 | 78.5 | 63.5 | 61.2 | 12.2 |
+
+Two things it found immediately. **Unpinned numbers are meaningless on a hybrid CPU**: the same vnni
+GEMM reads 63 GMAC/s when the scheduler puts it on an E-core and 229.4 pinned to a P-core, which is
+the whole gap between this table and HARDWARE.md. And the forcing switch had a real bug it exposed:
+`E2_CPU_BACKEND=scalar` reset the GEMM and quantizer pointers but not the fused attention ones, so a
+forced scalar backend still carried the VNNI attention kernel. Fixed in `apply_backend()` and pinned
+by a new assertion in `test_dispatch`.
+
+**The key-blocking idea is rejected, by measurement rather than by opinion.** The premise in the
+bullet below was that vision attention re-reads a spilled `patches x patches` score matrix. It does
+not spill: a work item is `E2_V_ATT_BQ`(32) x P(2304) x 4 B = 295 KB, which is L2-resident, and moving
+the block size in either direction makes the machine with the biggest cache worse and leaves the one
+without an L3 flat:
+
+| `E2_V_ATT_BQ` | laptop, attention (6 threads) | ARM, attention (2 threads) |
+| --: | --: | --: |
+| 16 | 484 ms | - |
+| 32 | 440-478 ms | 3127 ms |
+| 64 | 513 ms | 3135 ms |
+
+The arithmetic agrees. Two products per image are 2 x 2304^2 x 64 x 12 x 16 = 130 GMAC; at the
+measured 65.8 / 74.7 GMAC/s and 6 threads that is 0.31 s of the 0.44-0.48 s attention region, so the
+GEMMs are two thirds and the fused softmax+quantize (about 1 G elements per image) most of the rest.
+Key-blocking addresses neither. What the table does show is the actual gap: the attention GEMM runs at
+65.8 GMAC/s where the weight GEMM runs at 229.4, because the logits product is 16 k-quads deep with a
+4-row tile - the accumulator setup is not amortised, exactly the second bullet below.
+
 ## Next Targets
 
 - **15-token query**: the tightest case. Pool claim + barrier (~2.5 us per region at 14 threads) is a
@@ -1331,18 +1372,14 @@ skips it with a note when `E2_Q8_READ` is set.
   producer/consumer fusions and better arithmetic scheduling must pay for any further complexity.
   Short-query wins still need repeated same-session confirmation.
 - **Audio tower**: chunked local attention width is a fixed 12; nothing measured above or below it.
-- **vision attention key-blocking**: after Attempt 23 an image is 38 % attention, and that kernel
-  runs at ~42 GMAC/s against 75-111 for the weight GEMMs in the same run. The instruction mix is
-  comparable, so the loss is the `patches x patches` score matrix (2304^2 x 12 heads x 16 layers per
-  image) being written and re-read around the softmax. Splitting the key dimension so a score block
-  stays resident, the way `attb_worker` already does for text, is the next win - a `vision.c`
-  restructuring, not a kernel.
-- **why vision attention runs at 43 GMAC/s**: measured, not explained. Attempt 24 removed the
-  score-row traffic that was the obvious suspect and bought 2 %, so the loss is inside the attention
-  GEMM's own loop. Both it and the weight GEMM issue ~5-6 MAC/uop, so a profile of the kernel (not the
-  region) is the next step before changing its tile - the 4x8 tile is register-limited, and the
-  4-query-row shape may simply be too short at `K = 64` for the logits product to amortise its
-  accumulator setup.
+- **vision attention, measured per kernel**: the region is 50 % of an image (440-478 ms of ~900 at 6
+  threads), and the kernel bench shows why. `attn_gemm` runs at 65.8 GMAC/s (logits) and 74.7
+  (context) where the weight GEMM runs at 229.4, and the two products are 0.31 s of that region. The
+  limiter is the logits product's shape - 16 k-quads deep with a 4-query-row accumulator tile - not
+  cache traffic: a 295 KB score block is L2-resident and the block-size sweep above is flat or worse.
+  The next win is a wider tile for K=64 (8 or 16 query rows per accumulator), or fusing the softmax
+  into the logits kernel so the score row is never written as fp32. Target: >=120 GMAC/s on x86 and
+  >=70 on ARM, measured with `e2_kernel_bench`, before touching `vision.c`.
 - **text int8 attention below 128 keys**: the pack (still scalar `lrintf` at 1048 M elem/s) and the
   K/V^T transpose are now the whole cost there, and both are bound by element count rather than by
   FLOPs. A SIMD `e2_q8w_from_f32` is the only lever that moves this crossover again.

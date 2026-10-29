@@ -206,6 +206,10 @@ E2_REPS=7 ./build/e2_test models/embeddinggemma-2 tests/fixtures
 E2_Q8_READ=$PWD/models/e2/e2-embeddinggemma-2-int8-text.e8cq \
   ./build/e2_text_bench models/e2 tests/fixtures backends 196 1 5
 
+# Per-kernel throughput per backend, GMAC/s or Melem/s. Pin it: on a hybrid CPU an unpinned run
+# measures an E-core (63 vs 229 GMAC/s for the same vnni GEMM on Arrow Lake).
+taskset -c 0 ./build/e2_kernel_bench backends 10
+
 # Serial, alternating A/B against another engine on matched inputs
 python3 tools/bench/bench_compare.py --model-dir models/embeddinggemma-2 --fixture-dir tests/fixtures
 

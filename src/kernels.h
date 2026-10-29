@@ -76,6 +76,9 @@ extern void (*e2_i8_quantize)(int8_t *out, float *scales, const float *x, int M,
  * register tile walks them. Backends: AVX2/FMA, scalar. */
 extern void (*e2_sgemm_nn_range)(float *C, int ldc, const float *A, int lda, const float *B, int ldb,
                                  int M, int N, int K, int m0, int m1);
+/* The scalar reference every other sgemm is checked against (also the fallback). */
+void e2_sgemm_nn_range_scalar(float *C, int ldc, const float *A, int lda, const float *B, int ldb,
+                              int M, int N, int K, int m0, int m1);
 
 /* Select the best backend for this CPU (AVX2/FMA if available, else scalar). Call once before use.
  * E2_CPU_BACKEND=<name> downgrades the choice for an A/B; only a backend this CPU can execute is

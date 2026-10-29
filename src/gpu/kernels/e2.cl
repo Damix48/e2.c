@@ -251,6 +251,7 @@ __kernel void k_gemm_tiled(__global const char *wbuf, __global const uchar *acts
                 if (j < nlim) y[(size_t)(m0 + i) * N + (n0 + j)] = yacc[i][j];
 }
 
+#ifndef E2_NO_DPAS
 /* ------------------------------------------------------------------ int8 GEMM on the XMX (DPAS) engine
  * The dot-product kernels above are dp4a; this one uses the matrix engine
  * (intel_sub_group_u8_i8_matrix_mad_k32): one sub-group of 8 lanes computes an E2_DM x E2_DN tile,
@@ -826,6 +827,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_bench_dpas(__globa
     if (lane == 0 && get_local_id(1) == 0) out[get_global_id(0)] = (float)s;
 }
 
+#endif /* E2_NO_DPAS */
 /* ------------------------------------------------------------------ row-wise normalization
  * One sub-group per row: lane l holds elements [b*128 + l*4, +4) of block b, so a block's largest
  * magnitude is a 32-lane butterfly and the quantized bytes of a block are one 128-byte contiguous
@@ -1110,6 +1112,7 @@ __kernel void k_attn_f16_pack(__global const float *k, __global const float *v,
     vp[(size_t)z * SP * D / 2 + ((size_t)(jp / 8) * (D / 8) + f / 8) * 64 + (jp % 8) * 8 + f % 8] = as_int(b);
 }
 
+#ifndef E2_NO_DPAS
 /* FP16 XMX attention with FP32 accumulation/softmax; projections remain W8A8.
  * DPAS operand distribution follows Khronos cl_intel_subgroup_matrix_multiply_accumulate.
  * Each subgroup computes eight queries by sixteen keys (or context dimensions).
@@ -1187,6 +1190,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_f16_ctx(
     if (!lane) asc[(size_t)row * (H * D / 128) + h * (D / 128) + nbase / 128] = sc;
 }
 
+#endif /* E2_NO_DPAS */
 __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_f16_softmax(
     __global const float *scores, __global half *prob, __global const uchar *valid,
     int rows, int S, int SP, int window) {
@@ -1294,6 +1298,7 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_packw(
     }
 }
 
+#ifndef E2_NO_DPAS
 /* The two attention products, one kernel: `wd` is the packed int8 weight matrix in the DPAS A
  * layout, `qa` the int8 activations biased by +128, and the result is
  *
@@ -1441,6 +1446,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_attn_i8_ctx(
  * value, which is the same recipe the activation quantization uses everywhere else in the engine.
  * A masked key writes byte 0 (the context product has no zero-point correction) and a block with
  * nothing visible gets asc = 0, so a fully masked row produces an all-zero context. */
+#endif /* E2_NO_DPAS */
 __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_softmax(
     __global float *sc, __global uchar *p, __global float *asc, __global const uchar *valid, int M,
     int N, int slen, int window, int H, int nb, int q0, int tile) {
@@ -1511,6 +1517,107 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_attn_softmax(
     }
 }
 
+#ifdef E2_NO_DPAS
+/* ------------------------------------------------------------------ FP32 attention (no DPAS)
+ * A correctness-first fallback for GPUs without XMX (test path: E2_GPU_ATTN_F32=1). The projections
+ * still run int8 dp4a; only the two attention products use f32, and the context is quantized by
+ * k_rowops afterwards. One work item per score / probability row / context element: no packing, no
+ * subgroup reductions, no matrix engine. Slow by XMX standards, but it keeps the whole forward pass
+ * on the device. */
+/* 16x16 query/key tile, Q and K staged in SLM in 32-wide k chunks. The naive kernel re-read every
+ * Q/K row from global for every pair and measured ~1 GMAC/s on this iGPU; the tile makes each row
+ * load feed 16 products. Local size (16,16). */
+__kernel void k_attn_scores_f32(__global const float *q, __global const float *k,
+                                __global float *scores, int S, int SP, int H, int KV, int D) {
+    __local float qs[16][33], ks[16][33];
+    const int lx = get_local_id(0), ly = get_local_id(1);
+    const int tid = ly * 16 + lx;
+    const int n0 = get_group_id(0) * 16, m0 = get_group_id(1) * 16;
+    const int z = get_group_id(2), batch = z / H, h = z % H, kv = h * KV / H;
+    float acc = 0.f;
+    for (int c = 0; c < D; c += 32) {
+        for (int i = tid; i < 16 * 32; i += 256) {
+            const int r = i >> 5, cc = i & 31, row = m0 + r, d = c + cc;
+            qs[r][cc] = (row < S && d < D) ? q[((size_t)(batch * S + row) * H + h) * D + d] : 0.f;
+        }
+        for (int i = tid; i < 16 * 32; i += 256) {
+            const int r = i >> 5, cc = i & 31, row = n0 + r, d = c + cc;
+            ks[r][cc] = (row < S && d < D) ? k[((size_t)(batch * S + row) * KV + kv) * D + d] : 0.f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int jn = (D - c) < 32 ? D - c : 32;
+#pragma unroll
+        for (int j = 0; j < 32; j++)
+            if (j < jn) acc += qs[ly][j] * ks[lx][j];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const int m = m0 + ly, key = n0 + lx;
+    if (m < S && key < S) scores[((size_t)z * S + m) * SP + key] = acc;
+}
+
+/* Short sequences: the 16x16 tile is mostly padding and its barriers cost more than the products.
+ * Same one-work-item-per-score kernel the tiled path replaced, kept for S < 64. */
+__kernel void k_attn_scores_f32_small(__global const float *q, __global const float *k,
+                                      __global float *scores, int S, int SP, int H, int KV, int D) {
+    const int key = get_global_id(0), m = get_global_id(1), z = get_global_id(2);
+    if (key >= S || m >= S) return;
+    const int batch = z / H, h = z % H, kv = h * KV / H;
+    const __global float *qp = q + ((size_t)(batch * S + m) * H + h) * D;
+    const __global float *kp = k + ((size_t)(batch * S + key) * KV + kv) * D;
+    float acc = 0.f;
+    for (int d = 0; d < D; d += 4) {
+        const float4 a = *(__global const float4 *)(qp + d);
+        const float4 b = *(__global const float4 *)(kp + d);
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    scores[((size_t)z * S + m) * SP + key] = acc;
+}
+
+/* In-place scores -> probabilities, one work item per (batch, head, query). */
+__kernel void k_attn_softmax_f32(__global float *p, __global const uchar *valid, int S, int SP,
+                                 int H, int window) {
+    const int m = get_global_id(0), z = get_global_id(1);
+    if (m >= S) return;
+    const int batch = z / H;
+    const int row = batch * S + m;
+    const int active = !valid || valid[row];
+    const int lo = (window > 0 && m - window > 0) ? m - window : 0;
+    const int hi = (window > 0 && m + window + 1 < S) ? m + window + 1 : S;
+    __global float *pp = p + ((size_t)z * S + m) * SP;
+    if (!active) {
+        for (int j = 0; j < S; j++) pp[j] = 0.f;
+        return;
+    }
+    float mx = -3.0e38f;
+    for (int j = lo; j < hi; j++)
+        if (!valid || valid[batch * S + j]) mx = fmax(mx, pp[j]);
+    float sum = 0.f;
+    for (int j = lo; j < hi; j++)
+        if (!valid || valid[batch * S + j]) sum += exp(pp[j] - mx);
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    for (int j = 0; j < S; j++) {
+        const int vis = j >= lo && j < hi && (!valid || valid[batch * S + j]);
+        pp[j] = vis ? exp(pp[j] - mx) * inv : 0.f;
+    }
+}
+
+/* P [S, SP] x V [S, KV, D] -> context [S, H, D], one work item per (feature, query, head).
+ * A 16x16 SLM tile and a four-feature vector form were both tried and neither beat this on the N100
+ * (121 ms either way, against 111 ms for a fresh run of this one); V is already coalesced along the
+ * feature axis, so the scalar form is kept. */
+__kernel void k_attn_ctx_f32(__global const float *p, __global const float *v,
+                             __global float *ctx, int S, int SP, int H, int KV, int D) {
+    const int d = get_global_id(0), m = get_global_id(1), z = get_global_id(2);
+    if (d >= D || m >= S) return;
+    const int batch = z / H, h = z % H, kv = h * KV / H;
+    const __global float *pp = p + ((size_t)z * S + m) * SP;
+    const __global float *vp = v + ((size_t)batch * S * KV + kv) * D + d;
+    float acc = 0.f;
+    for (int key = 0; key < S; key++) acc += pp[key] * vp[(size_t)key * KV * D];
+    ctx[((size_t)(batch * S + m) * H + h) * D + d] = acc;
+}
+
+#endif /* E2_NO_DPAS */
 /* ------------------------------------------------------------------ gated-MLP / PLE epilogue
  * gate = gelu(gate) * up (or * this layer's PLE slice), then quantize the result: it is the input of
  * the next projection, so the elementwise product and the activation quantization are one pass. Four
@@ -2046,6 +2153,7 @@ __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_vattn_packv(
  * from the (max, sum) pair this kernel writes per block. From there the context is the usual
  * asc * (P . V) with P stored unbiased in [0, 127], so the i8 x u8 product needs no zero-point
  * correction at all and k_vattn_ctx has no bsq term. */
+#ifndef E2_NO_DPAS
 __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_vattn_psoft(
     __global const uchar *wd, __global const float *wsc, __global const int *bsq,
     __global const uchar *qa, __global const float *asc, __global uchar *p,
@@ -2314,6 +2422,7 @@ __attribute__((intel_reqd_sub_group_size(8))) __kernel void k_vattn_scores(
  * within noise. What is left is the score row's DRAM access pattern - the row's 128-key blocks are
  * a whole padded row apart in the layout the scores kernel's coalesced store needs - and that is
  * therefore where the remaining time is (see engine/README.md, *Vision*). */
+#endif /* E2_NO_DPAS */
 __attribute__((intel_reqd_sub_group_size(32))) __kernel void k_vattn_softmax(
     __global const float *sc, __global const float *bmax, __global uchar *p, __global float *asc,
     int M, int N, int ypitch, int slen, int nb) {

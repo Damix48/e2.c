@@ -154,6 +154,7 @@ target_include_directories(e2_test_pre PRIVATE src)
 # it off explicitly). The kernels are compiled to SPIR-V at build time rather than at startup, which
 # is why ocloc is required: the engine then ships one binary and pays no JIT at load.
 option(E2_WITH_GPU "Build the Intel GPU (Level Zero) backend" ON)
+option(E2_GPU_NO_XMX "Experimental text-only Intel GPU path for GPUs without XMX (DP4A + f32 attention)" OFF)
 if(E2_WITH_GPU)
   find_path(E2_ZE_INC level_zero/ze_api.h)
   find_library(E2_ZE_LIB ze_loader)
@@ -177,13 +178,19 @@ if(E2_WITH_GPU)
       endif()
     endif()
 
+    set(E2_GPU_CL_OPTS "-cl-std=CL1.2 -cl-mad-enable -cl-fast-relaxed-math -I${CMAKE_CURRENT_SOURCE_DIR}/src/gpu")
+    if(E2_GPU_NO_XMX)
+      # Xe-LP has no XMX. CL3.0 gives it dot(), and the guards drop every DPAS kernel.
+      set(E2_GPU_CL_OPTS "-cl-std=CL3.0 -DE2_NO_DPAS -cl-mad-enable -cl-fast-relaxed-math -I${CMAKE_CURRENT_SOURCE_DIR}/src/gpu")
+      message(STATUS "e2: experimental no-XMX Intel GPU path (text only; DP4A projections + f32 attention)")
+    endif()
     set(E2_KERNEL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/kernels/e2.cl)
     set(E2_SPV_DIR ${CMAKE_CURRENT_BINARY_DIR}/spirv)
     set(E2_SPV ${E2_SPV_DIR}/e2.spv)
     add_custom_command(OUTPUT ${E2_SPV}
       COMMAND ${CMAKE_COMMAND} -E make_directory ${E2_SPV_DIR}
       COMMAND ${E2_OCLOC} compile -file ${E2_KERNEL_SRC} -device ${E2_GPU_DEVICE}
-              -options "-cl-std=CL1.2 -cl-mad-enable -cl-fast-relaxed-math -I${CMAKE_CURRENT_SOURCE_DIR}/src/gpu"
+              -options "${E2_GPU_CL_OPTS}"
               -out_dir ${E2_SPV_DIR} -output e2
               -output_no_suffix
       DEPENDS ${E2_KERNEL_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/e2_tile.h
@@ -203,6 +210,12 @@ if(E2_WITH_GPU)
     add_executable(e2_test_gpu_text tests/test_gpu_text.c)
     target_link_libraries(e2_test_gpu_text PRIVATE e2_gpu e2)
     target_include_directories(e2_test_gpu_text PRIVATE src)
+    if(E2_GPU_NO_XMX)
+      target_compile_definitions(e2_gpu PRIVATE E2_GPU_NO_XMX=1)
+      # The no-XMX path is text-only and its 32x196 batch exceeds the 30 s GPU wait; validate the
+      # two single-call cases, not the batch section.
+      target_compile_definitions(e2_test_gpu_text PRIVATE E2_GPU_TEST_SINGLE=1)
+    endif()
 
     add_executable(e2_test_gpu_image tests/test_gpu_image.c)
     target_link_libraries(e2_test_gpu_image PRIVATE e2_gpu e2)
@@ -439,6 +452,17 @@ if(BUILD_TESTING)
       add_test(NAME gpu_soak COMMAND e2_test_gpu_soak "${E2_MODEL_DIR}" "${E2_FIXTURE_DIR}" 2)
     endif()
   endif()
+endif()
+
+# The experimental no-XMX build is text-only. Keep its single-call text test runnable and disable
+# the DPAS/vision/audio GPU tests that the module does not carry.
+if(E2_GPU_NO_XMX)
+  get_property(e2_tests DIRECTORY PROPERTY TESTS)
+  foreach(test IN LISTS e2_tests)
+    if(test MATCHES "^gpu_" AND NOT test STREQUAL "gpu_text")
+      set_tests_properties(${test} PROPERTIES DISABLED TRUE)
+    endif()
+  endforeach()
 endif()
 
 # A stuck device must not hang CTest indefinitely, including checkpoint-free GPU checks.

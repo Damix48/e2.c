@@ -12,7 +12,13 @@
 #include "int8.h"
 #include "kernels.h"
 
-#define MR E2_I8_MR
+/* Tokens per pass. Deliberately not E2_I8_MR (8): this kernel keeps two live YMM per token (the
+ * int32 accumulator and the float one across blocks) *and* the per-token |a| and sign temporaries,
+ * so 8 tokens over-subscribes the 16-register file. Measured on 64x512x2048, one P-core:
+ * MR=8 57.8, MR=6 64.6, MR=4 79.1, MR=2 78.8 GMAC/s. The VNNI kernel keeps 8 because vpdpbusd needs
+ * no |a|/sign temporaries (2 YMM per token, exactly 16). The caller's padding to E2_I8_MR is a
+ * separate concern: this kernel walks 4 at a time and its tail loop takes whatever is left. */
+#define MR 4
 #define NQ4 (E2_I8_BLOCK / 4)
 
 /* 4 int8 MACs per 32-bit lane, 8 rows at a time, without saturation: |a| in the unsigned position

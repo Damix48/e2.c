@@ -111,9 +111,14 @@ void e2_q8w_free(e2_q8w *q);
  * - the attention's context product uses K = keys - zero-pads the weight rows and the activation
  * rows up to the block. Every projection in the model already has a K that is a multiple of 128. */
 /* The scalar reference GEMM (int8 weights, biased int8 activations); the backends and the GPU
- * compare against it, and it is the fallback on machines without VNNI/AVX2. */
+ * compare against it, and it is what a host without AVX2/NEON runs: it needs no ISA, takes the same
+ * packed weights as the SIMD kernels, and the 8-row walk reaches ~24 GMAC/s in portable C. */
 void e2_i8_gemm_scalar(float *y, const int8_t *qa, const float *a_scales, const e2_q8w *w,
                        int M, int N, int n0, int n1);
+/* The portable activation quantizer, same contract as e2_quantize_blocks_avx2 (kernels.h). The
+ * scalar backend installs it, which is what makes an int8 path possible without any ISA. */
+void e2_quantize_blocks_scalar(int8_t *out, float *scales, const float *x, int M, int K, float lo,
+                               float hi);
 
 /* Packed-operand int8 GEMM shared by the attention of both towers:
  *

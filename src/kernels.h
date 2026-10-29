@@ -80,6 +80,11 @@ extern void (*e2_sgemm_nn_range)(float *C, int ldc, const float *A, int lda, con
 void e2_sgemm_nn_range_scalar(float *C, int ldc, const float *A, int lda, const float *B, int ldb,
                               int M, int N, int K, int m0, int m1);
 
+/* The scalar SiLU/GLU. In activations.c, which is compiled without -ffast-math: the reciprocal must
+ * be a real division, or the vectorised and scalar halves of the same loop disagree by 1e-4. */
+void e2_silu_scalar(float *x, size_t n);
+void e2_glu_scalar(float *a, const float *b, size_t n);
+
 /* Select the best backend for this CPU (AVX2/FMA if available, else scalar). Call once before use.
  * E2_CPU_BACKEND=<name> downgrades the choice for an A/B; only a backend this CPU can execute is
  * accepted, so the switch can measure the AVX2 kernels on a VNNI machine but never invent an ISA. */

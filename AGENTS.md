@@ -60,7 +60,7 @@ src/e2.c                - model loading, workspace management, public entry poin
 src/model.h             - internal model layout: bf16 pointers into the mmap + f32 copies
 src/st.c                - safetensors: mmap + JSON header parser + typed tensor views
 src/q8cache.c           - packed int8 model cache: writer, reader, mmap'd index
-src/int8.c              - weight quantization at load + the scalar int8 GEMM fallback
+src/int8.c              - weight quantization at load + the portable int8 GEMM and quantizer
 src/dispatch.c          - attention precision: capabilities + per-(backend,tower) rules, one query
 src/kernels.c           - scalar reference backend + runtime backend dispatch
 src/kernels_avx2.c      - AVX2 + FMA backend (fp32)
@@ -107,7 +107,13 @@ download_models.sh      - fetch the published packed int8 models (placeholder re
 One `e2` static library carries the CPU engine; the ISA backends are separate objects selected at
 run time, the GPU backends are separate libraries (`e2_gpu`, `e2_hip`).
 
-- **generic**: pure C, no dependencies, very slow. Always compiles and is the fallback.
+- **generic**: pure C, no dependencies. Not a bf16-only fallback any more: `int8.c` carries a
+  portable int8 GEMM (24 GMAC/s single-thread here, vs 2.0 for the per-column loop it replaced) and
+  `e2_quantize_blocks_scalar`, so a host with no SIMD at all runs the int8 weights out of the packed
+  cache instead of bf16. It is still the reference every SIMD kernel is checked against. GCC
+  vectorises the portable dot 4x better than clang (same source, same CPU: 88.4 vs 22.7 GMAC/s), so
+  clang-built binaries - the Windows port included - get the slower form; see PERFORMANCE.md,
+  Attempt 27.
 - **AVX2 / AVX-512**: fp32 kernels, chosen by CPUID.
 - **AVX2 / AVX-VNNI / AVX512-VNNI**: the int8 path, picked in the same dispatch. Needs AVX2 at
   minimum on the host.
@@ -187,6 +193,11 @@ cmake --build build -j
 ```
 
 `E2_THREADS=n` pins the pool (`1` disables it), `E2_REPS=n` makes `e2_test` report the best of n runs.
+`-DE2_NATIVE=ON` builds for the machine you are on (`-march=native`/`-mcpu=native`): the hand-written
+kernels already pick their ISA at run time, but the portable ones - which are the whole engine on a host
+with no SIMD - gain 3.6x on the int8 GEMM and ~2.4x end to end under GCC (2.6x and less under clang;
+PERFORMANCE.md, Attempt 27). The binary then targets this CPU only, so it is opt-in and never the
+default build.
 The GPU test binaries take the same two arguments and skip with 77 when there is no device.
 
 # Performance Tracking

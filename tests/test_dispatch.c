@@ -60,7 +60,9 @@ int main(void) {
 
     /* ---- text: the packer amortises at 128 keys on every SIMD CPU ---------------------------- */
     expect(E2_BK_CPU_SCALAR, E2_TOWER_TEXT, 0, E2_ATTN_F32);
-    expect(E2_BK_CPU_SCALAR, E2_TOWER_TEXT, 2048, E2_ATTN_F32); /* no quantizer -> no int8 ever */
+    /* Portable C has the GEMM and the quantizer but no rule row, so the table keeps it on fp32;
+     * E2_ATTN_TEXT=i8 can still force it (checked further down). */
+    expect(E2_BK_CPU_SCALAR, E2_TOWER_TEXT, 2048, E2_ATTN_F32);
     for (int i = 0; i < n_cpu_simd; i++) {
         expect(k_cpu_simd[i], E2_TOWER_TEXT, 0, E2_ATTN_F32);
         expect(k_cpu_simd[i], E2_TOWER_TEXT, 63, E2_ATTN_F32);
@@ -114,7 +116,12 @@ int main(void) {
     }
 
     /* ---- the capability bitmask is the other half of the split ------------------------------ */
-    assert(e2_backend_caps(E2_BK_CPU_SCALAR) == 0);
+    /* the portable backend now runs the int8 weights: GEMM + quantizer, but no fused attention
+     * kernel and no fused softmax, so the image and audio towers stay fp32 by capability. */
+    assert((e2_backend_caps(E2_BK_CPU_SCALAR) & (E2_CAP_GEMM_I8 | E2_CAP_QUANT_I8)) ==
+           (E2_CAP_GEMM_I8 | E2_CAP_QUANT_I8));
+    assert(!(e2_backend_caps(E2_BK_CPU_SCALAR) & E2_CAP_ATTN_I8_FUSED));
+    assert(!(e2_backend_caps(E2_BK_CPU_SCALAR) & E2_CAP_SOFTMAX_Q_I8));
     for (int i = 0; i < n_cpu_simd; i++) {
         const unsigned caps = e2_backend_caps(k_cpu_simd[i]);
         assert(caps & (E2_CAP_GEMM_I8 | E2_CAP_QUANT_I8 | E2_CAP_SOFTMAX_Q_I8));
@@ -147,7 +154,7 @@ int main(void) {
     setenv("E2_ATTN_TEXT", "i8", 1);
     e2_attn_env_reload();
     expect(E2_BK_CPU_VNNI, E2_TOWER_TEXT, 0, E2_ATTN_I8);    /* the override drops the length gate */
-    expect(E2_BK_CPU_SCALAR, E2_TOWER_TEXT, 0, E2_ATTN_F32); /* ...but not the capability */
+    expect(E2_BK_CPU_SCALAR, E2_TOWER_TEXT, 0, E2_ATTN_I8); /* the portable kernel can do it */
 
     setenv("E2_ATTN_TEXT", "f32", 1);
     e2_attn_env_reload();
@@ -268,7 +275,8 @@ int main(void) {
     setenv("E2_CPU_BACKEND", "scalar", 1);
     e2_cpu_init();
     assert(e2_cpu_backend() == E2_BK_CPU_SCALAR);
-    assert(e2_i8_quantize == NULL); /* so the model loads as bf16, which is what the switch is for */
+    /* the portable row has both halves of the int8 path, so the model loads int8 weights even here */
+    assert(e2_i8_gemm != NULL && e2_i8_quantize != NULL);
     /* ...and no stale kernel may survive from the best row that was selected first */
     assert(e2_i8_attn_gemm == NULL && e2_softmax_quant_i8 == NULL);
     assert(e2_attn_pick(e2_cpu_backend(), E2_TOWER_TEXT, 2048) == E2_ATTN_F32);

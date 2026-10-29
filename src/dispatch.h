@@ -13,7 +13,7 @@
 #define E2_DISPATCH_H
 
 typedef enum {
-    E2_BK_CPU_SCALAR = 0, /* generic C: no quantizer, so no int8 anywhere */
+    E2_BK_CPU_SCALAR = 0, /* generic C: int8 GEMM + quantizer, no fused attention kernel */
     E2_BK_CPU_AVX2,       /* AVX2 int8 (vpmaddubsw); AVX-512 without VNNI lands here too */
     E2_BK_CPU_VNNI,       /* AVX-VNNI: 256-bit vpdpbusd */
     E2_BK_CPU_AVX512,     /* AVX512-VNNI: 512-bit vpdpbusd */

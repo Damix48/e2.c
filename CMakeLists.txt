@@ -14,14 +14,43 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 add_compile_options(-O3 -fno-math-errno -Wall -Wextra -Wno-unused-parameter)
 include(CTest)
+
+# Building for the machine you are on. The hand-written kernels pick their ISA at run time, but the
+# portable ones (the scalar int8 GEMM, the fp32 GEMM, the elementwise loops) are compiled at the
+# baseline, and on a scalar-only host they are the whole engine: measured 24.3 -> 88.9 GMAC/s on the
+# int8 GEMM and 2.3x end to end with this on. The binary then runs on this CPU only, which is why it
+# is opt-in and not the default.
+option(E2_NATIVE "Build for this host only (-march/-mcpu=native): faster portable kernels, no portability" OFF)
+if(E2_NATIVE)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+      add_compile_options(-march=native)
+    else()
+      add_compile_options(-mcpu=native)
+    endif()
+    message(STATUS "e2: E2_NATIVE is on - this binary targets this CPU only")
+  else()
+    message(WARNING "e2: E2_NATIVE is only implemented for GCC and Clang; ignored")
+  endif()
+endif()
+
 # The SIMD kernels are hand-vectorized, but everything around them (attention value accumulation,
 # gated-MLP elementwise products, residual adds, PLE scaling) is plain loops over S x hidden and
 # benefits from the auto-vectorizer; -fno-tree-vectorize left those 4-8x slower than they need to be.
 
 set(E2_SOURCES src/st.c src/kernels.c src/dispatch.c src/int8.c src/q8cache.c src/e2.c src/text.c src/vision.c src/audio.c src/threads.c
-               src/tokenizer.c src/imageproc.c src/png.c src/imagedec.c src/validation.c src/audioproc.c)
+               src/tokenizer.c src/imageproc.c src/png.c src/imagedec.c src/validation.c src/audioproc.c
+               src/activations.c)
 # Input/output validation must keep IEEE finite-value checks real.
 set_source_files_properties(src/validation.c src/audioproc.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+# The scalar SiLU/GLU must round like the SIMD ones: -ffast-math lets GCC turn the reciprocal into
+# rcpss (12-bit mantissa), a 1e-4 relative error that moved the audio fixture from 0.9996 to 0.9982
+# (the AVX2 path divides with divps and cannot be approximated). Only activations.c gets the flag:
+# taking it off kernels.c costs 17 % on the aarch64 NEON path and 3.8x on the bf16 GEMMs, because
+# -ffast-math is what lets the compiler vectorise their reductions. int8.c keeps it too - its
+# reciprocal is one scale per 128-element block, a sub-LSB quantizer shift, and taking it off changes
+# 106,860 of the 410 MB the cache writer emits, which would make the published .e8cq non-reproducible.
+set_source_files_properties(src/activations.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
 
 # x86-64: AVX2/FMA backend compiled with its own flags, and an AVX-512 backend on top
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
@@ -316,7 +345,7 @@ if(NOT WIN32)
 endif()
 foreach(name softmax text_attention text_batch lifecycle q8cache validation audio_load
              st audio_kernels tokenizer_boundary png_transparency threads model_load audio_reference cpu_backends audioproc
-             dispatch)
+             dispatch scalar_kernels)
   add_executable(e2_test_${name} tests/test_${name}.c)
   target_link_libraries(e2_test_${name} PRIVATE e2)
   target_include_directories(e2_test_${name} PRIVATE src)
@@ -379,6 +408,7 @@ if(BUILD_TESTING)
   add_test(NAME int8 COMMAND e2_test_int8)
   set_tests_properties(int8 PROPERTIES SKIP_RETURN_CODE 77)
   add_test(NAME dispatch COMMAND e2_test_dispatch)
+  add_test(NAME scalar_kernels COMMAND e2_test_scalar_kernels)
   add_test(NAME metrics COMMAND e2_test_metrics)
   if(UNIX)
     add_test(NAME artifacts COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_artifacts.sh" "${CMAKE_CURRENT_SOURCE_DIR}")

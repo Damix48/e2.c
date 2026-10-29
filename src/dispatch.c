@@ -13,7 +13,10 @@
 #define E2_CPU_I8_CAPS (E2_CAP_GEMM_I8 | E2_CAP_QUANT_I8 | E2_CAP_SOFTMAX_Q_I8)
 
 static const unsigned k_caps[E2_BK_COUNT] = {
-    [E2_BK_CPU_SCALAR] = 0,
+    /* Portable C has the int8 GEMM and the quantizer, so it runs the int8 weights, but no fused
+     * attention kernel and no fused softmax: text attention stays fp32 unless E2_ATTN_TEXT forces
+     * it, image attention stays fp32 because that one needs the packed-operand kernel. */
+    [E2_BK_CPU_SCALAR] = E2_CAP_GEMM_I8 | E2_CAP_QUANT_I8,
     /* AVX2 has the quantizer and the fused softmax, but no maddubs attention kernel: attention on
      * images stays fp32 there, which is a capability gap rather than a tuning choice. */
     [E2_BK_CPU_AVX2] = E2_CPU_I8_CAPS,

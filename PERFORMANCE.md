@@ -1362,6 +1362,196 @@ Key-blocking addresses neither. What the table does show is the actual gap: the 
 65.8 GMAC/s where the weight GEMM runs at 229.4, because the logits product is 16 k-quads deep with a
 4-row tile - the accumulator setup is not amortised, exactly the second bullet below.
 
+### Attempt 25: make the portable backend a real int8 backend (ACCEPTED, 6.8x on a host with no SIMD)
+
+Where Attempts 20-24 gave aarch64 an int8 path, every other host without AVX2 had none at all: the
+`scalar` row installed `e2_i8_quantize = NULL`, so `m->use_int8` was false and the towers ran the bf16
+GEMMs (`scalar_gemm_nt`, a per-element bf16 conversion at 2.7 GMAC/s) while the attention products went
+through `e2_sgemm_nn_range_scalar`, a naive i-j-k with a strided B read (0.4 GMAC/s on the 64x512x2048
+weight shape - one cache line per MAC). Two kernels and one capability bit change that.
+
+*Portable int8 GEMM (`int8.c`, packed layout, no format change).* The weight pack interleaves 8 output
+rows into one 32-byte quad, which is what AVX2/NEON want and what portable C cannot transpose: a
+straight walk is 8 independent 4-byte dots per quad, 7.8 GMAC/s. The kernel now transposes one
+`8 columns x 128 k` block into a 1 KB stack tile (once per block, reused by every token) and runs eight
+contiguous 128-byte dots, which the compiler vectorises with the baseline ISA: **24.3 GMAC/s**, 12x the
+per-column form, bit-identical results (the k loop is exact int32), which is what keeps it usable as the
+reference the SIMD kernels are checked against.
+
+*Portable quantizer (`e2_quantize_blocks_scalar`).* Same contract as the AVX2 one: `amax/127`, round to
+nearest, saturate to +-127, store biased by +128, clamp inside the block. This is what `install_i8_scalar`
+installs, so the scalar row becomes a real backend: `E2_CAP_GEMM_I8 | E2_CAP_QUANT_I8`, no fused
+attention kernel and no fused softmax, so text/image attention stay fp32 unless `E2_ATTN_TEXT=i8` forces
+it. A host with no SIMD now loads the 410 MB packed cache instead of the 1.4 GB checkpoint.
+
+*Blocked scalar f32 GEMM (`e2_sgemm_nn_range_scalar`).* k-outer, four rows of C at a time, so a row of B
+is read once and the inner loop is a map (`c[n] += v*w[n]`) instead of a reduction. Every C element still
+accumulates over k in order, so the result is bit-identical to the old form: 0.4 -> **17.8 GMAC/s**.
+
+Kernel-level, one P-core pinned, best of 10 (`e2_kernel_bench cpu`):
+
+| scalar kernel | before | after |
+| :-- | --: | --: |
+| int8 weight GEMM, 64x2048x512 | 2.0 GMAC/s | **24.3** (12.2x) |
+| f32 GEMM, 64x2048x512 | 0.4 GMAC/s | **17.8** (45x) |
+| activation quantizer | - (NULL) | ~600 Melem/s |
+
+End to end on the same machine, `E2_THREADS=1` pinned, best of 3 (run-to-run spread ~1.4 %), against
+the bf16 path that a scalar-only host used to run (`E2_INT8=0`):
+
+| workload | bf16 (before) | portable int8 (after) | speedup |
+| :-- | --: | --: | --: |
+| 15-token query | 710.9 ms | **105.4 ms** | 6.8x |
+| 196-token document | 9348.6 ms | **1417.2 ms** | 6.6x |
+
+Fidelity moves as it must when the arithmetic changes: bf16 is `cos=1.000000` against the fixtures (it
+*is* the reference), int8 is 0.999789 / 0.999691, the same band as AVX2 (0.999788 / 0.999621) and above
+the 0.999 bar. Vision and audio were checked too: image 0.999824, image+caption 0.999656, text+audio
+0.999641 on the scalar backend, all against the same fixtures. Load from the checkpoint is 0.72 s
+(quantising the text tower); from the cache it is 0.01 s.
+
+**The audio fixture caught a real bug on the way.** With the int8 path enabled the scalar backend first
+scored 0.9982 on text+audio, below the bar, while AVX2 scored 0.9996. Bisecting one fp32 kernel at a
+time showed the whole gap was `silu`: swapping in the AVX2 `silu` alone moved the cosine to 0.999646.
+The cause was not the kernel's arithmetic but `-ffast-math`, which let GCC replace the reciprocal in
+`1.0f/(1.0f + expf(-x))` with `rcpps` (12-bit mantissa, ~1e-4 relative) in the vectorised path while the
+scalar tail kept `divss` - a reference kernel with an accuracy bug, on every backend that uses the scalar
+vtable (which includes aarch64, since the elementwise vtable stays scalar there). `kernels.c` and
+`int8.c` are now compiled with `-fno-fast-math` (the same treatment `validation.c`/`audioproc.c` already
+had), which costs the activation quantizer 2x (1198 -> ~600 Melem/s, ~7 % of a scalar GEMM) and buys back
+the audio fixture: 0.9982 -> **0.999641**. The audio tower is also worth remembering as a sensitivity
+amplifier: 1e-5 relative noise on its PCM input moves its cosine by 1e-3, so its 0.999 bar has very
+little headroom for any implementation difference.
+
+`tests/test_scalar_kernels.c` pins all three kernels against independent references: the blocked f32
+GEMM against the naive i-j-k over padded strides and sub-ranges, the int8 GEMM against the per-column
+form over non-8-aligned column ranges, a K that is not a block multiple and a clamped tensor (plus
+chunked calls, which must be bit-identical), and the quantizer against the documented scheme.
+
+### Attempt 26: the AVX2 int8 kernel was spilling registers (ACCEPTED, 1.3x on every pre-VNNI x86)
+
+`kernels_i8_avx2.c` walked `E2_I8_MR` (8) tokens per pass, the same blocking the VNNI kernel uses.
+That is one register too many: the AVX2 path keeps two live YMM per token (int32 accumulator through
+the block, float across blocks) *and* the per-token `|a|`/sign temporaries that `vpmaddubsw` needs and
+`vpdpbusd` does not, so 8 tokens over-subscribe the 16-register file and the compiler spills.
+Measured on 64x512x2048, one P-core pinned, best of 10:
+
+| MR | 8 | 6 | 4 | 2 |
+| :-- | --: | --: | --: | --: |
+| GMAC/s | 57.8 | 64.6 | **79.1** | 78.8 |
+
+The kernel now uses its own `MR 4`; the VNNI kernel keeps 8 (it measures 244.3 at 8, 203.1 at 4, so
+the two blockings genuinely differ). Callers still pad tokens to `E2_I8_MR` - that is a padding unit,
+not the kernel's blocking, and the kernel's tail loop takes whatever is left.
+
+**It is a trade-off, and the N100 shows the other side.** Gracemont wants the opposite blocking:
+16.0 GMAC/s at MR=4 against **19.1 at MR=8** (interleaved A/B, cool-down separated, three rounds
+each, same binary pair). The likely reason is that the narrow core is load-bound rather than
+register-bound - MR=8 halves the weight-quad loads per token - while the wide core spills. MR=4 is
+kept because the machines that actually select this kernel are pre-VNNI big cores (Haswell..Zen 3),
+which behave like the Arrow Lake P-core, and the N100 has AVX-VNNI so it never runs this kernel
+outside a forced A/B. If a Gracemont-class target without VNNI (Jasper Lake, Elkhart Lake) ever
+matters more than those, MR=8 is the one-line change back.
+
+End to end, `E2_CPU_BACKEND=avx2`, `E2_THREADS=1`, pinned, best of 3:
+
+| workload | MR=8 | MR=4 | |
+| :-- | --: | --: | --: |
+| 15-token query | 43.9 ms | **35.8 ms** | 1.23x |
+| 196-token document | 592.1 ms | **452.2 ms** | 1.31x |
+
+Fidelity is unchanged, to the last digit (0.999788 / 0.999621 on the text fixtures - the blocking
+changes, the per-token accumulation order does not), and `test_int8`'s cross-check of the AVX2 kernel
+against the float reference still passes.
+
+**A correction to Attempt 25's aside.** I wrote that a `-march=native` build of the portable kernel
+"beats the hand-written AVX2 kernel" (84.6 vs 57.2 GMAC/s). At the same ISA that is false: compiled
+with `-mavx2 -mfma` the portable kernel does 40.6 GMAC/s, i.e. the hand-written AVX2 kernel was
+already 1.4x ahead. What `-march=native` had found was `vpdpbssd` (AVX-VNNI-INT8), which Arrow Lake
+has, the AVX2 kernel is not allowed to use, and this host does not need (its AVX-VNNI path runs at
+244 GMAC/s). The lesson is the one in HARDWARE.md: name the ISA a number came from.
+
+### Attempt 27: `-DE2_NATIVE=ON` (ACCEPTED as an opt-in build option, 2.4x on the portable backend)
+
+The portable kernels are compiled at the baseline ISA, and it costs the hosts that need them most:
+on a machine with no SIMD they *are* the engine. `E2_NATIVE` adds `-march=native` (x86) or
+`-mcpu=native` (everything else) to the library, which is opt-in because the binary then targets one
+CPU. It only touches the portable code: the AVX2/AVX-512/NEON translation units already carry their
+own flags and still dispatch at run time.
+
+Same machine, same build type, portable backend, one P-core pinned:
+
+| | baseline | `E2_NATIVE=ON` |
+| :-- | --: | --: |
+| int8 GEMM, 64x512x2048 | 24.4 GMAC/s | **87.4** (3.6x) |
+| f32 GEMM, 64x512x2048 | 17.9 GMAC/s | 20.3 (1.1x) |
+| 15-token query, 1 thread | 104.5 ms | **41.9 ms** (2.5x) |
+| 196-token document, 1 thread | 1417.2 ms | **616.4 ms** (2.3x) |
+
+The flag is worth a lot more under GCC than under clang, because they vectorise the portable dot very
+differently (same source, same CPU, int8 GEMM 64x512x2048):
+
+| compiler | baseline | `E2_NATIVE=ON` |
+| :-- | --: | --: |
+| GCC 15.2 | 24.3 GMAC/s | **88.4** (3.6x) |
+| clang 23 | 8.6 GMAC/s | 22.7 (2.6x) |
+
+Both gain, but clang's vectorised form is 4x behind GCC's `vpdpbssd` and its baseline is 3x behind.
+That is a known limitation, not a regression: clang's SLP does not see this dot (12 vector
+instructions from GCC, 4 from clang, same source), so the portable backend runs ~2.6x under the
+clang-built binaries - which includes the Windows port. Teaching it the loop is the next item on the
+portable path; it is documented here so nobody re-measures it as a new discovery. On aarch64 the same loop is widening
+`smlal` at the baseline and `-mcpu=native` lets it use `sdot` where the core has it (not measured here:
+no aarch64 host this session). All 23 ctest targets pass with the flag on, and the fixtures are
+unchanged (0.999813 / 0.999685).
+
+### Attempt 28: the portable backend on real hardware - Ampere A1 and N100 (ACCEPTED, 2.0x there)
+
+Attempt 25 was measured on one x86 laptop. This is the same tree built and run on the two other
+machines in HARDWARE.md, with their own models (the A1 has the 1.5 GB checkpoint, the N100 the 410 MB
+packed cache). Build: gcc 15.2 on Ubuntu 26.04 (aarch64) and gcc 14.2 on Debian 12 (x86-64), release,
+`sleep`-separated runs because the N100 throttles back-to-back.
+
+Ampere A1 / Neoverse-N1, 2 vCPU, `E2_THREADS=2`, best of 3:
+
+| | bf16 (what a scalar-only host used to run) | portable int8 | NEON int8 (default) |
+| :-- | --: | --: | --: |
+| 15-token query | 369.7 ms | **179.8 ms** (2.1x) | 30.8 ms |
+| 196-token document | 4670.3 ms | **2341.6 ms** (2.0x) | 387.4 ms |
+
+So the win there is 2x, not the 6.6x of the laptop: the A1's bf16 path was already vectorised by gcc
+(NEON is in the aarch64 baseline), so the fallback was bad but not catastrophic. Fidelity moves the
+same way (0.999776 / 0.999670 against 1.000000 for bf16) and stays above the bar.
+
+Kernel level, one thread, 64x512x2048 - the ordering the whole design assumes:
+
+| machine | NEON / VNNI (best) | AVX2 kernel | portable int8 | portable sgemm |
+| :-- | --: | --: | --: | --: |
+| Ampere A1 (N1, 2.5 GHz) | NEON 51.5 | - | 6.5 | 9.7 |
+| N100 (Gracemont, 4C) | VNNI 38.9 | **16.0** | 9.7 | 8.9 |
+| Arrow Lake (P-core) | VNNI 240.6 | 79.0 | 24.3 | 17.9 |
+
+The hand-written kernel wins on every machine that has one (1.6x over portable on the N100, 8x on the
+A1), which is the answer to "why not just build portable C with `-march=native`". The N100 is also
+where Attempt 26's blocking change turns out to be a trade-off rather than a win: that core prefers
+MR=8 by 19 %, and Attempt 26 records why MR=4 is still the default. Note that the N100 has AVX-VNNI,
+so like the laptop it only reaches the AVX2 kernel with `E2_CPU_BACKEND=avx2`.
+
+End to end on the N100, 4 threads, packed cache: VNNI **23.5 / 321.5 ms**, portable int8 90.4 /
+1200.0 ms, AVX2 46.7 / 630.9 ms (query / document). All three pass the fixtures (0.999772 / 0.999580
+on VNNI and AVX2, 0.999758 / 0.999635 portable).
+
+Test suites: **27/27** on the A1 (model present, so the fixture tests run), **16/16** on the N100 and
+**23/23** on the laptop. The one thing the remote runs needed was a git checkout: `test_artifacts.sh`
+drives the GPU release gate, and the gate records `git rev-parse HEAD` in its evidence log under
+`set -e`, so a tree copied without `.git` fails that test for a reason that has nothing to do with the
+engine (the copy in `~/e2-arch` was tarred across; `git init` + one commit made it pass).
+
+Nothing here needed a code change; the two things it did change are the scope of the `-ffast-math`
+fix (see Attempt 25's amendment) and the confidence that the portable kernel's 24 GMAC/s on the
+laptop is not an x86 artifact - it is 6.5-9.7 GMAC/s on the two small cores, which is where it should
+be for hand-written scalar code.
+
 ## Next Targets
 
 - **15-token query**: the tightest case. Pool claim + barrier (~2.5 us per region at 14 threads) is a

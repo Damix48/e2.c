@@ -258,7 +258,15 @@ e2_gpu *e2_gpu_create(e2_model *m) {
     g->layer_limit = lim ? atoi(lim) : -1;
     g->dump_dir = getenv("E2_GPU_DUMP");
     { const char *dc = getenv("E2_GPU_DUMP_CALL"); g->dump_call = dc ? atoi(dc) : 1; }
+#ifdef E2_GPU_NO_XMX
+    /* The experimental build has no DPAS kernels: DP4A projections and f32 attention are the only
+     * paths the module carries. The runtime knobs are not needed and would select absent kernels. */
+    g->gemm_dp4a = 1;
+    g->attn_f32 = 1;
+#else
     g->gemm_dp4a = getenv("E2_GPU_DP4A") != NULL;
+    g->attn_f32 = 0;
+#endif
     g->vattn_old = getenv("E2_GPU_VATTN_OLD") != NULL;
     g->only = getenv("E2_GPU_ONLY") ? atoi(getenv("E2_GPU_ONLY")) : 0;
     g->limit = getenv("E2_GPU_LIMIT") ? atoi(getenv("E2_GPU_LIMIT")) : 0;
@@ -796,7 +804,12 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
         const int base = l * E2_DS_PER_LAYER;
         const int rope = L->sliding ? 0 : 1;
         const int D = L->head_dim, H = E2_NUM_HEADS, KV = L->n_kv_heads;
+#ifdef E2_GPU_NO_XMX
+        const int f32_attn = g->attn_f32;
+        const int i8_attn = !f32_attn && e2_attn_pick(E2_BK_INTEL_GPU, E2_TOWER_TEXT, seq_len) == E2_ATTN_I8;
+#else
         const int i8_attn = e2_attn_pick(E2_BK_INTEL_GPU, E2_TOWER_TEXT, seq_len) == E2_ATTN_I8;
+#endif
         const int sup = (seq_len + 127) / 128 * 128, tile = (seq_len + 15) / 16 * 16;
         const int batches = rows / seq_len;
         void *kp = aoff_ptr(g, A_TK), *vp = aoff_ptr(g, A_TV);
@@ -850,6 +863,35 @@ static int record(e2_gpu *g, int rows, int seq_len, int from_embeds, e2_graph **
             void *ctx = aoff_ptr(g, A_CTX), *q = aoff_ptr(g, A_Q), *k = aoff_ptr(g, A_K2);
             void *v = aoff_ptr(g, A_V2);
             void *qa = aoff_ptr(g, A_QAC), *asc = aoff_ptr(g, A_QACS);
+#ifdef E2_GPU_NO_XMX
+            if (f32_attn) {
+                /* No-XMX test path: f32 products over the normed Q/K/V, then quantize the context
+                 * for the o projection. Correctness first; the CPU keeps the real path. */
+                const int zs = batches * H;
+                void *scores = aoff_ptr(g, A_TSCR);
+                if (seq_len < 64) {
+                    KERN("k_attn_scores_f32_small", (uint32_t)((seq_len + 31) / 32),
+                         (uint32_t)((seq_len + 3) / 4), (uint32_t)zs, 32, 4, 1, 8,
+                         &q, sizeof q, &k, sizeof k, &scores, sizeof scores, &seq_len, sizeof seq_len,
+                         &sup, sizeof sup, &H, sizeof H, &KV, sizeof KV, &D, sizeof D);
+                } else {
+                    KERN("k_attn_scores_f32", (uint32_t)((seq_len + 15) / 16),
+                         (uint32_t)((seq_len + 15) / 16), (uint32_t)zs, 16, 16, 1, 8,
+                         &q, sizeof q, &k, sizeof k, &scores, sizeof scores, &seq_len, sizeof seq_len,
+                         &sup, sizeof sup, &H, sizeof H, &KV, sizeof KV, &D, sizeof D);
+                }
+                KERN("k_attn_softmax_f32", (uint32_t)((seq_len + 63) / 64), (uint32_t)zs, 1, 64, 1, 1,
+                     6, &scores, sizeof scores, &valid, sizeof valid, &seq_len, sizeof seq_len,
+                     &sup, sizeof sup, &H, sizeof H, &window, sizeof window);
+                KERN("k_attn_ctx_f32", (uint32_t)((D + 63) / 64), (uint32_t)((seq_len + 3) / 4),
+                     (uint32_t)zs, 64, 4, 1, 8, &scores, sizeof scores, &v, sizeof v, &ctx,
+                     sizeof ctx, &seq_len, sizeof seq_len, &sup, sizeof sup, &H, sizeof H,
+                     &KV, sizeof KV, &D, sizeof D);
+                if (rowops(g, gr, rows, H * D, A_CTX, -1, -1, A_QAC, A_QACS, -1, -1,
+                           E2_ROW_QUANT_ONLY, 1.f, 1.f))
+                    goto fail2;
+            } else
+#endif
             if (i8_attn) {
                 const int gy = 4, one = 1, q0 = 0, nbv = sup / 128;
                 void *scores = aoff_ptr(g, A_TSCR);

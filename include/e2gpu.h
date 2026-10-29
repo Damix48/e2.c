@@ -5,6 +5,9 @@
  * Fidelity can differ.
  * Experimental: execution guards contain missing
  * progress/invalid outputs but do not establish the cause of historical intermittent failures.
+ * An experimental, default-off build (-DE2_GPU_NO_XMX=ON) targets Intel GPUs without XMX: DP4A
+ * projections and an f32 text attention fallback, text only. It is not the default backend and is
+ * slower than the CPU on the N100; see PERFORMANCE.md.
  * See PRODUCTION.md for the software gate and its limits. Scope: text (single or padded batch), vision,
  * tower, and the audio Conformer; the tokenizer, image preprocessing and audio front end stay on the
  * CPU side (they are cheap and serial).

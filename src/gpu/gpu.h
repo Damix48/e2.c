@@ -107,6 +107,7 @@ struct e2_gpu {
     int nslots;
     int vlayer_limit;     /* E2_GPU_VLAYERS: diagnostic truncation of the vision graph */
     int gemm_dp4a;        /* E2_GPU_DP4A=1: use the dp4a tiled GEMM instead of the XMX one */
+    int attn_f32;         /* experimental no-XMX build: f32 attention products */
     int vattn_old;        /* E2_GPU_VATTN_OLD=1: vision attention the pre-fusion way (A/B) */
     int layer_limit;      /* E2_GPU_LAYERS: diagnostic truncation of the graph */
     int only;             /* E2_GPU_ONLY=1: record only the embedding gather */

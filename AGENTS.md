@@ -49,6 +49,9 @@ audio up to 30 s (750 soft tokens, one per 40 ms).
   EXIF orientation applied; each codec is optional at build time.
 - Two GPU backends: Intel Level Zero (all three towers, **experimental**) and AMD HIP (text and
   vision, **built and smoke-tested on nucleus's gfx1036, not performance-validated**).
+- An **experimental, default-off** build (`-DE2_GPU_NO_XMX=ON`) targets Intel GPUs without XMX
+  (Xe-LP): DP4A projections plus an f32 text attention fallback, text only. It is slower than the
+  CPU on the N100 but leaves three cores free; see `PERFORMANCE.md`.
 
 # File Structure
 
@@ -147,8 +150,8 @@ a call site; `e2_attn_pick()` is the only place a tower asks which precision to 
 `E2_ATTN_IMAGE=f32|i8` override the table (read once, at init); the older `E2_ATTN_I8=0/1` and
 `E2_VATTN_OFF` still work as deprecated aliases.
 
-Options: `E2_WITH_GPU`, `E2_WITH_HIP`, `E2_WITH_PNG`, `E2_WITH_JPEG`, `E2_WITH_WEBP`, `E2_WITH_SNDFILE`, `E2_MODEL_DIR`,
-`E2_FIXTURE_DIR`. See [README.md](README.md#building).
+Options: `E2_WITH_GPU`, `E2_WITH_HIP`, `E2_GPU_NO_XMX`, `E2_WITH_PNG`, `E2_WITH_JPEG`, `E2_WITH_WEBP`, `E2_WITH_SNDFILE`,
+`E2_MODEL_DIR`, `E2_FIXTURE_DIR`. See [README.md](README.md#building).
 
 # Development Rules
 

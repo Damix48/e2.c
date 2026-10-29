@@ -48,3 +48,21 @@ Boundaries: OpenVINO is NNCF `INT8_SYM` weight compression, not calibrated W8A8,
 attention precision differ between the engines. Timings exclude model load and graph compilation.
 Numbers are only comparable inside one session; the laptop throttles and the iGPU's reported clock is
 not its real clock.
+
+## Standalone DP4A GEMM probe
+
+`dp4a_bench.c` and `dp4a_bench.cl` time the engine's dp4a projection kernel on a GPU without XMX and
+check it against a scalar reference. They are not part of the CMake build, so the library keeps no
+OpenCL dependency; build against the Khronos headers and the ICD loader:
+
+```bash
+cc -O2 -std=c11 -I/path/to/OpenCL-Headers -I src/gpu \
+   tools/bench/dp4a_bench.c -o /tmp/dp4a_bench \
+   -L/usr/lib/x86_64-linux-gnu -l:libOpenCL.so.1
+/tmp/dp4a_bench tools/bench/dp4a_bench.cl src/gpu 200 512 2048 10
+```
+
+On the N100's iGPU the dp4a projection GEMM measured 99-108 GMAC/s across the text shapes at 750 MHz,
+against 38.9 GMAC/s on one N100 CPU core. That short-burst rate does not survive the full model: the
+end-to-end no-XMX path is 521 ms against 338 ms on four CPU cores (PERFORMANCE.md), because the
+attention and the full weight stream dominate.

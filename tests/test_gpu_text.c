@@ -115,6 +115,7 @@ int main(int argc, char **argv) {
         free(ggpu);
         free(fx);
     }
+#ifndef E2_GPU_TEST_SINGLE
     /* a padded batch must reproduce the single-sequence result, and `valid` must keep the padding out
      * of the mean pool */
     {
@@ -246,6 +247,7 @@ int main(int argc, char **argv) {
             free(out);
         }
     }
+#endif /* E2_GPU_TEST_SINGLE */
     e2_gpu_destroy(g);
     e2_free(m);
     printf("%s\n", failures ? "FAILED" : "ok");

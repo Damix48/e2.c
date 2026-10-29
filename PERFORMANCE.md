@@ -198,7 +198,7 @@ question on.
 runs `git rev-parse HEAD` under `set -eu` and git is not installed on this host - the same failure
 mode as the arm-server, which had the `.git` directory missing instead.
 
-#### The Intel GPU backend does not build for this box, and the reason is the hardware
+#### The default Intel GPU backend does not build for this box, and the reason is the hardware
 
 It has an iGPU and a full Level Zero stack: `Alder Lake-N [UHD Graphics]`, device id **0x46D1**,
 OpenCL 3.0 NEO, 24 CUs, `intel-level-zero-gpu` 1.3.30872.22 plus `libze_loader`, and `ocloc` present.
@@ -224,9 +224,37 @@ Two independent causes, both Xe-LP:
   first point.
 
 So the backend stays Arc-class code and was validated only on an Arc 140T (0x7d51). On this box the
-CPU path is the engine, and that is what the numbers above are. Nothing was left behind: the trial
-`build-gpu/` was removed and the CPU build is untouched; `libze-dev` (1.20.6) stayed installed, which
-is the only system change made. `apt purge libze-dev` undoes it.
+CPU path is the engine, and that is what the numbers above are. The experimental no-XMX build below is
+the text-only exception. Nothing was left behind: the trial `build-gpu/` was removed and the CPU build
+is untouched; `libze-dev` (1.20.6) stayed installed, which is the only system change made.
+`apt purge libze-dev` undoes it.
+
+#### Experimental no-XMX GPU path (2026-10-29)
+
+`-DE2_GPU_NO_XMX=ON` compiles the same kernel source with `-cl-std=CL3.0 -DE2_NO_DPAS`: every DPAS
+kernel is excluded, the projections use the existing `k_gemm_tiled` dp4a path, and text attention
+falls back to f32 kernels. Text only; the vision and audio kernels are not in the module. The f32
+kernels are behind `#ifdef E2_NO_DPAS`, so the default DPAS module does not carry them. The build is
+default OFF, and the experimental build disables the non-text `gpu_*` CTest tests.
+
+Measured on the N100 with the text int8 cache, four CPU threads pinned, one text call, spaced:
+
+| workload | CPU, 4 threads | no-XMX GPU | gap |
+| :-- | --: | --: | :-- |
+| 15-token query | 23.9 ms, 390 % CPU, 0.093 core-s | 41.9 ms, 100 % CPU, 0.042 core-s | 1.75x slower, 2.2x less CPU |
+| 196-token document | 337.6 ms, 392 % CPU, 1.323 core-s | 521 ms, 100 % CPU, 0.521 core-s | 1.54x slower, 2.5x less CPU |
+
+The GPU path leaves three cores free and pins one core in the Level Zero wait; a three-hog test left
+the document time unchanged. Fidelity: cosine 0.999738 (query) and 0.999643 (document) against fp32.
+Document profile: projections 258.5 ms, scores 122.0, context 121.3, softmax 13.1, norm/rowops/gelu/
+pool 17.5. The 16x16 SLM scores tile is the accepted tuning (208.6 -> 122.0 ms); a 16x16 context tile
+and a four-feature vector context did not beat the scalar context. An int8 DP4A attention path (575
+ms) and a fused 16-query attention kernel (740 ms) were tried and rejected - attention is not
+compute-bound at these shapes, so neither the precision change nor the fusion paid.
+
+Limits: text only; batch 32x196 exceeds the 30 s GPU wait; the 6 W N100 throttles under repeated long
+calls, so the 521 ms figure is a spaced run (sustained repeats can drop to 2-4 s). The test binary
+skips the batch section in this build (`E2_GPU_TEST_SINGLE`).
 
 ### 2026-10-26 / Core Ultra 9 285H, Arc 140T (0x7d51), 14 CPU threads, int8
 

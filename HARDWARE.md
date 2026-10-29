@@ -17,7 +17,7 @@ here only so a row can be read on its own.
 | laptop (local) | Intel Core Ultra 9 285H, Arrow Lake, 16T | **AVX-VNNI** (256-bit `vpdpbusd`); no AVX-512, no AMX | Intel Arc 140T (0x7d51) | **XMX/DPAS**: `intel_sub_group_i8_u8_matrix_mad_k32`, `u8_i8_k32`, `f16_f16_k16` | CPU: `kernels_i8_vnni.c` int8 GEMM + packed-operand attention GEMM, `kernels_i8_avx2.c` fallback, `kernels_avx2.c` fp32. GPU: Level Zero `src/gpu/` with DPAS kernels | 41.4 ms |
 | nucleus | AMD Ryzen 7 9700X, Zen 5, 8C/16T, **full-width 512-bit** | **AVX512-VNNI** (zmm `vpdpbusd`) + AVX-VNNI; no `avx512_fp16` | Radeon iGPU (Granite Ridge, 2 CU, `gfx1036`) | HIP via ROCm 7.2: `v_dot4`, no MFMA/WMMA; built and smoke-tested, not performance-validated | CPU: `kernels_i8_avx512_vnni.c` (512-bit, 16 output rows per weight load, packed-attention GEMM, fused softmax+quantizer), `kernels_avx512.c` fp32. GPU: `src/gpu/hip/` text and vision | **24.9 ms** |
 | minipc | AMD Ryzen 9 7940HS, Zen 4, 8C/16T, **256-bit datapath, double-pumped** | **AVX512-VNNI** + AVX512-BF16; **no AVX-VNNI** | Radeon 780M (RDNA3, 12 CU, `gfx1103`) | RDNA3 has **WMMA**; e2's HIP kernel uses **`v_dot4`, not MFMA/WMMA**. Not built here (Windows; see below) | same AVX-512 CPU path as nucleus, plus the native Windows port (`src/win32/`) | 30.4 ms |
-| n100 | Intel N100, Alder Lake-N, 4C Gracemont, no SMT | **AVX-VNNI** (256-bit) | Intel UHD Graphics 0x46D1, Xe-LP, 24 EU | **no XMX/DPAS** in silicon | same AVX-VNNI CPU path as the laptop. The GPU backend **does not build** - see below | 329.4 ms |
+| n100 | Intel N100, Alder Lake-N, 4C Gracemont, no SMT | **AVX-VNNI** (256-bit) | Intel UHD Graphics 0x46D1, Xe-LP, 24 EU | **no XMX/DPAS** in silicon | same AVX-VNNI CPU path as the laptop. The default DPAS GPU backend **does not build**; an **experimental text-only no-XMX path** does - see below | 329.4 ms |
 | arm-server | Oracle Ampere A1 / Neoverse-N1, 2 vCPU, aarch64 | **ARMv8.2 dotprod** (`SDOT`/`UDOT`); no SVE, no i8mm | none (cloud VM) | - | CPU: `kernels_i8_neon.c` (`vdotq_s32` int8 GEMM, quantizer, packed-attention GEMM, fused softmax+quantizer), `kernels_neon.c` blocked fp32 GEMM | 380.5 ms |
 
 Thread counts differ and they matter: 6 pinned on the laptop, 8 on nucleus and minipc, 4 on the n100, 2
@@ -75,6 +75,10 @@ by `e2_cpu_init()`.
   matrix units, and whoever compiles for that device id does not accept the dot-product extension.
   The `#ifdef cl_intel_subgroup_matrix_multiply_accumulate` guard in `e2.cl` does not help, because
   ocloc defines that macro for this target while not providing the intrinsics.
+  The default DPAS backend still does not build, but `-DE2_GPU_NO_XMX=ON` compiles the module with
+  `-cl-std=CL3.0 -DE2_NO_DPAS`: dp4a projections plus an f32 text attention fallback, text only. It
+  passes the query/document fidelity cases at 42/521 ms against 24/338 ms on the CPU and leaves three
+  cores free; see PERFORMANCE.md. Batch 32x196 still exceeds the 30 s GPU wait.
 
 ## Matrix hardware none of these use
 

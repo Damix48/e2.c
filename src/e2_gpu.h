@@ -20,6 +20,11 @@ void e2_gpu_free(e2_ctx *ctx);
 int e2_gpu_gemm(e2_ctx *ctx, float *y, int ns, const uint8_t *xq, const float *xs,
                 int xss, int m, int k, const e2_qmat *w, int nb0, int nb1);
 
+/* Matrix-engine (DPAS) path: y[i] = x @ W[i]^T for several matrices sharing one
+ * activation row block, quantising x on the fly.  Returns 0 on success. */
+int e2_gpu_linear_multi(e2_ctx *ctx, const float *x, int m,
+                        const e2_linear *const *ls, float *const *ys, int n);
+
 #ifdef __cplusplus
 }
 #endif

@@ -889,3 +889,162 @@ For reference, the same rows on the CPU in the same session: e2 2.7 / 11.3 /
 1381 / 154 / 625 / 1478 / 57 / 5200 ms. So the iGPU is genuinely ~6x the CPU
 for OpenVINO, and e2 leaves that on the table because of the pipeline shape,
 not because of the hardware.
+
+---
+
+# Round 7 — Intel iGPU path: the matrix engine (DPAS) and why the pipeline shape binds
+
+Box: Intel Core Ultra 9 285H, Arc 140T iGPU (`deviceId 0x7d51`, 128 EUs,
+1 slice / 8 subslices / 16 EUs per subslice, 2.35 GHz, 30.6 GB shared DDR).
+Host is otherwise idle; every number below is from this machine unless stated.
+
+## Fresh OpenVINO GPU baseline (same run, this box)
+
+`python tools/bench_compare.py --model ~/Projects/embeddinggemma-2
+--sources ov-int8-gpu --repeat 2 --iters 3`
+
+| task | length | ov-int8@GPU ms | 1.5x target |
+|---|---:|---:|---:|
+| text | 8 | 5.6 | 3.7 |
+| text | 64 | 6.4 | 4.3 |
+| text | 128 | 7.8 | 5.2 |
+| text | 512 | 18.6 | 12.4 |
+| text | 2048 | 132.2 | 88 |
+| batch | 8x64 | 15.8 | 10.5 |
+| batch | 32x64 | 68.1 | 45.4 |
+| image | 270 tok | 258.0 | 172 |
+| audio | 54 tok | 23.0 | 15.3 |
+| video | 8 frames | 792.5 | 528 |
+
+## Hardware ceilings measured this round (all on the iGPU)
+
+| probe | rate | how |
+|---|---:|---|
+| `vpdpbusd`-class ALU (int8 mul-add, no loads) | **13 TMAC/s** | 16 accumulators, operands in registers |
+| matrix engine `dpas.8x8` int8 (K=32, 2048 MAC/instruction) | **15.8 TMAC/s** | 4 independent accumulators, tiny register footprint, ≥32 sub-groups per EU |
+| same, with one dependent chain per sub-group | 2.0 TMAC/s | DPAS latency ~150 cycles, so 1 chain per thread is 8x off peak |
+| wide-load streaming from a 16 MB working set | **966 GB/s** | `vload8` (32 B/lane), 32768 work items |
+| the same from DRAM (64 MB) | 81 GB/s | |
+| cached 4-byte/lane loads, sub-group scattered | ~420 GB/s | what the naive GEMM gets |
+
+Consequences: the machine can do ~16 TMAC/s of int8 matmul, ~1 TB/s from L2/L3,
+so a GEMM that streams `b` bytes per MAC is capped at `1 TB/s / b`.  For text
+512 (77 GMAC) the 1.5x target (12.4 ms) needs **6.3 TMAC/s effective including
+everything else**, i.e. ~40% of the DPAS peak — reachable, but only if the
+kernel gets its bytes/MAC well below 0.15.
+
+## Driving DPAS from e2 (the hard part)
+
+Three routes were tried; only one works on this stack.
+
+| route | result |
+|---|---|
+| `cl_khr_integer_dot_product` `dot()` via clang → `OpDot`/`__spirv_Dot` | **does not work.** Mixed signedness silently lowers to *unsigned x unsigned*; the signed form emits `__spirv_Dot`, which IGC 2.41 cannot link (`undefined reference to _Z11__spirv_DotDv4_cS_`). IGC has no `OpSDot`/`OpUDot` strings at all. |
+| hand-written SPIR-V `OpSubgroupMatrixMultiplyAccumulateINTEL` | **works** after dropping the `OpExtension` line: with it, the module is rejected (“extension … disabled by --spirv-ext option”) and module build flags are not forwarded by this driver; without it IGC accepts the capability and validates the operands (A element type must be int32 for K=32 on this device, operand mask must include `MatrixAPackedInt8INTEL|MatrixBPackedInt8INTEL`). |
+| OpenCL C via **ocloc** (IGC's own frontend) producing SPIR-V that Level Zero then loads | **works, and is what shipped.** The driver advertises `cl_intel_subgroup_matrix_multiply_accumulate`, ocloc emits SPIR-V with a `SubgroupSize 8` execution mode, and Level Zero's IGC build resolves the builtin. `make spv` now uses ocloc for `tools/gpu/e2_dpas.cl` and clang for the rest. |
+
+The operand layout was reverse-engineered from the hardware with a probe
+(`OpSubgroupMatrixMultiplyAccumulateINTEL` one-hot scans) and matches
+`intel_sub_group_u8_i8_matrix_mad_k32` on a subgroup-8 device:
+
+* `M = 8` rows, `N = 8` = subgroup size, `K = 32` per instruction (2048 MACs).
+* A: lane `l` holds 8 u32, component `i` = row `i`, bytes `k = 4l..4l+3`.
+* B: lane `l` holds 8 u32, component `i` = k-quad `i`, i.e. the lane's *column*
+  `l` of the weight tile.
+* C/result: lane `l` holds column `l`, components = 8 rows.
+
+That is a plain "VNNI, 4 k per 32-bit word" packing for both operands, so both
+the weight repack and the activation pack are a single 4-byte-shuffle pass (no
+2-D transpose, no scratch).
+
+## What was built
+
+`tools/gpu/e2_dpas.cl` (compiled by ocloc, checked in as `src/e2_gpu_spv.h`):
+
+| kernel | job |
+|---|---|
+| `k_pack_wq` | model weight tiles `[n/16][k/4][16][4]` → matrix-engine layout + per-column `wsum` (`atomic_add`) |
+| `k_pack_a` | f32 rows → u8 with one scale per row + matrix-engine layout |
+| `k_pack_u8` | already-quantised row-major u8 → matrix-engine layout |
+| `k_gemm_dpas` | `y[m][n] = (Σ a·b − 128·Σw) · xscale[row] · wscale[col]`, 4 row blocks × 2 column tiles per sub-group (8 tiles = 64 int accumulators) |
+
+`src/e2_gpu.c` gained `e2_gpu_linear_multi()`: quantise the activation row block
+once (per-row scale, CPU, pooled), pack it on the device, then run every linear
+of the list.  Weight packing is done on the CPU straight into shared USM on
+first use (one pass over the matrix, no upload, no extra kernel).
+
+## GEMM results (m=512, k=512, n=2048 unless noted; 20 launches per submission)
+
+| variant | registers/spill | GMAC/s |
+|---|---|---:|
+| previous plain kernel (`gemm_4x4`, imad byte MACs) | — | 1 050 |
+| DPAS, unpacked operands (8+8 narrow loads per DPAS) | 127 | 1 060 |
+| DPAS, packed operands, R1×C1 (2 acc/tile) | 127 | 2 295 |
+| DPAS, packed, R2×C2 | 127, spills | 3 477 |
+| **DPAS, packed, R4×C2 (shipped)** | 127 | **4 640** (5 373 at k=768) |
+| DPAS, packed, R2×C4 | 127 | 3 803 |
+| DPAS, packed, R4×C4 / R8×C2 / R2×C8 | 127, heavy spill | 240-926 |
+
+Split of the shipped kernel: loads alone 4 560 GMAC/s, DPAS alone 6 540 GMAC/s,
+both 4 640 — they now overlap, and the kernel is limited by *both* the L2
+traffic (0.094 bytes/MAC, i.e. 435 GB/s at 4.6 TMAC/s) and by occupancy
+(127 GRF/thread ⇒ ~1 thread per EU, so the DPAS latency is only hidden by the
+8 in-flight accumulators).
+
+What did not work:
+
+| try | outcome |
+|---|---|
+| `-cl-64/128/256-GRF-per-thread` to raise occupancy | ocloc rejects the option; the Level Zero `pBuildFlags` path does not forward build flags to IGC at all (proved with `-cl-std=CL9.9`, silently accepted) |
+| trusting `tools/gpu_probe`-style timings with one submission per launch | every “GMAC/s” number before this round was ~4x too low: one submit+host-sync costs **0.38 ms** on this driver. All measurements above submit 20 launches and divide. |
+| bigger tiles (R4×C4, R8×C2, R2×C8) | 128 accumulator registers + operands = spills; 3-20x slower |
+| more independent DPAS chains at constant tile | saturated: 2 chains 5.3, 4 chains 5.6, 8 chains 6.5 TMAC/s (DPAS-only) |
+
+## End-to-end: the pipeline shape, not the kernel, is the binding constraint
+
+`E2_GPU_DPAS=1 E2_DEVICE=gpu`, text ≈560 tokens, 218 GEMM calls:
+
+| stage | ms | per call |
+|---|---:|---:|
+| CPU per-row quantise + pack launch | 34.7 | 0.16 |
+| submit | 15.7 | 0.07 |
+| **host sync (includes the kernel)** | **82.6** | **0.38** |
+| copy y back to the CPU | 10.1 | 0.05 |
+| rest (CPU elementwise, attention, plain-path GEMMs) | ~100 | |
+
+The 0.38 ms is a *dispatch+round-trip* latency: it does not shrink when the
+kernel is faster (polling `zeEventQueryStatus` instead of the blocking wait
+changed 90 → 83 ms), and the old plain kernel pays it too.  That is why the
+previous ledger's `e2@GPU` numbers were 4-10x off OpenVINO: OpenVINO compiles
+the whole graph and submits **once per inference**, e2 submits once per GEMM.
+
+Same box, same run, ~560 tokens of text:
+
+| build | ms |
+|---|---:|
+| CPU (8 threads) | 47.7 |
+| GPU, plain kernel (previous) | 280 |
+| GPU, matrix engine (`E2_GPU_DPAS=1`) | 247 |
+
+So the kernel is 4.4x faster and the forward is 13% faster: 85% of the time is
+dispatch and copies.  `E2_GPU_DPAS` is therefore **opt-in** and off by default;
+the plain path stays the shippable GPU behaviour.
+
+## What the numbers say the plan must be
+
+1. **Device-resident tower.** One submission per forward (or per layer), all
+   activations in shared USM, no per-GEMM sync, no per-GEMM copy.  The tower is
+   ~10 kernels (embed gather, rmsnorm+quantise, rope, softmax, gelu/mul,
+   residual-add, plus the DPAS GEMM used for attention too) — the projection:
+   77 GMAC at 4.6 TMAC/s ≈ 17 ms + ~3 ms of elementwise + one 0.4 ms submit
+   ≈ **20 ms for text 512**, i.e. parity with OpenVINO (18.6).
+2. **Then the kernel has to get to ~10 TMAC/s** to reach the 1.5x goal on the
+   text rows: 0.094 → 0.045 bytes/MAC needs a 32×32 output tile per work-group
+   with both operands staged in SLM (64 KB/subslice, 4 KB per k-chunk
+   double-buffered) and the accumulators in registers.  That is the oneDNN-class
+   design; the traffic formula `bytes/MAC = (R+C)/(R·C)` plus the measured
+   1 TB/s L2 and 15.8 TMAC/s DPAS peak says ~13 TMAC/s is the ceiling for a
+   64×64 work-group tile.
+3. The small rows (text 8/64/128, audio) are weight-streaming + launch bound
+   (64 MB of text weights = 0.8 ms at 80 GB/s), which the device-resident tower
+   fixes for free.

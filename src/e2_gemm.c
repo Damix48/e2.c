@@ -719,6 +719,12 @@ void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
             linear_one(ctx, ys[i], x, m, ls[i]);
     }
 
+    /* Device path: quantise on the fly and run every GEMM of the list on the
+     * matrix engine (four times the CPU kernel's MAC rate on this iGPU). */
+    if (ctx->device == E2_DEVICE_GPU && ctx->gpu &&
+        e2_gpu_linear_multi(ctx, x, m, ls, ys, n) == 0)
+        return;
+
     int m4 = (m + 15) & ~15;
     size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
     if (ctx->qcap < qneed) {
@@ -787,6 +793,7 @@ static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
     e2_gemm_init();
     int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
     if (!g_kernel || nblk == 0) return;
+
     int m4 = (m + 15) & ~15;
     size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
     if (ctx->qcap < qneed) {

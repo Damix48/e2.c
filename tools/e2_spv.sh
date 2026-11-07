@@ -17,11 +17,24 @@ trap 'rm -rf "$TMP"' EXIT
     echo "#include <stddef.h>"
 } > "$OUT"
 
+# The DPAS kernels use Intel's int8 matrix-multiply builtin, which only IGC's
+# own OpenCL frontend (ocloc) knows how to lower.  Everything else goes through
+# clang.  Both end up as plain SPIR-V, which the Level Zero module builder
+# accepts (IGC resolves the builtin when it compiles the module).
+OCLOC_DEVICE=${OCLOC_DEVICE:-arl-h}
+
 for f in tools/gpu/*.cl; do
     name=$(basename "$f" .cl)
     arr="e2_gpu_spv_${name}"
-    "$CLANG" -target spirv64-unknown-unknown -x cl -cl-std=CL3.0 -O2 -c "$f" \
-        -o "$TMP/$name.spv"
+    if grep -q "intel_sub_group_" "$f"; then
+        mkdir -p "$TMP/$name"
+        ocloc compile -file "$f" -device "$OCLOC_DEVICE" -out_dir "$TMP/$name" \
+            -output "$name" >/dev/null
+        cp "$TMP/$name/${name}_"*.spv "$TMP/$name.spv"
+    else
+        "$CLANG" -target spirv64-unknown-unknown -x cl -cl-std=CL3.0 -O2 -c "$f" \
+            -o "$TMP/$name.spv"
+    fi
     xxd -i "$TMP/$name.spv" > "$TMP/$name.inc"
     sed -e "s/^unsigned char .*\[\]/static const unsigned char ${arr}[]/" \
         -e "s/^unsigned int .*_len/static const size_t ${arr}_len/" \

@@ -131,17 +131,18 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
     size_t ts = w->tstride ? w->tstride : (size_t)k4 * 64;
     int wss = w->wsmstride ? w->wsmstride : nblk;
     int nb = nb0;
-    /* Row-block the K sweep so the f32 epilogue RMW stays in L1.  The old
-     * order (b outer, all rows inner) re-read the output from L2/L3 once per
-     * K block; for k=2048 that is 16 passes over a 4 MB matrix. */
+    /* Row block outermost: a 64-row activation slab stays in L1 while every
+     * output-tile group is swept.  The old order re-read the whole activation
+     * matrix once per 64-column tile group, which dominated at large m. */
     int RB = g_rb;
-    for (; nb + 4 <= nb1; nb += 4) {
+    int nb4 = nb0 + ((nb1 - nb0) / 4) * 4;
+    for (int rb = 0; rb < m; rb += RB) {
+        int rend = rb + RB; if (rend > m) rend = m;
+        for (nb = nb0; nb < nb4; nb += 4) {
         int n0 = nb * 16;
         const int8_t *wp = w->q + (size_t)nb * ts;
         __m512 WSC4[4];
         for (int t2 = 0; t2 < 4; t2++) WSC4[t2] = _mm512_loadu_ps(w->scale + n0 + 16 * t2);
-        for (int rb = 0; rb < m; rb += RB) {
-        int rend = rb + RB; if (rend > m) rend = m;
         for (int b = 0; b < nblk; b++) {
             __m512i base[4];
             for (int t2 = 0; t2 < 4; t2++) {
@@ -210,7 +211,7 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
         }
         }
     }
-    if (nb < nb1) gemm_t1(y, ns, xq, xs, xss, m, k, w, nb, nb1);
+    if (nb4 < nb1) gemm_t1(y, ns, xq, xs, xss, m, k, w, nb4, nb1);
 }
 #endif
 
@@ -474,16 +475,19 @@ static void gemm_work(void *vp, int tid, int nt) {
     if (nb0 < nb1) a->kern(a->y, a->ns, a->xq, a->xs, a->xss, a->m, a->k, a->w, nb0, nb1);
 }
 
+void e2_gemm_init(void) {
+    if (g_kernel) return;
+    g_kernel = select_kernel();
+    const char *rb = getenv("E2_GEMM_RB");
+    if (rb) g_rb = atoi(rb);
+    if (g_rb <= 0) g_rb = 1 << 28;
+    const char *pf = getenv("E2_GEMM_PF");
+    if (pf) g_pf = atoi(pf);
+}
+
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l) {
     const e2_qmat *w = &l->w;
-    if (!g_kernel) {
-        g_kernel = select_kernel();
-        const char *rb = getenv("E2_GEMM_RB");
-        if (rb) g_rb = atoi(rb);
-        if (g_rb <= 0) g_rb = 1 << 28;
-        const char *pf = getenv("E2_GEMM_PF");
-        if (pf) g_pf = atoi(pf);
-    }
+    e2_gemm_init();
     int k = w->k;
     int blk = w->blk ? w->blk : BLK;
     int nblk = k / blk;
@@ -566,7 +570,7 @@ void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
 void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
                           uint8_t *xq, float *xs, float *tmp) {
     const e2_qmat *w = &l->w;
-    if (!g_kernel) g_kernel = select_kernel();
+    e2_gemm_init();
     int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
     if (l->in_min || l->in_max) {
         float lo = l->in_min ? l->in_min[0] : -INFINITY;
@@ -596,6 +600,20 @@ void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
                 }
         }
     }
+}
+
+/* Linear with already-quantised activations (no clip, no bias expected). */
+void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
+                          const float *xs, int m, const e2_linear *l) {
+    const e2_qmat *w = &l->w;
+    e2_gemm_init();
+    int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
+    gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
+    long work = (long)m * w->n * k;
+    if (!ctx || ctx->nthreads <= 1 || work < 2000000L)
+        gemm_work(&a, 0, 1);
+    else
+        e2_parallel(ctx, gemm_work, &a);
 }
 
 /* f32 helpers (debug) */

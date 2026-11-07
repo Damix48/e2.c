@@ -8,3 +8,4 @@ __pycache__/
 /e2cli
 *.bin
 !models/.gitkeep
+core.*

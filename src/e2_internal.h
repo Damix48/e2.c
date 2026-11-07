@@ -186,9 +186,12 @@ int  e2_pack_mat(const float *w, int n, int k, int rs, int cs, int8_t **q,
 int  e2_pack_mat_ctx(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
                      int8_t **q, float **scale, int32_t **wsum, int *blk_out);
 void e2_pack_free(int8_t *q, float *scale, int32_t *wsum);
+void e2_gemm_init(void);
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
 void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
                           uint8_t *xq, float *xs, float *tmp);
+void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
+                          const float *xs, int m, const e2_linear *l);
 void e2_gemm_f32(float *y, const float *x, const float *w, int m, int k, int n);
 void e2_gemm_nt_f32(float *y, const float *x, const float *w, int m, int k, int n);
 void e2_dequant_row(const e2_qmat *w, int row, float *out);

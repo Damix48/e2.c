@@ -158,3 +158,89 @@ be re-checked per layer (see next steps).
   instinct, decides.
 * Denormals (`ldmxcsr`) are worth 3x on half the GEMMs of a bf16 model. Check
   for them before any kernel work.
+
+## Round 2 — attention packing, tokenizer, elementwise, big-m GEMM
+
+The box was shared and load average moved between 1 and 19 during this pass.
+Only same-run medians (`bench_compare --repeat 2`) are comparable; the absolute
+ms values below are from the quieter run (`/tmp/bench3.json`).
+
+### Wins kept (measured)
+
+| change | effect |
+|---|---|
+| **AVX-512 int8 K/V packer** (`e2_pack_mat`), rows split across the pool | The scalar packer did one `lrintf` per weight per layer. Vectorised + parallel it is bit-identical to the old packer and removed ~0.3-0.4 ms/layer from text attention. |
+| **Batched short-sequence attention** (`e2_attention_text_multi`): one worker per sequence instead of one thread-pool dispatch per (head, group, block) | batch attention 160 ms → ~20 ms (profile, batch 32x64). This is 768 tiny attention calls per forward; pool latency was most of the cost. |
+| **O(n log n) BPE** with a heap + linked list instead of rescanning all pairs | 32 x 64-token texts tokenise in 0.46 ms total; the old scan was tens of ms on batch/2048/video rows. |
+| **GEMM row blocking (RB=64)** and **row split when n has fewer than 4 tiles per thread** | The old order re-read the output for every K block; the attention PV GEMM (n=256) also fell into the 1-tile slow path. m=2048 GEMM-only: 168 → 135 ms. |
+| Fixed the row-split range arithmetic | Adjacent workers overlapped by up to 3 rows, and the b==0 store raced with the other thread's b>0 accumulate: wrong results. Disjoint 4-row-aligned ranges. |
+| **Fused RMSNorm(scale)**, **RMSNorm+residual-add**, **GELU x up** | text/vision elementwise traffic down by roughly one pass each; the GELU+gate multiply and three norm+add pairs were ~25 ms of the batch32 forward. |
+| **Audio per-dim scale table + cached relative-position table** | 5.1 → 0.1 ms and 1.6 → 0.5 ms per forward. |
+| Audio channel-major subsample conv kept (see below) | reverting the experiment also restored the audio tower's HF cosine. |
+
+### Tried, reverted or not kept
+
+| try | outcome |
+|---|---|
+| Fused softmax + u8 PV quantiser (unnormalised exp, 1/sum applied after PV) | 25-35% **slower** at t≥2048: the per-16-element mask construction and 8-zmm live range cost more than the f32 passes it saved. Left behind `E2_ATTN_FUSED_SQ=1`, off by default. |
+| Per-head parallel vision attention (one worker per kv head, serial GEMM inside) | 3.4 → 1.5 ms at t=1024, but no gain at t≈2400 and it segfaulted intermittently with 8 threads (fault at a heap mapping edge, not reproduced under ASAN). Removed. |
+| Audio conv rewritten channel-last with AVX-512 over output channels | subsample 7 → 13 ms and audio tower cosine vs HF fell 0.99909 → 0.9987 (chaotic amplification). Reverted. |
+| Volatile float sums in the new layernorm | restored bit-order but made LN ~5x slower. `optimize("no-fast-math")` was the right tool. |
+| Explicit weight prefetch in the GEMM K loop | noisy, no consistent gain; `E2_GEMM_PF` default 0. |
+| RB sweep 32/64/128/off | 64 best at m=2048, off/big-RB best at m≤128. `E2_GEMM_RB` selects at runtime. |
+| Moving the row-block loop outside the column-tile loop | ~7% at m=2048, neutral at m=512; kept because it also keeps activations in L1. |
+
+### Measured state after round 2
+
+e2 / ov-int8 (same run, `--repeat 2`; lower is better, ≤ 0.67 is the 1.5x goal):
+
+| task | length | e2 ms | ov-int8 ms | ratio |
+|---|---:|---:|---:|---:|
+| text | 8 | 3.5 | 5.8 | **0.60** |
+| text | 64 | 8.8 | 9.7 | 0.91 |
+| text | 128 | 16.0 | 16.0 | 1.00 |
+| text | 512 | 66.5 | 62.2 | 1.07 |
+| text | 2048 | 430.4 | 512.2 | 0.84 |
+| batch | 8x64 | 49.5 | 48.1 | 1.03 |
+| batch | 32x64 | 267.0 | 193.9 | 1.38 |
+| image | 270 tok | 644.9 | 528.2 | 1.22 |
+| audio | 54 tok | 42.4 | 25.5 | 1.66 |
+| video | 8 frames | 1868.1 | 1680.2 | 1.11 |
+
+A second run at load average 12-19 gave text 8: 0.77, text 2048: 0.97,
+image: 1.09, video: 1.06, batch32: 1.33, audio: 1.63. e2 loses more to external
+load than OpenVINO, so the ratio moves with the box even though both engines are
+measured in the same run.
+
+### Remaining gap and next steps
+
+1. **Vision attention is score-matrix bandwidth bound.** At t=2394 it is
+   350-390 ms of the ~590 ms image row: 16 heads x 2394^2 scores = 92M f32 per
+   layer, five passes through it. A flash/blocked int8 attention (scores and
+   exp kept in L1/L2, online softmax) is the only lever big enough left here.
+2. **Audio tower** is 4 ms mel + 7 ms subsample + ~29 ms conformer for 15 GMAC.
+   The short text encoder at T=54 adds ~10 ms. Both need work; OV does the tower
+   in ~19 ms. The conformer attention is still scalar and the mel front-end is
+   scalar (`logf` per bin).
+3. **Batch 32x64** is 258 GMAC of GEMM at m=2048 (~135-145 ms GEMM-only), plus
+   ~90 ms of elementwise and ~20 ms attention. Next: 2-D thread split in
+   `gemm_work`, an f32 epilogue that does not RMW, and holding PLE/norm passes
+   to fewer bytes.
+4. **Text 64/128/512 parity.** Both engines stream the same 130 MB of int8
+   weights per forward; e2 wins when compute matters (text8/2048) and loses
+   when pool wake latency matters (short single text under external load).
+5. `e2_attention_text_multi` is only used when all sequences have the same
+   length (the benchmark case); unequal-length batches still loop per sequence.
+
+Reproduce:
+
+```bash
+make test
+make tests/e2_bench_full
+. .venv/bin/activate
+python tools/bench_compare.py --sources e2,ov-int8 --repeat 2 --json /tmp/bench.json
+```
+
+Useful debug switches: `E2_ATTN_F32=1` (f32 attention), `E2_ATTN_FUSED_SQ=1`
+(fused softmax+quant experiment), `E2_GEMM_RB=N`, `E2_GEMM_PF=N`,
+`E2_PACK_SCALAR=1`, `E2_KERNEL=scalar|avx2|avx512`, `E2_PROFILE=1`.

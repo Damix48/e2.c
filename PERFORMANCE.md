@@ -716,3 +716,64 @@ here (`simd()` returns 2) and the prefetch knob only lives in `gemm_avxvnni`.
 Confirmed while auditing: the `e2_linear_forward_multi` skip bug was real —
 text embeddings are bit-identical to round 4, the audio embedding changed and
 its cosine against the HF reference improved 0.99847 -> 0.99865.
+
+## Round 6 — Arrow Lake host (Core Ultra 9 285H), GPU backend
+
+New host, same code: Intel Core Ultra 9 285H (6 P + 8 E + 2 LP-E, **no
+AVX-512**, AVX-VNNI only), Intel Arc 140T iGPU (Xe-LPG, 1024 shaders, no
+XMX/DPAS, DP4A only). `e2_cpu_count()` returns 14 (LP cores skipped). All CPU
+rows below are 8 threads, matching what the harness gives OpenVINO.
+
+### Baseline before any round-6 change (`--repeat 2 --iters 3`, 8 threads)
+
+| task | length | e2 ms | ov-int8 ms | e2/ov |
+|---|---:|---:|---:|---:|
+| text | 8 | 4.4 | 7.1 | 0.62 |
+| text | 64 | 11.5 | 25.1 | 0.46 |
+| text | 128 | 21.6 | 47.8 | 0.45 |
+| text | 512 | 84.4 | 201.5 | 0.42 |
+| text | 2048 | 430.8 | 1381.1 | 0.31 |
+| batch | 8x64 | 70.1 | 153.7 | 0.46 |
+| batch | 32x64 | 290.1 | 624.5 | 0.46 |
+| image | 270 tok | 625.1 | 1477.5 | 0.42 |
+| audio | 54 tok | 33.7 | 56.9 | 0.59 |
+| video | 8 frames | 2099.9 | 5199.9 | 0.40 |
+
+OpenVINO is much slower on this host than on the Ryzen 9700X of rounds 1-5
+(201 vs 64 ms for text 512): its int8 path is weight-only compression, so it
+runs f32 matmuls, and Lion Cove's f32 throughput per core is lower than Zen 5's.
+e2 keeps its int8 GEMM, so the ratio improves everywhere and every row is
+already past the 1.5x goal before round 6 starts. The two thin rows were
+**text 8 (0.62)** and **audio (0.59)**.
+
+### What worked this round (CPU)
+
+| # | change | effect |
+|---|---|---|
+| 1 | **AVX2+FMA twins of the f32 attention kernels** (`qk_kt_a2`, `attn_pv_a2` in `e2_ops.c`). `qk_kt_v`/`attn_pv_v` were AVX-512-only and the dispatch was `simd() >= 2`, so on any host without AVX-512 the *scalar* kernels ran at ~8 GMAC/s. Text shorter than 32 tokens takes the f32 attention path, which is why text 8 was the worst row. | **text 8: 4.37 -> 2.7 ms (1.6x)**, ratio 0.62 -> 0.38. Nothing else moves (t >= 32 uses the int8 path). |
+
+### What did not work this round (CPU)
+
+| try | outcome |
+|---|---|
+| AVX-VNNI GEMM tile 2 rows x 2 output tiles instead of 4 rows x 1 tile (same 8 accumulators, half the `vpbroadcastd` uops) | 4-8% **slower** on every shape (m=8..2048, k=512..2048): the broadcast uops are not the bottleneck, and the extra weight loads double the L1 traffic. Reverted. |
+| cutting the pool spin (`E2_POOL_SPIN` 20000 -> 2000 -> 200 -> 0) | 2000: audio 31 -> 90 ms, text 8 4.4 -> 7.0; 0: text 8 -> 25 ms. The nanosleep wake-up latency dominates the ~40 dispatches per layer. The 20000 spin stays; `worker` shows as ~35-45% of *cycles* in `perf` but those cycles are on otherwise idle cores. |
+
+### Where the time goes on this host (text 512, 8 threads)
+
+`attn` 24 ms, `mlp_gate` 21, `o_proj` 16, `q` 11, `mlp_down` 10, `ple_gate` 5,
+rest ~10. The int8 GEMM runs at 235 GMAC/s single-threaded (peak `vpdpbusd`
+with no loads: 436 GMAC/s, i.e. ~3/cycle) and 1.4-1.6 TMAC/s at 8 threads, so
+the kernel is at ~55% of the no-load ceiling; the tile-shape experiment above
+says the remaining gap is not a scheduling artefact that a different tile
+fixes. Attention at t=512 is 0.8 ms/layer: qk 121 us, pv 118 us, softmax 46 us,
+K/V packing 130 us -- all already on the int8 GEMM.
+
+### Audio (54 tokens, 22 ms of tower work)
+
+12 conformer layers: ff1 6.4 ms, ff2 6.5, attn 4.7, lconv 3.3, qkv 2.8. The
+GEMMs are small (m=50) and the tower is bound by weight streaming per layer,
+not by the kernel (the same shapes measure 1.3 TMAC/s in `mb cold`). The
+conformer attention is f32 by design (logit soft-cap + relative position keys)
+and its 4.7 ms is 21% of the tower; the fix would be routing it through the
+int8 attention core, which is not worth the risk at a 0.59 ratio.

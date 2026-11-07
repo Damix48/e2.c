@@ -1369,6 +1369,46 @@ static void attn_pv_v(float *const out[4], const float *const q[4],
         }
     }
 }
+
+/* AVX2 twins.  Without them the f32 attention (text shorter than 32 tokens,
+ * and any host without AVX-512) ran the scalar kernel at ~8 GMAC/s. */
+__attribute__((target("avx2,fma")))
+static void attn_pv_a2(float *const out[4], const float *const q[4],
+                       const float *vb, size_t vstride, int n, int dim,
+                       const float *sc, int sstride) {
+    (void)q;
+    int cfull = dim & ~15;
+    for (int c = 0; c < cfull; c += 16) {
+        __m256 z = _mm256_setzero_ps();
+        float *o0 = out[0] + c, *o1 = out[1] + c, *o2 = out[2] + c, *o3 = out[3] + c;
+        __m256 a0 = z, a1 = z, a2 = z, a3 = z;
+        __m256 b0 = z, b1 = z, b2 = z, b3 = z;
+        for (int j = 0; j < n; j++) {
+            const float *v = vb + (size_t)j * vstride + c;
+            _mm_prefetch((const char *)(v + 8 * vstride), _MM_HINT_T0);
+            __m256 v0 = _mm256_loadu_ps(v);
+            __m256 v1 = _mm256_loadu_ps(v + 8);
+            const float *p = sc + j;
+            __m256 w0 = _mm256_set1_ps(p[0]), w1 = _mm256_set1_ps(p[sstride]);
+            __m256 w2 = _mm256_set1_ps(p[2 * sstride]), w3 = _mm256_set1_ps(p[3 * sstride]);
+            a0 = _mm256_fmadd_ps(w0, v0, a0); b0 = _mm256_fmadd_ps(w0, v1, b0);
+            a1 = _mm256_fmadd_ps(w1, v0, a1); b1 = _mm256_fmadd_ps(w1, v1, b1);
+            a2 = _mm256_fmadd_ps(w2, v0, a2); b2 = _mm256_fmadd_ps(w2, v1, b2);
+            a3 = _mm256_fmadd_ps(w3, v0, a3); b3 = _mm256_fmadd_ps(w3, v1, b3);
+        }
+        _mm256_storeu_ps(o0, a0); _mm256_storeu_ps(o1, a1);
+        _mm256_storeu_ps(o2, a2); _mm256_storeu_ps(o3, a3);
+        _mm256_storeu_ps(o0 + 8, b0); _mm256_storeu_ps(o1 + 8, b1);
+        _mm256_storeu_ps(o2 + 8, b2); _mm256_storeu_ps(o3 + 8, b3);
+    }
+    for (int c = cfull; c < dim; c++) {          /* head_dim not a multiple of 16 */
+        for (int r = 0; r < 4; r++) out[r][c] = 0.0f;
+        for (int j = 0; j < n; j++) {
+            const float *v = vb + (size_t)j * vstride + c;
+            for (int r = 0; r < 4; r++) out[r][c] += sc[(size_t)r * sstride + j] * *v;
+        }
+    }
+}
 #endif
 
 /* Transpose K to [kv][dim][t_pad] (zero padded to a multiple of 32 columns). */
@@ -1403,6 +1443,44 @@ static void kt_work(void *vp, int tid, int nt) {
 }
 
 /* scores sc[r*tpad + j] = q[r] . kt[d][j], 32 keys at a time, 4 rows */
+__attribute__((target("avx2,fma")))
+static void qk_kt_a2(const float *const q[4], const float *kt, int n, int dim,
+                     int tpad, float *sc) {
+    const float *p0 = q[0], *p1 = q[1], *p2 = q[2], *p3 = q[3];
+    int jb = 0;
+    for (; jb + 16 <= n; jb += 16) {
+        const float *kp = kt + jb;
+        __m256 z = _mm256_setzero_ps();
+        __m256 a0 = z, a1 = z, b0 = z, b1 = z;
+        __m256 c0 = z, c1 = z, d0 = z, d1 = z;
+        for (int d = 0; d < dim; d++, kp += tpad) {
+            _mm_prefetch((const char *)(kp + 6 * tpad), _MM_HINT_T0);
+            _mm_prefetch((const char *)(kp + 6 * tpad + 8), _MM_HINT_T0);
+            __m256 k0 = _mm256_loadu_ps(kp);
+            __m256 k1 = _mm256_loadu_ps(kp + 8);
+            __m256 w0 = _mm256_set1_ps(p0[d]);
+            __m256 w1 = _mm256_set1_ps(p1[d]);
+            __m256 w2 = _mm256_set1_ps(p2[d]);
+            __m256 w3 = _mm256_set1_ps(p3[d]);
+            a0 = _mm256_fmadd_ps(w0, k0, a0); a1 = _mm256_fmadd_ps(w0, k1, a1);
+            b0 = _mm256_fmadd_ps(w1, k0, b0); b1 = _mm256_fmadd_ps(w1, k1, b1);
+            c0 = _mm256_fmadd_ps(w2, k0, c0); c1 = _mm256_fmadd_ps(w2, k1, c1);
+            d0 = _mm256_fmadd_ps(w3, k0, d0); d1 = _mm256_fmadd_ps(w3, k1, d1);
+        }
+        _mm256_storeu_ps(sc + jb, a0); _mm256_storeu_ps(sc + jb + 8, a1);
+        _mm256_storeu_ps(sc + tpad + jb, b0); _mm256_storeu_ps(sc + tpad + jb + 8, b1);
+        _mm256_storeu_ps(sc + 2 * tpad + jb, c0); _mm256_storeu_ps(sc + 2 * tpad + jb + 8, c1);
+        _mm256_storeu_ps(sc + 3 * tpad + jb, d0); _mm256_storeu_ps(sc + 3 * tpad + jb + 8, d1);
+    }
+    for (; jb < n; jb++)
+        for (int r = 0; r < 4; r++) {
+            const float *kf = kt + jb;
+            float s = 0.0f;
+            for (int d = 0; d < dim; d++, kf += tpad) s += q[r][d] * *kf;
+            sc[(size_t)r * tpad + jb] = s;
+        }
+}
+
 __attribute__((target("avx512f")))
 static void qk_kt_v(const float *const q[4], const float *kt, int n, int dim, int tpad,
                     float *sc) {
@@ -1506,6 +1584,7 @@ static void attn_work(void *vp, int tid, int nt) {
 
 #ifdef E2_X86OPS
         if (simd() >= 2) qk_kt_v(q, kt, npad, head_dim, tpad, sc);
+        else if (simd() >= 1) qk_kt_a2(q, kt, npad, head_dim, tpad, sc);
         else
 #endif
         qk_kt_s(q, kt, npad, head_dim, tpad, sc);
@@ -1532,6 +1611,7 @@ static void attn_work(void *vp, int tid, int nt) {
         }
 #ifdef E2_X86OPS
         if (simd() >= 2) attn_pv_v(out, q, vb, kv_stride, n, head_dim, sc, tpad);
+        else if (simd() >= 1) attn_pv_a2(out, q, vb, kv_stride, n, head_dim, sc, tpad);
         else
 #endif
         attn_pv_s(out, q, vb, kv_stride, n, head_dim, sc, tpad);

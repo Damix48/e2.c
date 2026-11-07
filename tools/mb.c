@@ -79,6 +79,30 @@ static volatile int32_t g_sink_i;
 
 #if defined(__x86_64__)
 #include <immintrin.h>
+/* 256-bit VNNI: what an Arrow Lake / Zen 5 host without AVX-512 can issue. */
+__attribute__((target("avx2,avxvnni")))
+static double peak_vnni256(int nt) {
+    const int iters = 400000000 / nt;
+    double t0 = now();
+    __m256i a = _mm256_set1_epi32(0x7f7f7f7f);
+    __m256i acc[8] = {a, a, a, a, a, a, a, a};
+    __m256i w0 = _mm256_set1_epi8(3);
+    for (int i = 0; i < iters / 8; i++) {
+        for (int j = 0; j < 8; j++) acc[j] = _mm256_dpbusd_epi32(acc[j], a, w0);
+        /* keep the loop from being strength-reduced into one multiply */
+        a = _mm256_add_epi8(a, _mm256_set1_epi8(1));
+    }
+    __m256i s = _mm256_add_epi32(_mm256_add_epi32(acc[0], acc[1]),
+                                 _mm256_add_epi32(acc[2], acc[3]));
+    s = _mm256_add_epi32(s, _mm256_add_epi32(_mm256_add_epi32(acc[4], acc[5]),
+                                             _mm256_add_epi32(acc[6], acc[7])));
+    s = _mm256_hadd_epi32(s, s);
+    s = _mm256_hadd_epi32(s, s);
+    g_sink_i = _mm256_extract_epi32(s, 0) + _mm256_extract_epi32(s, 4);
+    double t = now() - t0;
+    return (double)iters * 32 / (t / 1e3) / 1e9;
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vnni")))
 static double peak_vnni(int nt) {
     const int iters = 400000000 / nt;
@@ -333,9 +357,15 @@ int main(int argc, char **argv) {
         bench_par(nt, 2000);
     } else if (!strcmp(argv[1], "peak")) {
 #if defined(__x86_64__)
-        for (int nt = 1; nt <= 16; nt *= 2)
-            printf("vnni nt=%2d %.2f GMAC/s | fma %.2f GMAC/s\n", nt,
-                   peak_vnni(nt), peak_fma(nt));
+        __builtin_cpu_init();
+        int a512 = __builtin_cpu_supports("avx512vnni");
+        for (int nt = 1; nt <= 16; nt *= 2) {
+            if (a512)
+                printf("vnni nt=%2d %.2f GMAC/s | fma %.2f GMAC/s\n", nt,
+                       peak_vnni(nt), peak_fma(nt));
+            else
+                printf("vnni256 nt=%2d %.2f GMAC/s\n", nt, peak_vnni256(nt));
+        }
 #endif
     } else if (!strcmp(argv[1], "quant")) {
         int m = argc > 2 ? atoi(argv[2]) : 256;

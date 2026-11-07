@@ -49,13 +49,33 @@ static void fft512(const float *in, float *mag) {
 
 static double aud_prof[9];
 
+/* 2 = AVX-512, 1 = AVX2 + FMA, 0 = scalar.  Every AVX-512 part has AVX2. */
+static int aud_simd(void) {
+#if defined(__x86_64__)
+    static int v = -1;
+    if (v < 0) {
+        __builtin_cpu_init();
+        v = __builtin_cpu_supports("avx512f") ? 2
+          : (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) ? 1 : 0;
+    }
+    return v;
+#else
+    return 0;
+#endif
+}
+
 /* 3x3 stride-2 conv, channel-last in/out, vectorised over output channels.
- * wT is [3][3][c_in][c_out_pad] so 16 output channels are one 64-byte load.
+ * wT is [3][3][c_in][c_out_pad] so 32 output channels are four ymm loads.
  * The reduction order stays (ic, ky, kx), so results match the scalar loop. */
 typedef struct {
     const float *in, *wT; float *out;
     int c_in, T_in, W_in, c_out, T_out, W_out, cpad;
 } conv3_arg;
+
+#if defined(__x86_64__)
+static void conv3_rows_a2(const conv3_arg *a, int t0, int t1);
+static void mel_bank_a2(const float *mag, const float *mel, float *dst, int n, float floor);
+#endif
 
 typedef struct {
     float *x; int T, W, C; const float *norm; float eps;
@@ -64,8 +84,11 @@ typedef struct {
 static void conv3_work(void *vp, int tid, int nt) {
     conv3_arg *a = vp;
     int cpad = a->cpad, c_out = a->c_out;
-    int nv = (c_out + 15) / 16;
-    int t0 = (int)((long)a->T_out * tid / nt), t1 = (int)((long)a->T_out * (tid + 1) / nt);
+    int t0, t1;
+    e2_split(a->T_out, tid, nt, &t0, &t1);
+#if defined(__x86_64__)
+    if (aud_simd() >= 1) { conv3_rows_a2(a, t0, t1); return; }
+#endif
     float acc[128];
     for (int t = t0; t < t1; t++) {
         for (int w = 0; w < a->W_out; w++) {
@@ -85,7 +108,6 @@ static void conv3_work(void *vp, int tid, int nt) {
             }
             float *op = a->out + ((size_t)t * a->W_out + w) * c_out;
             for (int j = 0; j < c_out; j++) op[j] = acc[j];
-            (void)nv;
         }
     }
 }
@@ -95,7 +117,8 @@ static void conv3_work(void *vp, int tid, int nt) {
 static void ln_relu_work(void *vp, int tid, int nt) {
     ln_arg *a = vp;
     int px = a->T * a->W, C = a->C;
-    int p0 = (int)((long)px * tid / nt), p1 = (int)((long)px * (tid + 1) / nt);
+    int p0, p1;
+    e2_split(px, tid, nt, &p0, &p1);
     for (int p = p0; p < p1; p++) {
         float *v = a->x + (size_t)p * C;
         float mean = 0.0f, var = 0.0f;
@@ -118,7 +141,8 @@ typedef struct {
 
 static void mel_work(void *vp, int tid, int nt) {
     mel_arg *a = vp;
-    int t0 = (int)((long)a->T * tid / nt), t1 = (int)((long)a->T * (tid + 1) / nt);
+    int t0, t1;
+    e2_split(a->T, tid, nt, &t0, &t1);
     float frame[512];
     float mag[257];
     for (int t = t0; t < t1; t++) {
@@ -130,10 +154,17 @@ static void mel_work(void *vp, int tid, int nt) {
         }
         for (int i = 320; i < 512; i++) frame[i] = 0.0f;
         fft512(frame, mag);
-        for (int c = 0; c < 128; c++) {
-            float s = 0.0f;
-            for (int f = 0; f < 257; f++) s += mag[f] * a->mel[f * 128 + c];
-            a->feat[(size_t)t * 128 + c] = logf(s + a->floor);
+#if defined(__x86_64__)
+        if (aud_simd() >= 1) {
+            mel_bank_a2(mag, a->mel, a->feat + (size_t)t * 128, 128, a->floor);
+        } else
+#endif
+        {
+            for (int c = 0; c < 128; c++) {
+                float s = 0.0f;
+                for (int f = 0; f < 257; f++) s += mag[f] * a->mel[f * 128 + c];
+                a->feat[(size_t)t * 128 + c] = logf(s + a->floor);
+            }
         }
         a->mask[t] = (t * 160 + 160) < a->n;
         if (!a->mask[t]) {
@@ -197,15 +228,14 @@ static void audio_ff(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     e2_linear *b = which == 0 ? &L->ff1b : &L->ff2b;
     const float *pre = which == 0 ? L->ff1_pre_norm : L->ff2_pre_norm;
     const float *post = which == 0 ? L->ff1_post_norm : L->ff2_post_norm;
-    /* residual + clamp, norm, two linears with SiLU */
-    float *res = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
-    memcpy(res, x, (size_t)T * H * sizeof(float));
+    /* norm, two linears with SiLU, then the gated residual on x in place */
     e2_rmsnorm(ctx, h, x, pre, T, H, c->audio_eps);
     e2_linear_forward(ctx, up, h, T, a);
     e2_silu_ctx(ctx, up, T * I);
     e2_linear_forward(ctx, h, up, T, b);
     e2_rmsnorm(ctx, h, h, post, T, H, c->audio_eps);
-    for (size_t i = 0; i < (size_t)T * H; i++) x[i] = res[i] + h[i] * c->audio_residual;
+    e2_vec_scale_ctx(ctx, h, T * H, c->audio_residual);
+    e2_add_inplace_ctx(ctx, x, h, T * H);
 }
 
 static float softplus(float v) {
@@ -214,17 +244,9 @@ static float softplus(float v) {
     return log1pf(e2_fexp(v));
 }
 
-/* dot product, AVX-512 when available (D is 128 here) */
+/* dot product, AVX-512 when available, else AVX2 (D is 128 here) */
 #if defined(__x86_64__)
 #include <immintrin.h>
-static int aud_avx512(void) {
-    static int v = -1;
-    if (v < 0) {
-        __builtin_cpu_init();
-        v = __builtin_cpu_supports("avx512f");
-    }
-    return v;
-}
 __attribute__((target("avx512f")))
 static float dot128_v(const float *a, const float *b, int n) {
     __m512 s0 = _mm512_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
@@ -252,10 +274,134 @@ static void axpy_v(float *o, const float *v, float w, int n) {
                                                 _mm512_loadu_ps(o + i)));
     for (; i < n; i++) o[i] += w * v[i];
 }
+
+/* AVX2 + FMA twins for hosts without AVX-512 (Arrow Lake, Alder Lake,
+ * Zen 2/3/4): 8 lanes instead of 1. */
+#define A2 __attribute__((target("avx2,fma")))
+
+A2 static inline float hsum8(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(_mm_add_ss(s, _mm_shuffle_ps(s, s, 1)));
+}
+
+A2 static float dot128_a2(const float *a, const float *b, int n) {
+    __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
+        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), s2);
+        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), s3);
+    }
+    for (; i + 8 <= n; i += 8)
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+    float s = hsum8(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+A2 static void axpy_a2(float *o, const float *v, float w, int n) {
+    __m256 vw = _mm256_set1_ps(w);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(vw, _mm256_loadu_ps(v + i),
+                                                _mm256_loadu_ps(o + i)));
+    for (; i < n; i++) o[i] += w * v[i];
+}
+
+/* Mel filterbank: one pass over the 257 bins per 64 output channels, so the
+ * sum for a channel still runs over f in ascending order. */
+A2 static void mel_bank_a2(const float *mag, const float *mel, float *dst, int n,
+                           float floor) {
+    for (int c0 = 0; c0 < n; c0 += 64) {
+        __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+        __m256 s4 = s0, s5 = s0, s6 = s0, s7 = s0;
+        for (int f = 0; f < 257; f++) {
+            const float *m = mel + (size_t)f * n + c0;
+            __m256 v = _mm256_broadcast_ss(mag + f);
+            s0 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m), s0);
+            s1 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m + 8), s1);
+            s2 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m + 16), s2);
+            s3 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m + 24), s3);
+            s4 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m + 32), s4);
+            s5 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m + 40), s5);
+            s6 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m + 48), s6);
+            s7 = _mm256_fmadd_ps(v, _mm256_loadu_ps(m + 56), s7);
+        }
+        __m256 s[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+        for (int i = 0; i < 8; i++) {
+            float buf[8];
+            _mm256_storeu_ps(buf, s[i]);
+            for (int j = 0; j < 8; j++) dst[c0 + i * 8 + j] = logf(buf[j] + floor);
+        }
+    }
+}
+
+/* 3x3 stride-2 conv over 32 output channels per pass: the accumulators stay in
+ * four ymm registers instead of a memory array.  cpad is 32 or 64 here. */
+A2 static void conv3_rows_a2(const conv3_arg *a, int t0, int t1) {
+    for (int c0 = 0; c0 < a->cpad; c0 += 32) {
+        for (int t = t0; t < t1; t++) {
+            for (int w = 0; w < a->W_out; w++) {
+                __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+                for (int ic = 0; ic < a->c_in; ic++) {
+                    for (int ky = 0; ky < 3; ky++) {
+                        int iy = t * 2 - 1 + ky;
+                        if (iy < 0 || iy >= a->T_in) continue;
+                        for (int kx = 0; kx < 3; kx++) {
+                            int ix = w * 2 - 1 + kx;
+                            if (ix < 0 || ix >= a->W_in) continue;
+                            __m256 v = _mm256_set1_ps(
+                                a->in[((size_t)iy * a->W_in + ix) * a->c_in + ic]);
+                            const float *wt = a->wT +
+                                ((size_t)(ky * 3 + kx) * a->c_in + ic) * a->cpad + c0;
+                            s0 = _mm256_fmadd_ps(v, _mm256_loadu_ps(wt), s0);
+                            s1 = _mm256_fmadd_ps(v, _mm256_loadu_ps(wt + 8), s1);
+                            s2 = _mm256_fmadd_ps(v, _mm256_loadu_ps(wt + 16), s2);
+                            s3 = _mm256_fmadd_ps(v, _mm256_loadu_ps(wt + 24), s3);
+                        }
+                    }
+                }
+                float *op = a->out + ((size_t)t * a->W_out + w) * a->c_out + c0;
+                _mm256_storeu_ps(op, s0);
+                _mm256_storeu_ps(op + 8, s1);
+                _mm256_storeu_ps(op + 16, s2);
+                _mm256_storeu_ps(op + 24, s3);
+            }
+        }
+    }
+}
+
+/* row-wise scale by a D-wide pattern: the per-dim q scale and the k scale. */
+A2 static void scale_rows_a2(float *p, int rows, int D, const float *s) {
+    for (int r = 0; r < rows; r++) {
+        float *x = p + (size_t)r * D;
+        int d = 0;
+        for (; d + 8 <= D; d += 8)
+            _mm256_storeu_ps(x + d, _mm256_mul_ps(_mm256_loadu_ps(x + d),
+                                                  _mm256_loadu_ps(s + d)));
+        for (; d < D; d++) x[d] *= s[d];
+    }
+}
 #endif
+static void aud_qk_scale(float *q, float *k, const float *qs, const float *ks,
+                         int rows, int D) {
+#if defined(__x86_64__)
+    if (aud_simd() >= 1) {
+        scale_rows_a2(q, rows, D, qs);
+        scale_rows_a2(k, rows, D, ks);
+        return;
+    }
+#endif
+    for (int r = 0; r < rows; r++)
+        for (int d = 0; d < D; d++) { q[(size_t)r * D + d] *= qs[d]; k[(size_t)r * D + d] *= ks[d]; }
+}
 static float dot128(const float *a, const float *b, int n) {
 #if defined(__x86_64__)
-    if (aud_avx512()) return dot128_v(a, b, n);
+    int lv = aud_simd();
+    if (lv == 2) return dot128_v(a, b, n);
+    if (lv >= 1) return dot128_a2(a, b, n);
 #endif
     float s = 0.0f;
     for (int i = 0; i < n; i++) s += a[i] * b[i];
@@ -263,7 +409,9 @@ static float dot128(const float *a, const float *b, int n) {
 }
 static void axpy(float *o, const float *v, float w, int n) {
 #if defined(__x86_64__)
-    if (aud_avx512()) { axpy_v(o, v, w, n); return; }
+    int lv = aud_simd();
+    if (lv == 2) { axpy_v(o, v, w, n); return; }
+    if (lv >= 1) { axpy_a2(o, v, w, n); return; }
 #endif
     for (int i = 0; i < n; i++) o[i] += w * v[i];
 }
@@ -352,22 +500,20 @@ static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     float *out = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
     if (!q || !k || !v || !out) return;
     double _a0 = e2_now_ms();
-    e2_linear_forward(ctx, q, x, T, &L->q);
-    e2_linear_forward(ctx, k, x, T, &L->k);
-    e2_linear_forward(ctx, v, x, T, &L->v);
+    {
+        const e2_linear *ql[3] = {&L->q, &L->k, &L->v};
+        float *yl[3] = {q, k, v};
+        e2_linear_forward_multi(ctx, x, T, ql, yl, 3);
+    }
     aud_prof[4] += e2_now_ms() - _a0;
     _a0 = e2_now_ms();
-    float qs[256];
-    for (int d = 0; d < D; d++)
+    float qs[256], ks[256];
+    for (int d = 0; d < D; d++) {
         qs[d] = c->audio_qscale * softplus(L->per_dim_scale[d]);
-    const float kscale = c->audio_kscale;
-    for (int t = 0; t < T; t++) {
-        for (int hh = 0; hh < heads; hh++) {
-            float *qp = q + ((size_t)t * heads + hh) * D;
-            float *kp = k + ((size_t)t * heads + hh) * D;
-            for (int d = 0; d < D; d++) { qp[d] *= qs[d]; kp[d] *= kscale; }
-        }
+        ks[d] = c->audio_kscale;
     }
+    const float kscale = c->audio_kscale;
+    aud_qk_scale(q, k, qs, ks, T * heads, D);
     aud_prof[5] += e2_now_ms() - _a0;
     _a0 = e2_now_ms();
     float *rk = e2_arena_alloc(&ctx->scratch, (size_t)pos_len * H * sizeof(float));
@@ -395,12 +541,47 @@ static void dw_conv_add_v(float *op, const float *hp, const float *wp, int H) {
                                          _mm512_loadu_ps(op + c0)));
     for (; c0 < H; c0++) op[c0] += hp[c0] * wp[c0];
 }
+
+A2 static void dw_conv_add_a2(float *op, const float *hp, const float *wp, int H) {
+    int c0 = 0;
+    for (; c0 + 8 <= H; c0 += 8)
+        _mm256_storeu_ps(op + c0,
+                         _mm256_fmadd_ps(_mm256_loadu_ps(hp + c0),
+                                         _mm256_loadu_ps(wp + c0),
+                                         _mm256_loadu_ps(op + c0)));
+    for (; c0 < H; c0++) op[c0] += hp[c0] * wp[c0];
+}
 #endif
 static void dw_conv_add(float *op, const float *hp, const float *wp, int H) {
 #if defined(__x86_64__)
-    if (aud_avx512()) { dw_conv_add_v(op, hp, wp, H); return; }
+    int lv = aud_simd();
+    if (lv == 2) { dw_conv_add_v(op, hp, wp, H); return; }
+    if (lv >= 1) { dw_conv_add_a2(op, hp, wp, H); return; }
 #endif
     for (int c0 = 0; c0 < H; c0++) op[c0] += hp[c0] * wp[c0];
+}
+
+typedef struct {
+    const float *h, *dwt; float *conv; int T, H, K;
+} dwconv_arg;
+
+/* Causal depthwise conv over time, split over (t, channel block). */
+static void dwconv_work(void *vp, int tid, int nt) {
+    dwconv_arg *a = vp;
+    int nb = (a->H + 255) / 256, lo, hi;
+    e2_split(a->T * nb, tid, nt, &lo, &hi);
+    for (int it = lo; it < hi; it++) {
+        int t = it / nb, c0 = (it % nb) * 256;
+        int c1 = c0 + 256 > a->H ? a->H : c0 + 256;
+        float *op = a->conv + (size_t)t * a->H + c0;
+        for (int c = 0; c < c1 - c0; c++) op[c] = 0.0f;
+        for (int j = 0; j < a->K; j++) {
+            int tt = t - (a->K - 1) + j;
+            if (tt < 0 || tt >= a->T) continue;
+            dw_conv_add(op, a->h + (size_t)tt * 2 * a->H + c0, a->dwt + (size_t)j * a->H + c0,
+                        c1 - c0);
+        }
+    }
 }
 
 static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
@@ -416,14 +597,9 @@ static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     for (int ch = 0; ch < H; ch++)
         for (int j = 0; j < K; j++) dwt[j * H + ch] = L->dw_conv[ch * K + j];
     /* causal depthwise conv over time, vectorised over channels */
-    for (int t = 0; t < T; t++) {
-        float *op = conv + (size_t)t * H;
-        for (int c0 = 0; c0 < H; c0++) op[c0] = 0.0f;
-        for (int j = 0; j < K; j++) {
-            int tt = t - (K - 1) + j;
-            if (tt < 0 || tt >= T) continue;
-            dw_conv_add(op, h + (size_t)tt * 2 * H, dwt + (size_t)j * H, H);
-        }
+    {
+        dwconv_arg da = {h, dwt, conv, T, H, K};
+        e2_parallel(ctx, dwconv_work, &da);
     }
     e2_rmsnorm(ctx, conv, conv, L->lc_conv_norm, T, H, c->audio_eps);
     e2_silu_ctx(ctx, conv, T * H);
@@ -533,16 +709,13 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
         audio_ff(ctx, L, x, T1, 0, H, I);
         aud_prof[0] += e2_now_ms() - _l0;
         /* attention */
-        float *res = e2_arena_alloc(&ctx->scratch, (size_t)T1 * H * sizeof(float));
         float *hn = e2_arena_alloc(&ctx->scratch, (size_t)T1 * H * sizeof(float));
-        memcpy(res, x, (size_t)T1 * H * sizeof(float));
         e2_rmsnorm(ctx, hn, x, L->pre_attn_norm, T1, H, c->audio_eps);
         _l0 = e2_now_ms();
         audio_attention(ctx, L, hn, T1, m1, H, heads, D, pe, pos_len);
         aud_prof[1] += e2_now_ms() - _l0;
         e2_rmsnorm(ctx, hn, hn, L->post_attn_norm, T1, H, c->audio_eps);
-        e2_add_inplace_ctx(ctx, res, hn, T1 * H);
-        memcpy(x, res, (size_t)T1 * H * sizeof(float));
+        e2_add_inplace_ctx(ctx, x, hn, T1 * H);
         _l0 = e2_now_ms();
         audio_lconv(ctx, L, x, T1, H, K);
         aud_prof[2] += e2_now_ms() - _l0;

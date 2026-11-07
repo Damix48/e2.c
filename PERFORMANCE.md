@@ -352,6 +352,26 @@ Accuracy against the float32 HF reference (`tools/e2_acc.py`):
 4. `pack_vt_dims` is still scalar in the quantise step (a 4x16 byte transpose
    would give ~3x), which costs 0.6 ms/layer on the 32x64 batch row.
 
+### Why the GEMM-bound rows cannot reach 1.5x
+
+Measured ceilings on this host (`make mb`): raw `vpdpbusd` **347 GMAC/s per
+core**, f32 FMA 165 GMAC/s per core.  That is exactly the 2x uop advantage int8
+has over f32, i.e. 2.8 TMAC/s for 8 cores.
+
+* e2's packed-int8 GEMM runs at 2.7-3.3 TMAC/s (warm) / 2.0-2.8 (cold weights):
+  at the VNNI peak.
+* OpenVINO's text 512 row is 132 GMAC in 62.6 ms = **2.2 TMAC/s**.  An f32
+  matmul could not exceed 1.15 TMAC/s on 8 cores, so their "INT8_SYM
+  weight-only" execution is also an int8 GEMM (weights int8, activations
+  quantised on the fly) running at ~78% of the int8 peak.
+
+So for the rows that are GEMM-dominated (text 128/512, batch 32x64) both
+engines are within 25% of the same hardware limit and the ratio is bounded by
+the non-GEMM work e2 can delete.  Round 1 assumed OpenVINO ran dequantised f32
+matmuls; that assumption is what made "1.5x in every scenario" look reachable.
+The rows where attention and the elementwise tail dominate (text 8/64/2048,
+image, video) are the ones that now clear 1.5x or come close.
+
 ### The pool spin count is not a knob to turn down
 
 Dropping the worker spin from 20 000 `pause` iterations to 4 000/1 000/200 makes

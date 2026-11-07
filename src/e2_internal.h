@@ -189,6 +189,8 @@ int  e2_pack_mat_ctx(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
 void e2_pack_free(int8_t *q, float *scale, int32_t *wsum);
 void e2_gemm_init(void);
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
+void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
+                             const e2_linear *const *ls, float *const *ys, int n);
 void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
                           uint8_t *xq, float *xs, float *tmp);
 void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
@@ -209,6 +211,9 @@ void e2_rmsnorm_pre(e2_ctx *ctx, float *out, const float *x, const float *w, int
 void e2_rmsnorm_add(e2_ctx *ctx, float *x, const float *src, const float *w, int rows,
                     int dim, float eps);
 void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n);
+void e2_gelu_mul_q(e2_ctx *ctx, const float *x, const float *up, int rows, int k,
+                   uint8_t *q, float *sc, int blk);
+uint8_t *e2_quant_scratch(e2_ctx *ctx, int m, int k, float **xs);
 void e2_rmsnorm_noweight(e2_ctx *ctx, float *out, const float *x, int rows, int dim,
                          float eps);
 void e2_gelu_tanh(float *x, int n);
@@ -229,6 +234,14 @@ void e2_rope_free(e2_ctx *ctx);
 void e2_vec_scale(float *x, int n, float k);
 void e2_rope_text(e2_ctx *ctx, float *q, float *k, int t, int heads, int kv_heads,
                   int head_dim, int pos_offset, float theta);
+/* Cached cos/sin table, or NULL on OOM. */
+e2_rope_tab *e2_rope_get(e2_ctx *ctx, float theta, int half, int need);
+/* RMSNorm over `per_pos` consecutive rows per position, then rotate each row
+ * with the table.  Fuses the two passes the text encoder used to make over q
+ * and k (rope was a separate read+write of both). */
+void e2_rmsnorm_rope(e2_ctx *ctx, float *x, const float *w, int rows, int dim,
+                     float eps, const e2_rope_tab *tb, int per_pos,
+                     const int *seq_off, int nseq);
 void e2_rope_vision(e2_ctx *ctx, float *q, float *k, int t, int heads, int head_dim,
                     const int *xy, float theta);
 void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,

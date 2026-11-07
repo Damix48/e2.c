@@ -56,8 +56,81 @@ typedef struct {
 /* Column max of V (one pass), then quantise+pack the transpose in 16x16
  * blocks so every source cache line is used fully.  The per-row weight sum
  * the zero-point correction needs is accumulated on the way. */
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+/* 16 (dim) x 4 (key) block: convert four float rows to int8 with a per-dim
+ * scale and transpose them into the packed [dim][4 keys] layout, which is a
+ * 4x16 byte transpose (three unpack levels).  The per-dim sums the zero-point
+ * correction needs fall out of the transposed zmm. */
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+static void pack_vt_dims_v(attn_job *j, const float *v, int rs, int8_t *qw,
+                           float *sc, int32_t *ws, int d0, int d1) {
+    int t = j->t, tpad = j->tpad, tpb = j->tpb;
+    size_t ts = (size_t)(tpad / 4) * 64;
+    const __m512i sgn = _mm512_set1_epi32((int)0x80000000u);
+    const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
+    memset(ws + (size_t)d0 * tpb, 0, (size_t)(d1 - d0) * tpb * sizeof(int32_t));
+
+    for (int db = d0; db < d1; db += 16) {
+        __m512 mx = _mm512_set1_ps(sc[db]);      /* seeded to 1.0 by the caller */
+        for (int jy = 0; jy < t; jy++) {
+            __m512i a = _mm512_andnot_si512(sgn, _mm512_loadu_si512((const void *)(v + (size_t)jy * rs + db)));
+            mx = _mm512_max_ps(mx, _mm512_castsi512_ps(a));
+        }
+        __m512 inv = _mm512_div_ps(_mm512_set1_ps(127.0f), mx);
+        _mm512_storeu_ps(sc + db, _mm512_mul_ps(mx, _mm512_set1_ps(1.0f / 127.0f)));
+        int jb = 0;
+        for (; jb + 4 <= t; jb += 4) {
+            __m512 v0 = _mm512_mul_ps(_mm512_loadu_ps(v + (size_t)(jb + 0) * rs + db), inv);
+            __m512 v1 = _mm512_mul_ps(_mm512_loadu_ps(v + (size_t)(jb + 1) * rs + db), inv);
+            __m512 v2 = _mm512_mul_ps(_mm512_loadu_ps(v + (size_t)(jb + 2) * rs + db), inv);
+            __m512 v3 = _mm512_mul_ps(_mm512_loadu_ps(v + (size_t)(jb + 3) * rs + db), inv);
+            __m128i a = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(v0));
+            __m128i b = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(v1));
+            __m128i c = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(v2));
+            __m128i d = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(v3));
+            __m128i ab_lo = _mm_unpacklo_epi8(a, b), ab_hi = _mm_unpackhi_epi8(a, b);
+            __m128i cd_lo = _mm_unpacklo_epi8(c, d), cd_hi = _mm_unpackhi_epi8(c, d);
+            __m512i z = _mm512_castsi128_si512(_mm_unpacklo_epi16(ab_lo, cd_lo));
+            z = _mm512_inserti32x4(z, _mm_unpackhi_epi16(ab_lo, cd_lo), 1);
+            z = _mm512_inserti32x4(z, _mm_unpacklo_epi16(ab_hi, cd_hi), 2);
+            z = _mm512_inserti32x4(z, _mm_unpackhi_epi16(ab_hi, cd_hi), 3);
+            int8_t *dst = qw + (size_t)(db / 16) * ts + (size_t)(jb / 4) * 64;
+            _mm512_storeu_si512((void *)dst, z);
+            __m512i s = _mm512_madd_epi16(_mm512_maddubs_epi16(ones8, z), ones16);
+            int32_t sum[16];
+            _mm512_storeu_si512((void *)sum, s);
+            int blk = jb / 128;
+            for (int d = 0; d < 16; d++) ws[(size_t)(db + d) * tpb + blk] += sum[d];
+        }
+        for (; jb < t; jb++) {                   /* tail: fewer than 4 keys */
+            const float *vr = v + (size_t)jb * rs + db;
+            int8_t *dst = qw + (size_t)(db / 16) * ts + (size_t)(jb / 4) * 64;
+            int e = jb & 3;
+            if (!e) memset(dst, 0, 64);
+            for (int d = 0; d < 16; d++) {
+                long x = lrintf(vr[d] * inv[d]);
+                if (x < -127) x = -127;
+                if (x > 127) x = 127;
+                dst[d * 4 + e] = (int8_t)x;
+                ws[(size_t)(db + d) * tpb + jb / 128] += (int32_t)x;
+            }
+        }
+    }
+    int j4 = (t + 3) >> 2;
+    if (j4 < tpad / 4) {
+        size_t nb = (size_t)(tpad / 4 - j4) * 64;
+        for (int dt = d0; dt < d1; dt += 16)
+            memset(qw + (size_t)(dt / 16) * ts + (size_t)j4 * 64, 0, nb);
+    }
+}
+#endif
+
 static void pack_vt_dims(attn_job *j, const float *v, int rs, int8_t *qw,
                          float *sc, int32_t *ws, int d0, int d1) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (!getenv("E2_PACK_SCALAR")) { pack_vt_dims_v(j, v, rs, qw, sc, ws, d0, d1); return; }
+#endif
     int t = j->t, tpad = j->tpad;
     int tpb = j->tpb, k4 = tpad / 4;
     size_t ts = (size_t)k4 * 64;

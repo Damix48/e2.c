@@ -406,7 +406,7 @@ static void rmsnorm_add_v(float *x, const float *src, const float *w, int rows,
 }
 
 __attribute__((target("avx512f")))
-static void gelu_mul_v(float *x, const float *up, int n) {
+static void gelu_mul_v3(float *o, const float *x, const float *up, int n) {
     const __m512 k = _mm512_set1_ps(0.7978845608028654f);
     const __m512 c = _mm512_set1_ps(0.044715f);
     const __m512 two = _mm512_set1_ps(2.0f);
@@ -419,9 +419,45 @@ static void gelu_mul_v(float *x, const float *up, int n) {
         __mmask16 sat = _mm512_cmp_ps_mask(t, big, _CMP_GT_OQ);
         __m512 r = _mm512_mul_ps(v, s);
         r = _mm512_mask_mov_ps(r, sat, v);
-        _mm512_storeu_ps(x + i, _mm512_mul_ps(r, _mm512_loadu_ps(up + i)));
+        _mm512_storeu_ps(o + i, _mm512_mul_ps(r, _mm512_loadu_ps(up + i)));
     }
-    for (; i < n; i++) x[i] = gelu1(x[i]) * up[i];
+    for (; i < n; i++) o[i] = gelu1(x[i]) * up[i];
+}
+
+static void gelu_mul_v(float *x, const float *up, int n) { gelu_mul_v3(x, x, up, n); }
+
+typedef struct { const float *x, *up; uint8_t *q; float *sc; int rows, k, blk; float *tmp; } gmq_arg;
+static void gelu_mul_q_work(void *vp, int tid, int nt) {
+    gmq_arg *a = vp;
+    int r0 = (int)((long)a->rows * tid / nt);
+    int r1 = (int)((long)a->rows * (tid + 1) / nt);
+    int nblk = a->k / a->blk;
+    float *t = a->tmp + (size_t)tid * a->k;
+    for (int r = r0; r < r1; r++) {
+        const float *xp = a->x + (size_t)r * a->k, *up = a->up + (size_t)r * a->k;
+#ifdef E2_X86OPS
+        if (simd() >= 2) gelu_mul_v3(t, xp, up, a->k);
+        else
+#endif
+            for (int i = 0; i < a->k; i++) t[i] = gelu1(xp[i]) * up[i];
+        e2_quant_rows_blk(t, 1, a->k, a->q + (size_t)r * a->k,
+                          a->sc + (size_t)r * nblk, a->blk);
+    }
+}
+
+/* tmp = gelu(x) * up, immediately quantised: the GEMM that consumes it reads
+ * the u8 form straight away, so the f32 intermediate never reaches memory. */
+void e2_gelu_mul_q(e2_ctx *ctx, const float *x, const float *up, int rows, int k,
+                   uint8_t *q, float *sc, int blk) {
+    if (!blk) blk = 128;
+    int nt = ctx && ctx->nthreads > 1 && (long)rows * k >= 65536 ? ctx->nthreads : 1;
+    if (nt > rows) nt = rows;
+    float *tmp = malloc((size_t)nt * k * sizeof(float));
+    if (!tmp) return;
+    gmq_arg a = {x, up, q, sc, rows, k, blk, tmp};
+    if (nt > 1) e2_parallel(ctx, gelu_mul_q_work, &a);
+    else gelu_mul_q_work(&a, 0, 1);
+    free(tmp);
 }
 
 typedef struct { float *x; const float *up; int n, chunk; } mul_arg;
@@ -464,8 +500,40 @@ static void rmsnorm_add_s(float *x, const float *src, const float *w, int rows,
  * splitting rows is enough to use every core; the dispatch costs 0.25 us. */
 typedef struct {
     float *out; const float *x, *src, *w;
-    int rows, dim; float eps, pre; int mode;   /* 0 norm, 1 pre, 2 add */
+    int rows, dim; float eps, pre; int mode;   /* 0 norm, 1 pre, 2 add, 3 rope */
+    const e2_rope_tab *tb; int per_pos; const int *seq_off; int nseq;
 } norm_arg;
+
+static inline void rot(float *x, const float *c, const float *s, int half);
+static void rmsnorm_rope_v(float *out, const float *x, const float *w, int rows,
+                           int dim, float eps, const e2_rope_tab *tb,
+                           int per_pos, const int *seq_off, int nseq, int r0);
+
+/* position of row `r` inside its sequence */
+static int rope_pos(int r, int per_pos, const int *seq_off, int nseq) {
+    int gt = r / per_pos;
+    int s = nseq - 1;
+    while (s > 0 && gt < seq_off[s]) s--;
+    return gt - seq_off[s];
+}
+
+/* norm then rotate: two L1-resident passes over one row. */
+static void rmsnorm_rope_span(float *out, const float *x, const float *w, int rows,
+                              int dim, float eps, const e2_rope_tab *tb,
+                              int per_pos, const int *seq_off, int nseq, int r0) {
+    int half = dim / 2;
+    float inv_dim = 1.0f / (float)dim;
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        int pos = rope_pos(r0 + r, per_pos, seq_off, nseq);
+        float sum = 0.0f;
+        for (int i = 0; i < dim; i++) sum += xp[i] * xp[i];
+        float s = 1.0f / sqrtf(sum * inv_dim + eps);
+        for (int i = 0; i < dim; i++) op[i] = xp[i] * s * (w ? w[i] : 1.0f);
+        rot(op, tb->c + (size_t)pos * half, tb->s + (size_t)pos * half, half);
+    }
+}
 
 static void norm_rows(norm_arg *a, int r0, int r1) {
     int dim = a->dim;
@@ -473,6 +541,18 @@ static void norm_rows(norm_arg *a, int r0, int r1) {
     const float *x = a->x + (size_t)r0 * dim;
     const float *src = a->src ? a->src + (size_t)r0 * dim : NULL;
     int rows = r1 - r0;
+    if (a->mode == 3) {
+#ifdef E2_X86OPS
+        if (simd() >= 2) {
+            rmsnorm_rope_v(out, x, a->w, rows, dim, a->eps, a->tb, a->per_pos,
+                           a->seq_off, a->nseq, r0);
+            return;
+        }
+#endif
+        rmsnorm_rope_span(out, x, a->w, rows, dim, a->eps, a->tb, a->per_pos,
+                          a->seq_off, a->nseq, r0);
+        return;
+    }
 #ifdef E2_X86OPS
     if (simd() >= 2) {
         if (a->mode == 1) { rmsnorm_pre_v(out, x, a->w, rows, dim, a->eps, a->pre); return; }
@@ -515,13 +595,13 @@ static void norm_run(e2_ctx *ctx, norm_arg *a) {
 
 void e2_rmsnorm_pre(e2_ctx *ctx, float *out, const float *x, const float *w,
                     int rows, int dim, float eps, float pre) {
-    norm_arg a = {out, x, NULL, w, rows, dim, eps, pre, 1};
+    norm_arg a = {out, x, NULL, w, rows, dim, eps, pre, 1, NULL, 0, NULL, 0};
     norm_run(ctx, &a);
 }
 
 void e2_rmsnorm_add(e2_ctx *ctx, float *x, const float *src, const float *w,
                     int rows, int dim, float eps) {
-    norm_arg a = {x, x, src, w, rows, dim, eps, 1.0f, 2};
+    norm_arg a = {x, x, src, w, rows, dim, eps, 1.0f, 2, NULL, 0, NULL, 0};
     norm_run(ctx, &a);
 }
 
@@ -544,7 +624,15 @@ void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n) {
 
 void e2_rmsnorm(e2_ctx *ctx, float *out, const float *x, const float *w, int rows,
                 int dim, float eps) {
-    norm_arg a = {out, x, NULL, w, rows, dim, eps, 1.0f, 0};
+    norm_arg a = {out, x, NULL, w, rows, dim, eps, 1.0f, 0, NULL, 0, NULL, 0};
+    norm_run(ctx, &a);
+}
+
+void e2_rmsnorm_rope(e2_ctx *ctx, float *x, const float *w, int rows, int dim,
+                     float eps, const e2_rope_tab *tb, int per_pos,
+                     const int *seq_off, int nseq) {
+    if (!tb) { e2_rmsnorm(ctx, x, x, w, rows, dim, eps); return; }
+    norm_arg a = {x, x, NULL, w, rows, dim, eps, 1.0f, 3, tb, per_pos, seq_off, nseq};
     norm_run(ctx, &a);
 }
 
@@ -574,7 +662,7 @@ static void l2norm_work(void *vp, int tid, int nt) {
 }
 
 void e2_l2norm_rows(e2_ctx *ctx, float *x, int rows, int dim) {
-    norm_arg a = {x, x, NULL, NULL, rows, dim, 0, 1.0f, 0};
+    norm_arg a = {x, x, NULL, NULL, rows, dim, 0, 1.0f, 0, NULL, 0, NULL, 0};
     if (!ctx || ctx->nthreads <= 1 || (long)rows * dim < 16384) {
         l2norm_span(x, rows, dim);
         return;
@@ -681,6 +769,46 @@ static inline void rot(float *x, const float *c, const float *s, int half) {
     rot_s(x, c, s, half);
 }
 
+/* vectorised RMSNorm + RoPE on one row (norm and rotation in one pass over
+ * the row, which is still in L1 between the two halves) */
+__attribute__((target("avx512f")))
+static void rmsnorm_rope_v(float *out, const float *x, const float *w, int rows,
+                           int dim, float eps, const e2_rope_tab *tb,
+                           int per_pos, const int *seq_off, int nseq, int r0) {
+    int half = dim / 2;
+    float inv_dim = 1.0f / (float)dim;
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        __m512 a0 = _mm512_setzero_ps(), a1 = a0;
+        int i = 0;
+        for (; i + 32 <= dim; i += 32) {
+            __m512 v0 = _mm512_loadu_ps(xp + i), v1 = _mm512_loadu_ps(xp + i + 16);
+            a0 = _mm512_fmadd_ps(v0, v0, a0);
+            a1 = _mm512_fmadd_ps(v1, v1, a1);
+        }
+        for (; i + 16 <= dim; i += 16) {
+            __m512 v0 = _mm512_loadu_ps(xp + i);
+            a0 = _mm512_fmadd_ps(v0, v0, a0);
+        }
+        float sum = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+        for (; i < dim; i++) sum += xp[i] * xp[i];
+        __m512 vs = _mm512_set1_ps(1.0f / sqrtf(sum * inv_dim + eps));
+        i = 0;
+        if (w) {
+            for (; i + 16 <= dim; i += 16)
+                _mm512_storeu_ps(op + i, _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(xp + i), vs),
+                                                       _mm512_loadu_ps(w + i)));
+        } else {
+            for (; i + 16 <= dim; i += 16)
+                _mm512_storeu_ps(op + i, _mm512_mul_ps(_mm512_loadu_ps(xp + i), vs));
+        }
+        for (; i < dim; i++) op[i] = w ? xp[i] * (vs[0] * w[i]) : xp[i] * vs[0];
+        int pos = rope_pos(r0 + r, per_pos, seq_off, nseq);
+        rot_v(op, tb->c + (size_t)pos * half, tb->s + (size_t)pos * half, half);
+    }
+}
+
 /* Build/extend a table covering positions [0,need) for `theta`. */
 static int rope_build(e2_rope_tab *tb, float theta, int half, int need) {
     if (tb->cap >= need && tb->half == half && tb->theta == theta && tb->c) return 0;
@@ -716,6 +844,10 @@ static e2_rope_tab *rope_pick(e2_rope_tab *tabs, float theta, int half, int need
     int i = (tabs[0].c == NULL) ? 0 : (tabs[1].c == NULL ? 1 : 0);
     if (rope_build(&tabs[i], theta, half, need)) return NULL;
     return &tabs[i];
+}
+
+e2_rope_tab *e2_rope_get(e2_ctx *ctx, float theta, int half, int need) {
+    return rope_pick(ctx->rope, theta, half, need);
 }
 
 typedef struct {

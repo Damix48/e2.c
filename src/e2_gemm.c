@@ -486,13 +486,40 @@ void e2_gemm_init(void) {
     if (pf) g_pf = atoi(pf);
 }
 
+/* One linear, including the input-clip path the shared-quantiser version
+ * cannot express. */
+static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
+
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l) {
-    const e2_qmat *w = &l->w;
+    if (l->in_min || l->in_max) { linear_one(ctx, y, x, m, l); return; }
+    e2_linear_forward_multi(ctx, x, m, &l, &y, 1);
+}
+
+/* Several linears reading the same activation row block (q/k/v, gate/up):
+ * quantise once and run every GEMM on it.  The quantiser was a full extra
+ * read+max pass over m*k floats for each of those. */
+void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
+                             const e2_linear *const *ls, float *const *ys, int n) {
+    const e2_qmat *w = &ls[0]->w;
     e2_gemm_init();
     int k = w->k;
     int blk = w->blk ? w->blk : BLK;
     int nblk = k / blk;
     if (!g_kernel || nblk == 0) return;
+    /* only the same-k, unclipped case shares the quantiser */
+    for (int i = 1; i < n; i++) {
+        const e2_qmat *q = &ls[i]->w;
+        if (q->k != k || (q->blk ? q->blk : BLK) != blk || ls[i]->in_min || ls[i]->in_max) {
+            linear_one(ctx, ys[i], x, m, ls[i]);
+            n = i;
+            break;
+        }
+    }
+    if (n <= 0) return;
+    if (ls[0]->in_min || ls[0]->in_max) {
+        for (int i = 0; i < n; i++) linear_one(ctx, ys[i], x, m, ls[i]);
+        return;
+    }
 
     int m4 = (m + 15) & ~15;
     size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
@@ -510,25 +537,6 @@ void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
     float *xs = ctx->sbuf;
     if (!xq || !xs) return;
 
-    if (l->in_min || l->in_max) {
-        float lo = l->in_min ? l->in_min[0] : -INFINITY;
-        float hi = l->in_max ? l->in_max[0] : INFINITY;
-        size_t tneed = (size_t)m * k;
-        if (ctx->tcap < tneed * sizeof(float)) {
-            free(ctx->tbuf);
-            ctx->tbuf = malloc(tneed * sizeof(float));
-            ctx->tcap = tneed * sizeof(float);
-        }
-        float *tmp = ctx->tbuf;
-        for (int i = 0; i < m * k; i++) {
-            float v = x[i];
-            if (v < lo) v = lo;
-            if (v > hi) v = hi;
-            tmp[i] = v;
-        }
-        x = tmp;
-    }
-
     if (ctx->nthreads > 1 && (long)m * k >= 262144) {
         quant_arg qa = {x, m, k, xq, xs, blk};
         e2_parallel(ctx, quant_work, &qa);
@@ -541,23 +549,101 @@ void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
             for (int b = 0; b < nblk; b++) xs[(size_t)r * nblk + b] = 1.0f;
     }
 
+    gemm_arg a = {0, xq, xs, nblk, m, k, w->n, w, g_kernel};
+    for (int i = 0; i < n; i++) {
+        const e2_linear *l = ls[i];
+        a.y = ys[i];
+        a.w = &l->w;
+        a.ns = l->w.n;
+        long work = (long)m * l->w.n * k;
+        if (ctx->nthreads <= 1 || work < 2000000L)
+            gemm_work(&a, 0, 1);
+        else
+            e2_parallel(ctx, gemm_work, &a);
+        if (l->w.bias || l->out_min || l->out_max) {
+            float lo = l->out_min ? l->out_min[0] : -INFINITY;
+            float hi = l->out_max ? l->out_max[0] : INFINITY;
+            int nn = l->w.n;
+            for (int r = 0; r < m; r++) {
+                float *yp = ys[i] + (size_t)r * nn;
+                if (l->w.bias)
+                    for (int j = 0; j < nn; j++) yp[j] += l->w.bias[j];
+                if (l->out_min || l->out_max)
+                    for (int j = 0; j < nn; j++) {
+                        if (yp[j] < lo) yp[j] = lo;
+                        if (yp[j] > hi) yp[j] = hi;
+                    }
+            }
+        }
+    }
+}
+
+static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l) {
+    const e2_qmat *w = &l->w;
+    e2_gemm_init();
+    int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
+    if (!g_kernel || nblk == 0) return;
+    int m4 = (m + 15) & ~15;
+    size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
+    if (ctx->qcap < qneed) {
+        free(ctx->qbuf);
+        ctx->qbuf = malloc(qneed);
+        ctx->qcap = qneed;
+    }
+    if (ctx->scap < sneed * sizeof(float)) {
+        free(ctx->sbuf);
+        ctx->sbuf = malloc(sneed * sizeof(float));
+        ctx->scap = sneed * sizeof(float);
+    }
+    uint8_t *xq = ctx->qbuf;
+    float *xs = ctx->sbuf;
+    if (!xq || !xs) return;
+    if (l->in_min || l->in_max) {
+        float lo = l->in_min ? l->in_min[0] : -INFINITY;
+        float hi = l->in_max ? l->in_max[0] : INFINITY;
+        size_t tneed = (size_t)m * k;
+        if (ctx->tcap < tneed * sizeof(float)) {
+            free(ctx->tbuf);
+            ctx->tbuf = malloc(tneed * sizeof(float));
+            ctx->tcap = ctx->tbuf ? tneed * sizeof(float) : 0;
+        }
+        float *tmp = ctx->tbuf;
+        if (!tmp) return;
+        for (int i = 0; i < m * k; i++) {
+            float v = x[i];
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            tmp[i] = v;
+        }
+        x = tmp;
+    }
+    if (ctx->nthreads > 1 && (long)m * k >= 262144) {
+        quant_arg qa = {x, m, k, xq, xs, blk};
+        e2_parallel(ctx, quant_work, &qa);
+    } else {
+        e2_quant_rows_blk(x, m, k, xq, xs, blk);
+    }
+    if (m4 > m) {
+        memset(xq + (size_t)m * k, 128, (size_t)(m4 - m) * k);
+        for (int r = m; r < m4; r++)
+            for (int b = 0; b < nblk; b++) xs[(size_t)r * nblk + b] = 1.0f;
+    }
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
     long work = (long)m * w->n * k;
     if (ctx->nthreads <= 1 || work < 2000000L)
         gemm_work(&a, 0, 1);
     else
         e2_parallel(ctx, gemm_work, &a);
-
     if (w->bias || l->out_min || l->out_max) {
         float lo = l->out_min ? l->out_min[0] : -INFINITY;
         float hi = l->out_max ? l->out_max[0] : INFINITY;
-        int n = w->n;
+        int nn = w->n;
         for (int r = 0; r < m; r++) {
-            float *yp = y + (size_t)r * n;
+            float *yp = y + (size_t)r * nn;
             if (w->bias)
-                for (int j = 0; j < n; j++) yp[j] += w->bias[j];
+                for (int j = 0; j < nn; j++) yp[j] += w->bias[j];
             if (l->out_min || l->out_max)
-                for (int j = 0; j < n; j++) {
+                for (int j = 0; j < nn; j++) {
                     if (yp[j] < lo) yp[j] = lo;
                     if (yp[j] > hi) yp[j] = hi;
                 }
@@ -615,6 +701,31 @@ void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
         gemm_work(&a, 0, 1);
     else
         e2_parallel(ctx, gemm_work, &a);
+}
+
+/* Caller-owned m4-padded u8 activation scratch (ctx->qbuf) plus its block
+ * scales, for the fused producer+quantiser paths. */
+uint8_t *e2_quant_scratch(e2_ctx *ctx, int m, int k, float **xs) {
+    int blk = BLK, m4 = (m + 15) & ~15, nblk = k / blk;
+    size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
+    if (ctx->qcap < qneed) {
+        free(ctx->qbuf);
+        ctx->qbuf = malloc(qneed);
+        ctx->qcap = ctx->qbuf ? qneed : 0;
+    }
+    if (ctx->scap < sneed * sizeof(float)) {
+        free(ctx->sbuf);
+        ctx->sbuf = malloc(sneed * sizeof(float));
+        ctx->scap = ctx->sbuf ? sneed * sizeof(float) : 0;
+    }
+    if (!ctx->qbuf || !ctx->sbuf) return NULL;
+    if (m4 > m) {
+        memset(ctx->qbuf + (size_t)m * k, 128, (size_t)(m4 - m) * k);
+        for (int r = m; r < m4; r++)
+            for (int b = 0; b < nblk; b++) ctx->sbuf[(size_t)r * nblk + b] = 1.0f;
+    }
+    *xs = ctx->sbuf;
+    return ctx->qbuf;
 }
 
 /* Single-threaded GEMM over an output-tile range [nb0, nb1).  Attention uses
@@ -763,7 +874,8 @@ int e2_pack_mat_into(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
     int blk = *blk_out ? *blk_out : BLK;
     if ((k % blk) || (k % 4)) return -1;
     int nbuf = (ctx && ctx->nthreads > 1 && (long)n * k >= 65536) ? ctx->nthreads : 1;
-    int8_t *rowbuf = malloc((size_t)k * nbuf);
+    int8_t sbuf[1024];
+    int8_t *rowbuf = k * nbuf <= (int)sizeof(sbuf) ? sbuf : malloc((size_t)k * nbuf);
     if (!rowbuf) return -1;
     pack_arg a = {w, n, k, rs, cs, blk, qw, sc, ws};
     int fast = (cs == 1 && (k % 16) == 0 && (blk % 16) == 0 && !getenv("E2_PACK_SCALAR"));
@@ -773,7 +885,7 @@ int e2_pack_mat_into(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
         e2_parallel(ctx, pack_work, &j);
     else
         pack_work(&j, 0, 1);
-    free(rowbuf);
+    if (rowbuf != sbuf) free(rowbuf);
     *blk_out = blk;
     return 0;
 }

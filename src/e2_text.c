@@ -47,6 +47,7 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
                           const int *seq_off, const int *seq_len, int nseq,
                           float *out) {
     int prof_on = getenv("E2_PROFILE") != NULL;
+    int dump = getenv("E2_DUMP") != NULL;
     double prof[16] = {0};
     double p2[10] = {0};
     double _q = 0;
@@ -91,31 +92,42 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
         if (li == 0) dump_tensor("l0_h", h, (size_t)n * H);
 
         _i = 3;
-        PROF_T(e2_linear_forward(ctx, q, h, n, &ly->q));
-        _i = 4;
-        PROF_T(e2_linear_forward(ctx, k, h, n, &ly->k));
-        _i = 5;
-        PROF_T(e2_linear_forward(ctx, v, h, n, &ly->v));
+        {
+            const e2_linear *ls[3] = {&ly->q, &ly->k, &ly->v};
+            float *ys[3] = {q, k, v};
+            PROF_T(e2_linear_forward_multi(ctx, h, n, ls, ys, 3));
+        }
         _i = 4;
 
         if (li == 0) dump_tensor("l0_vraw", v, (size_t)n * kvh * hd);
-        _q = e2_now_ms();
-        e2_rmsnorm(ctx, q, q, ly->q_norm, n * c->text_heads, hd, c->text_eps);
-        e2_rmsnorm(ctx, k, k, ly->k_norm, n * kvh, hd, c->text_eps);
-        e2_rmsnorm(ctx, v, v, NULL, n * kvh, hd, c->text_eps);
-        p2[2] += e2_now_ms() - _q;
-        if (li == 0) {
-            dump_tensor("l0_qpre", q, (size_t)n * c->text_heads * hd);
-            dump_tensor("l0_kpre", k, (size_t)n * kvh * hd);
-            dump_tensor("l0_vpre", v, (size_t)n * kvh * hd);
-        }
-
-        _q = e2_now_ms();
+        int window = ly->is_full ? -1 : c->text_sliding;
+        int tmax = seq_len[0];
+        for (int sq = 1; sq < nseq; sq++) if (seq_len[sq] > tmax) tmax = seq_len[sq];
         float theta = ly->is_full ? c->text_rope_theta_full : c->text_rope_theta_sliding;
-        for (int sq = 0; sq < nseq; sq++)
-            e2_rope_text(ctx, q + (size_t)seq_off[sq] * c->text_heads * hd,
-                         k + (size_t)seq_off[sq] * kvh * hd, seq_len[sq],
-                         c->text_heads, kvh, hd, 0, theta);
+        e2_rope_tab *rt = dump ? NULL : e2_rope_get(ctx, theta, hd / 2, tmax);
+        _q = e2_now_ms();
+        if (rt) {
+            e2_rmsnorm_rope(ctx, q, ly->q_norm, n * c->text_heads, hd, c->text_eps,
+                            rt, c->text_heads, seq_off, nseq);
+            e2_rmsnorm_rope(ctx, k, ly->k_norm, n * kvh, hd, c->text_eps,
+                            rt, kvh, seq_off, nseq);
+            e2_rmsnorm(ctx, v, v, NULL, n * kvh, hd, c->text_eps);
+        } else {
+            e2_rmsnorm(ctx, q, q, ly->q_norm, n * c->text_heads, hd, c->text_eps);
+            e2_rmsnorm(ctx, k, k, ly->k_norm, n * kvh, hd, c->text_eps);
+            e2_rmsnorm(ctx, v, v, NULL, n * kvh, hd, c->text_eps);
+            p2[2] += e2_now_ms() - _q;
+            if (li == 0) {
+                dump_tensor("l0_qpre", q, (size_t)n * c->text_heads * hd);
+                dump_tensor("l0_kpre", k, (size_t)n * kvh * hd);
+                dump_tensor("l0_vpre", v, (size_t)n * kvh * hd);
+            }
+            _q = e2_now_ms();
+            for (int sq = 0; sq < nseq; sq++)
+                e2_rope_text(ctx, q + (size_t)seq_off[sq] * c->text_heads * hd,
+                             k + (size_t)seq_off[sq] * kvh * hd, seq_len[sq],
+                             c->text_heads, kvh, hd, 0, theta);
+        }
         p2[1] += e2_now_ms() - _q;
         if (li == 0 && nseq == 1) {
             dump_tensor("l0_q", q, (size_t)n * c->text_heads * hd);
@@ -123,7 +135,6 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
             dump_tensor("l0_v", v, (size_t)n * kvh * hd);
         }
 
-        int window = ly->is_full ? -1 : c->text_sliding;
         int same_len = nseq > 1;
         for (int sq = 1; sq < nseq && same_len; sq++)
             if (seq_len[sq] != seq_len[0]) same_len = 0;
@@ -156,15 +167,26 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
         e2_rmsnorm(ctx, h, x, ly->pre_ff_norm, n, H, c->text_eps);
         p2[4] += e2_now_ms() - _q;
         _i = 9;
-        PROF_T(e2_linear_forward(ctx, tmp, h, n, &ly->gate));
+        {
+            const e2_linear *ls[2] = {&ly->gate, &ly->up};
+            float *ys[2] = {tmp, up};
+            PROF_T(e2_linear_forward_multi(ctx, h, n, ls, ys, 2));
+        }
         _i = 10;
-        PROF_T(e2_linear_forward(ctx, up, h, n, &ly->up));
-        _i = 14;
         _q = e2_now_ms();
-        e2_gelu_mul(ctx, tmp, up, n * c->text_inter);
-        p2[5] += e2_now_ms() - _q;
-        _i = 11;
-        PROF_T(e2_linear_forward(ctx, h, tmp, n, &ly->down));
+        float *gs = NULL;
+        uint8_t *gq = e2_quant_scratch(ctx, n, c->text_inter, &gs);
+        if (gq) {
+            e2_gelu_mul_q(ctx, tmp, up, n, c->text_inter, gq, gs, 128);
+            p2[5] += e2_now_ms() - _q;
+            _i = 11;
+            PROF_T(e2_linear_forward_pq(ctx, h, gq, gs, n, &ly->down));
+        } else {
+            e2_gelu_mul(ctx, tmp, up, n * c->text_inter);
+            p2[5] += e2_now_ms() - _q;
+            _i = 11;
+            PROF_T(e2_linear_forward(ctx, h, tmp, n, &ly->down));
+        }
         _q = e2_now_ms();
         e2_rmsnorm_add(ctx, x, h, ly->post_ff_norm, n, H, c->text_eps);
         p2[6] += e2_now_ms() - _q;

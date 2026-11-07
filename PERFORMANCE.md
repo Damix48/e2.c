@@ -565,31 +565,74 @@ alone is `n x 24 x 512` floats). perf attributes 53% of P-core cycles to
 `gemm_avxvnni` and **28% to the pool spin loop**, i.e. a large part of the
 non-GEMM time is the main thread running alone.
 
-### Measured state after round 5 (`--repeat 2 --iters 3`, quiet host, 8 threads)
+### Measured state after round 5 (`--repeat 2 --iters 3`, quiet-ish host, 8 threads)
 
-e2 / ov-int8, lower is better, **<= 0.67 is the 1.5x goal**:
+e2 / ov-int8, lower is better, **<= 0.67 is the 1.5x goal**. Same run for both
+engines, medians pooled over 6 samples per row:
 
-| task | length | e2 ms | ov-int8 ms | ratio | round 5 start |
-|---|---:|---:|---:|---:|---:|
-| text | 8 | 4.4 | 6.5 | 0.68 | 1.26 |
-| text | 64 | 11.9 | 24.2 | **0.49** | 1.12 |
-| text | 128 | 23.0 | 47.8 | **0.48** | 1.21 |
-| text | 512 | 90.8 | 203.0 | **0.45** | 0.74 |
-| text | 2048 | 583.4 | 1378.5 | **0.42** | 0.61 |
-| batch | 8x64 | 82.7 | 154.9 | **0.53** | 0.89 |
-| batch | 32x64 | 443.4 | 615.7 | 0.72 | 0.97 |
-| image | 270 tok | 760.0 | 1482.9 | **0.51** | 1.06 |
-| audio | 54 tok | 38.4 | 55.2 | 0.70 | 1.39 |
-| video | 8 frames | 2337.4 | 5042.0 | **0.46** | 0.97 |
+| task | length | e2 ms | ov-int8 ms | ratio | speedup | round 5 start |
+|---|---:|---:|---:|---:|---:|---:|
+| text | 8 | 4.6 | 7.0 | **0.66** | 1.52x | 1.26 |
+| text | 64 | 11.9 | 22.9 | **0.52** | 1.92x | 1.12 |
+| text | 128 | 24.0 | 47.6 | **0.50** | 2.00x | 1.21 |
+| text | 512 | 84.4 | 205.8 | **0.41** | 2.44x | 0.74 |
+| text | 2048 | 452.0 | 1395.1 | **0.32** | 3.09x | 0.61 |
+| batch | 8x64 | 73.5 | 154.9 | **0.47** | 2.11x | 0.89 |
+| batch | 32x64 | 305.1 | 625.1 | **0.49** | 2.05x | 0.97 |
+| image | 270 tok | 649.7 | 1499.9 | **0.43** | 2.31x | 1.06 |
+| audio | 54 tok | 35.5 | 57.4 | **0.62** | 1.62x | 1.39 |
+| video | 8 frames | 2271.3 | 5077.4 | **0.45** | 2.24x | 0.97 |
 
-The batch 32x64 row above predates the L1-accumulator kernel; measured
-interleaved against the pre-change binary it goes 1216 -> 615 ms, i.e. ~0.36.
-Remaining over the line: text 8 (0.68), audio (0.70) and batch 32x64 before
-the accumulator change.
+**Every row is at or past the 1.5x target.** Absolute e2 throughput over the
+round: text 8 9.3 -> 4.6 ms, text 64 27.9 -> 11.9, text 128 54.8 -> 24.0,
+text 512 155.6 -> 84.4, text 2048 879 -> 452, batch 32x64 621 -> 305,
+image 1649 -> 650, audio 79 -> 35.5, video 4981 -> 2271.
 
-Accuracy is unchanged (the kernel changes are numerically equivalent):
-`e2_acc.py text` -> embedding 0.99970, last_hidden_state 0.99938, per-layer
-0.9994-0.9999.
+The two narrowest margins are text 8 (1.52x) and audio (1.62x). text 8 streams
+the whole 133 MB of text weights in 4.6 ms = 29 GB/s, which is at this
+machine's practical sequential-read limit, so it cannot improve much further
+without touching fewer bytes. Audio's margin comes from the conformer tower
+(12 layers, T=50: the GEMM there is DRAM-bound because each weight is used
+only 50 times).
+
+### Accuracy (vs the float32 HuggingFace reference, `tools/e2_acc.py`)
+
+| dump | cosine | round 4 |
+|---|---|---|
+| text `embedding` | 0.99970 | 0.99970 |
+| text `last_hidden_state` | 0.99938 | 0.99938 |
+| text per-layer | 0.9994-0.9999 | same |
+| image `image_soft` | 0.97788 | 0.97867 |
+| audio `audio_soft` | 0.99361 | 0.99847 |
+
+The audio number moved because the conformer tower amplifies activation
+quantisation noise the same way the vision tower does: a 1e-7 change in a
+layer-1 intermediate crosses u8 rounding boundaries and the trajectories then
+diverge (aud_feat and aud_in are bit-identical, layer 1 differs by 1e-4 rms
+and the final audio embedding lands 0.6% away). The vectorised path is not
+"wrong" (with the ops forced back to scalar, `E2_OPS_SCALAR=1`, the current
+build reproduces the pre-round binary to 0.9995), it is a different sample of
+the same chaotic system. Worth re-checking if audio retrieval quality is ever
+questioned; the fix would be higher-precision activation quantisation in that
+tower, not a different kernel.
+
+### Bugs found while validating (all three would have shipped silently)
+
+* `e2_linear_forward_multi` **truncated its linear list** at the first linear
+  that needed an input clip or had a different k: `n = i; break;` skipped every
+  linear after it. The audio tower's q/k/v are all clipped linears, so the new
+  shared-quantiser call computed q and k and left `v` as whatever was in the
+  arena. Caught by comparing staged dumps against the previous binary
+  (`aud_l1` cosine 0.90). The fix runs each incompatible linear through the
+  single-linear path and keeps the shared quantiser for the rest.
+* The audio attention used `-INFINITY` as its mask sentinel and then passed the
+  score row through `tanh`. `tanh` maps -inf to -1, so the sentinel was gone;
+  worse, the vectorised `tanh` turned it into **NaN** (`rcp(inf)` then
+  `r*(2-inf*0)`), which poisoned the whole row. The mask now lives in its own
+  `uint8_t ok[]` array and `tanh_v`/`tanh_a2` clamp their input to +-20 first
+  (tanh(20) is already exactly 1 in f32), so +-inf can never reach the exp.
+* `e2_ops.c`'s AVX2 `simd()` returned 1 for AVX2 without checking FMA, which
+  would have run the FMA kernels on a pre-Haswell part.
 
 ### Notes for the next round
 
@@ -606,3 +649,26 @@ Accuracy is unchanged (the kernel changes are numerically equivalent):
 4. The 28% spin in `worker` is idle time of the *workers* while the main thread
    runs serial code. Cutting the number of serial regions (or the dispatch
    count) is worth more than any kernel work at 8 threads.
+
+### Debug switches added this round
+
+`E2_KERNEL=scalar|avx2|avxvnni|avx512`, `E2_QUANT=scalar|avx2|avx512`,
+`E2_GEMM_RB=N` (row block, 32 default), `E2_GEMM_PF=N` (weight prefetch
+distance in 64-byte rows, 48 default), `E2_POOL_SPIN=N` (20000),
+`E2_OPS_SCALAR=1` (force the scalar elementwise ops; the audio dump comparison
+above uses it), `E2_DEBUG_TW=1` (print the per-thread speed weights),
+`E2_GTIME` was used temporarily and is gone.
+
+### Reproduce
+
+```bash
+make && make tests/e2_bench_full
+. .venv/bin/activate
+python tools/bench_compare.py --model ~/Projects/embeddinggemma-2 \
+    --sources e2,ov-int8 --repeat 2 --iters 3 --threads 8   # -> ratio table
+python tools/e2_acc.py text|image|audio --model ~/Projects/embeddinggemma-2
+```
+
+The box is shared and thermally throttled: a single run of the same binary can
+read 4.6 or 8.0 ms on text 8 depending on what else is running. Only the
+same-run e2-vs-OV ratio means anything, and `--repeat 2` or 3 is required.

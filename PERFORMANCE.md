@@ -186,7 +186,7 @@ ms values below are from the quieter run (`/tmp/bench3.json`).
 | Per-head parallel vision attention (one worker per kv head, serial GEMM inside) | 3.4 → 1.5 ms at t=1024, but no gain at t≈2400 and it segfaulted intermittently with 8 threads (fault at a heap mapping edge, not reproduced under ASAN). Removed. |
 | Audio conv rewritten channel-last with AVX-512 over output channels | subsample 7 → 13 ms and audio tower cosine vs HF fell 0.99909 → 0.9987 (chaotic amplification). Reverted. |
 | Volatile float sums in the new layernorm | restored bit-order but made LN ~5x slower. `optimize("no-fast-math")` was the right tool. |
-| Explicit weight prefetch in the GEMM K loop | noisy, no consistent gain; `E2_GEMM_PF` default 0. |
+| Explicit weight prefetch in the GEMM K loop | noisy, no consistent gain; removed in round 4. |
 | RB sweep 32/64/128/off | 64 best at m=2048, off/big-RB best at m≤128. `E2_GEMM_RB` selects at runtime. |
 | Moving the row-block loop outside the column-tile loop | ~7% at m=2048, neutral at m=512; kept because it also keeps activations in L1. |
 
@@ -242,7 +242,8 @@ python tools/bench_compare.py --sources e2,ov-int8 --repeat 2 --json /tmp/bench.
 ```
 
 Useful debug switches: `E2_ATTN_F32=1` (f32 attention), `E2_ATTN_FUSED_SQ=1`
-(fused softmax+quant experiment), `E2_GEMM_RB=N`, `E2_GEMM_PF=N`,
+(fused softmax+quant experiment), `E2_GEMM_RB=N`, `E2_ATTN_R=N`,
+`E2_NOFUSE=1` (separate rope pass, needed for the `l0_qpre` dumps),
 `E2_PACK_SCALAR=1`, `E2_KERNEL=scalar|avx2|avx512`, `E2_PROFILE=1`.
 
 ## Round 3 — the non-GEMM half of the forward
@@ -276,7 +277,7 @@ addressed below.
 | try | outcome |
 |---|---|
 | **f32 accumulators held across k-blocks** (4 rows x 2 tiles, 8 int + 8 f32) to remove the per-k-block output read-modify-write | **slower**: 0.67 → 0.81 ms warm, 0.93 → 1.32 cold at m=2048 k=2048 n=512. The 17% extra issue slots (1.75 vs 1.5 uops per dpbusd) cost more than the saved output traffic; the 4x4 kernel's uop ratio is the binding constraint, not the epilogue. |
-| explicit weight prefetch (`E2_GEMM_PF=4/8/16/24`) | 0-7%, inside the noise of a shared box |
+| explicit weight prefetch in the GEMM K loop (`E2_GEMM_PF`) | 0-7%, inside the noise of a shared box. Removed in round 4. |
 | RB 16/32/64/128 for the short-text rows | 32 marginally best (7.0 vs 7.5 ms at text 64), within noise |
 | loading the model with `malloc`+`pread`+`MADV_HUGEPAGE` instead of a file mapping (to get huge-page TLB coverage) | identical: audio 41.9 vs 41.9 ms. Bandwidth was not TLB-limited. |
 | spinning pool workers 2 M times instead of 20 k before sleeping | **much worse** for the serial phases (mel 4 → 21 ms): idle workers steal issue slots from the one doing the work even with 1:1 pinning |
@@ -407,7 +408,8 @@ So a GEMM whose weights are read once per forward (every GEMM in a forward)
 loses 35-45% to the DRAM stream. At m=2048 with n=2048/k=512 that stream is only
 1 MB per GEMM — a few GB/s — so it is the *first touch of each line* stalling
 the pipeline, not bandwidth. Prefetching the next k-block of all four tiles
-(`E2_GEMM_PB`, on by default) recovers 5-9% of it and nothing else did.
+recovers 5-9% of it in the microbenchmark but nothing end to end (see the
+"did not work" table), so the kernel is back to plain loads.
 
 ### Wins kept (measured end-to-end, same-run ratios)
 
@@ -418,15 +420,15 @@ the pipeline, not bandwidth. Prefetching the next k-block of all four tiles
 | **`gelu(x)*up` fused into the down-projection quantiser** (`e2_gelu_mul_q`): the 2048-wide f32 intermediate was written and read back only to be quantised. Now it is computed into a per-thread L1 row buffer and quantised in place. | batch32 mlp_down 26.6 → 19.1 ms |
 | **Vectorised V^T packer** (`pack_vt_dims_v`): float→int8 with a per-dim scale, then a 4x16 byte transpose built from three unpack levels, and the per-dim sums the zero-point correction needs fall out of `vpmaddubsw`+`vpmaddwd` on the transposed zmm. `_mm512_cvtsepi32_epi8` replaces the scalar `lrintf`+clamp pair. Bit-identical to the scalar path. | batch 32x64 attention pack 12 → 3 ms; helps every t |
 | **No malloc in the K packer** (`e2_pack_mat_into` used to `malloc(k)` per 16-row tile, i.e. 12288 times per batch32 forward) | batch32 −6 ms, text128 −0.7 ms |
-| **Cached attention score tiles** (`attn_item` rewritten): the key band is scored `cw` keys at a time with an online (running) max/sum instead of a global max over a full-width tile, and `R` (queries per K/V pass) no longer has to be shrunk to fit the tile — it is now 256 for t = 2394 where it used to be 16. | vision attention 103 → ~85 ms; more importantly it made `vis_*` dump comparisons sane again |
-| prefetch the next k-block of weights (`E2_GEMM_PB`) | +5-9% on cold GEMM microbenchmarks |
+| 8-accumulator `mb peak` (was measuring `vpdpbusd` latency, not throughput) | corrects the ceiling from 2.8 to 4.0 TMAC/s and reframes every later decision |
 
 ### Tried, measured, reverted or not kept
 
 | try | outcome |
 |---|---|
+| **Flash-style chunked attention** (`attn_item` rewritten: score `cw` keys at a time with an online max/sum so the score tile stays in L2, and `R` freed from the scratch-size clamp — 256 for t = 2394 instead of 16). The premise was that the vision attention is score-matrix-bandwidth bound (6 passes over 275 MB per layer). Measured: vision attention 103 → 113 ms, image -1.7%, text 2048 flat. The 4-tile GEMM is limited by the *weight* stream (m = 16 per query block) and by score-tile writes, not by the softmax passes over it, and the extra per-chunk output rescale/add costs as much as the saved cache traffic. Reverted. |
 | `E2_GEMM_RB=128/256/1024` | *better* in the cold microbenchmark at m=512 (2.43 → 2.68 TMAC/s) but **worse end-to-end** (text512 41.2 → 44.7, batch32 177 → 193). In situ the weights are re-read from L2 by later row blocks, and a bigger RB evicts the activation slab. Kept 64. |
-| per-iteration weight prefetch (`E2_GEMM_PF`) | 0-7%, inside noise. Default off. |
+| weight prefetch, both the per-iteration form and 1/2/4 k-blocks ahead (`E2_GEMM_PF`, `E2_GEMM_PB`): +5-9% on `mb cold` in isolation but **neutral to -11% end to end**, because in situ the weights are re-read from L2 by the later row blocks and the prefetch traffic only pollutes. Both removed from the kernel in round 4. |
 | 16 threads (SMT) for the streaming-bound shapes (m=50..2048) | 20-40% slower everywhere. |
 | linearator with 3 tiles (12 int + 12 f32 accumulators to hold f32 across k-blocks) | not implemented — 31 zmm is over budget once pointers/broadcasts are counted, and 8 accumulators is exactly the 2/cycle dependency limit. |
 | holding f32 accumulators over all k (round 3, 4x2 tiles) | already measured slower; the 8 int accumulator ILP is the binding constraint. |

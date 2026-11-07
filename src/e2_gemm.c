@@ -206,61 +206,133 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
 #endif
 
 /* ------------------------------------------------------------------ */
-/* AVX2: 8 rows x 4 k, widened to 16-bit (no saturation)              */
-/* ------------------------------------------------------------------ */
-
+/* AVX2: 16 rows x 4 k widened to i16 (vpmaddubsw would saturate: a u8 x i8
+ * pair sum reaches 64k > i16).  The two `vpmaddwd` partials a row produces
+ * stay interleaved in one ymm and are summed once per K block, so the inner
+ * loop is 4 loads+4 madd+4 add for 64 MACs. */
 #ifdef E2_X86
 __attribute__((target("avx2")))
 static void gemm_avx2(float *y, int ns, const uint8_t *xq, const float *xs,
                       int xss, int m, int k, const e2_qmat *w, int nb0, int nb1) {
-    int k4 = k / 4, nblk = k / BLK;
+    int blk = w->blk ? w->blk : BLK, nblk = k / blk;
+    size_t ts = w->tstride ? w->tstride : (size_t)(k / 4) * 64;
+    int wss = w->wsmstride ? w->wsmstride : nblk;
     for (int nb = nb0; nb < nb1; nb++) {
         int n0 = nb * 16;
         int cnt = w->n - n0; if (cnt > 16) cnt = 16;
-        const int8_t *wp = w->q + (size_t)nb * k4 * 64;
-        for (int r = 0; r < m; r++) {
-            const uint8_t *ap = xq + (size_t)r * k;
-            float *yp = y + (size_t)r * ns + n0;
-            for (int b = 0; b < nblk; b++) {
-                int32_t acc[16];
-                for (int t = 0; t < cnt; t++) acc[t] = -128 * w->wsum[(size_t)(n0 + t) * nblk + b];
-                for (int kb = b * (BLK / 4); kb < (b + 1) * (BLK / 4); kb++) {
-                    const int8_t *wv = wp + (size_t)kb * 64;
-                    uint32_t a4;
+        const int8_t *wp = w->q + (size_t)nb * ts;
+        __m256 ws0 = _mm256_loadu_ps(w->scale + n0);
+        __m256 ws1 = _mm256_loadu_ps(w->scale + n0 + 8);
+        for (int b = 0; b < nblk; b++) {
+            int32_t wsbuf[16];
+            for (int t = 0; t < 16; t++) wsbuf[t] = -128 * w->wsum[(size_t)(n0 + t) * wss + b];
+            const int8_t *wq = wp + (size_t)b * (blk / 4) * 64;
+            for (int r = 0; r < m; r++) {
+                const uint8_t *ap = xq + (size_t)r * k + (size_t)b * blk;
+                __m256i acc[4];
+                memset(acc, 0, sizeof(acc));
+                for (int kb = 0; kb < blk / 4; kb++) {
+                    int a4;
                     memcpy(&a4, ap + (size_t)kb * 4, 4);
-                    __m256i av = _mm256_set1_epi32((int)a4);
-                    __m128i a8 = _mm256_castsi256_si128(av);
-                    int t = 0;
-                    for (; t + 8 <= cnt; t += 8) {
-                        __m256i w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(wv + t * 4)));
-                        __m256i w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(wv + (t + 4) * 4)));
-                        __m256i a0 = _mm256_cvtepu8_epi16(a8);
-                        __m256i p0 = _mm256_madd_epi16(w0, a0);
-                        __m256i p1 = _mm256_madd_epi16(w1, a0);
-                        __m128i s0 = _mm_hadd_epi32(_mm256_castsi256_si128(p0),
-                                                    _mm256_extracti128_si256(p0, 1));
-                        __m128i s1 = _mm_hadd_epi32(_mm256_castsi256_si128(p1),
-                                                    _mm256_extracti128_si256(p1, 1));
-                        acc[t + 0] += _mm_extract_epi32(s0, 0);
-                        acc[t + 1] += _mm_extract_epi32(s0, 1);
-                        acc[t + 2] += _mm_extract_epi32(s0, 2);
-                        acc[t + 3] += _mm_extract_epi32(s0, 3);
-                        acc[t + 4] += _mm_extract_epi32(s1, 0);
-                        acc[t + 5] += _mm_extract_epi32(s1, 1);
-                        acc[t + 6] += _mm_extract_epi32(s1, 2);
-                        acc[t + 7] += _mm_extract_epi32(s1, 3);
-                    }
-                    for (; t < cnt; t++) {
-                        const int8_t *q = wv + t * 4;
-                        uint8_t a0 = a4, a1 = a4 >> 8, a2 = a4 >> 16, a3 = a4 >> 24;
-                        acc[t] += a0 * q[0] + a1 * q[1] + a2 * q[2] + a3 * q[3];
+                    __m256i a16 = _mm256_cvtepu8_epi16(
+                        _mm256_castsi256_si128(_mm256_set1_epi32(a4)));
+                    const int8_t *wv = wq + (size_t)kb * 64;
+                    for (int g = 0; g < 4; g++) {
+                        __m256i w16 = _mm256_cvtepi8_epi16(
+                            _mm_loadu_si128((const __m128i *)(wv + g * 16)));
+                        acc[g] = _mm256_add_epi32(acc[g], _mm256_madd_epi16(w16, a16));
                     }
                 }
-                float s = xs[(size_t)r * xss + b];
+                int32_t part[32];
+                for (int g = 0; g < 4; g++)
+                    _mm256_storeu_si256((__m256i *)(part + g * 8), acc[g]);
+                int32_t sum[16];
+                for (int t = 0; t < 16; t++) sum[t] = part[2 * t] + part[2 * t + 1] + wsbuf[t];
+                __m256 s0 = _mm256_set1_ps(xs[(size_t)r * xss + b]);
+                __m256 f0 = _mm256_mul_ps(_mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)sum)), s0), ws0);
+                __m256 f1 = _mm256_mul_ps(_mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)(sum + 8))), s0), ws1);
+                float out[16];
+                _mm256_storeu_ps(out, f0);
+                _mm256_storeu_ps(out + 8, f1);
+                float *yp = y + (size_t)r * ns + n0;
                 if (b == 0)
-                    for (int t = 0; t < cnt; t++) yp[t] = (float)acc[t] * s * w->scale[n0 + t];
+                    for (int t = 0; t < cnt; t++) yp[t] = out[t];
                 else
-                    for (int t = 0; t < cnt; t++) yp[t] += (float)acc[t] * s * w->scale[n0 + t];
+                    for (int t = 0; t < cnt; t++) yp[t] += out[t];
+            }
+        }
+    }
+}
+#endif
+
+/* AVX-VNNI (Alder Lake / Arrow Lake / Zen 5 have the 256-bit VEX form):
+ * 4 rows x 1 tile, 8 accumulators, ~18 MAC/uop. */
+#ifdef E2_X86
+__attribute__((target("avx2,avxvnni")))
+static void gemm_avxvnni(float *y, int ns, const uint8_t *xq, const float *xs,
+                         int xss, int m, int k, const e2_qmat *w, int nb0, int nb1) {
+    int blk = w->blk ? w->blk : BLK, nblk = k / blk;
+    size_t ts = w->tstride ? w->tstride : (size_t)(k / 4) * 64;
+    int wss = w->wsmstride ? w->wsmstride : nblk;
+    const __m256i k128 = _mm256_set1_epi32(128);
+    for (int nb = nb0; nb < nb1; nb++) {
+        int n0 = nb * 16;
+        int cnt = w->n - n0; if (cnt > 16) cnt = 16;
+        const int8_t *wp = w->q + (size_t)nb * ts;
+        __m256 wscale0 = _mm256_loadu_ps(w->scale + n0);
+        __m256 wscale1 = _mm256_loadu_ps(w->scale + n0 + 8);
+        for (int b = 0; b < nblk; b++) {
+            int32_t wsbuf[16];
+            for (int t = 0; t < 16; t++) wsbuf[t] = w->wsum[(size_t)(n0 + t) * wss + b];
+            __m256i base0 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_mullo_epi32(
+                _mm256_loadu_si256((const __m256i *)wsbuf), k128));
+            __m256i base1 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_mullo_epi32(
+                _mm256_loadu_si256((const __m256i *)(wsbuf + 8)), k128));
+            const int8_t *wq = wp + (size_t)b * (blk / 4) * 64;
+            for (int r0 = 0; r0 < m; r0 += 4) {
+                int mm = m - r0; if (mm > 4) mm = 4;
+                const uint8_t *ap = xq + (size_t)r0 * k + (size_t)b * blk;
+                __m256i a0l = base0, a0h = base1, a1l = base0, a1h = base1;
+                __m256i a2l = base0, a2h = base1, a3l = base0, a3h = base1;
+                for (int kb = 0; kb < blk / 4; kb++) {
+                    const int8_t *wv = wq + (size_t)kb * 64;
+                    __m256i wl = _mm256_loadu_si256((const __m256i *)wv);
+                    __m256i wh = _mm256_loadu_si256((const __m256i *)(wv + 32));
+                    int x0, x1, x2, x3;
+                    memcpy(&x0, ap + (size_t)kb * 4, 4);
+                    memcpy(&x1, ap + k + (size_t)kb * 4, 4);
+                    memcpy(&x2, ap + 2 * k + (size_t)kb * 4, 4);
+                    memcpy(&x3, ap + 3 * k + (size_t)kb * 4, 4);
+                    __m256i v;
+                    v = _mm256_set1_epi32(x0);
+                    a0l = _mm256_dpbusd_epi32(a0l, v, wl);
+                    a0h = _mm256_dpbusd_epi32(a0h, v, wh);
+                    v = _mm256_set1_epi32(x1);
+                    a1l = _mm256_dpbusd_epi32(a1l, v, wl);
+                    a1h = _mm256_dpbusd_epi32(a1h, v, wh);
+                    v = _mm256_set1_epi32(x2);
+                    a2l = _mm256_dpbusd_epi32(a2l, v, wl);
+                    a2h = _mm256_dpbusd_epi32(a2h, v, wh);
+                    v = _mm256_set1_epi32(x3);
+                    a3l = _mm256_dpbusd_epi32(a3l, v, wl);
+                    a3h = _mm256_dpbusd_epi32(a3h, v, wh);
+                }
+                __m256i R[4][2] = {{a0l, a0h}, {a1l, a1h}, {a2l, a2h}, {a3l, a3h}};
+                for (int i = 0; i < mm; i++) {
+                    float *yp = y + (size_t)(r0 + i) * ns + n0;
+                    __m256 s = _mm256_set1_ps(xs[(size_t)(r0 + i) * xss + b]);
+                    float out[16];
+                    _mm256_storeu_ps(out, _mm256_mul_ps(_mm256_mul_ps(
+                        _mm256_cvtepi32_ps(R[i][0]), s), wscale0));
+                    _mm256_storeu_ps(out + 8, _mm256_mul_ps(_mm256_mul_ps(
+                        _mm256_cvtepi32_ps(R[i][1]), s), wscale1));
+                    if (b == 0)
+                        for (int t = 0; t < cnt; t++) yp[t] = out[t];
+                    else
+                        for (int t = 0; t < cnt; t++) yp[t] += out[t];
+                }
             }
         }
     }
@@ -326,7 +398,9 @@ static gemm_kernel select_kernel(void) {
     __builtin_cpu_init();
     if (force && !strcmp(force, "avx2")) return gemm_avx2;
     if (force && !strcmp(force, "avx512")) return gemm_avx512;
+    if (force && !strcmp(force, "avxvnni")) return gemm_avxvnni;
     if (__builtin_cpu_supports("avx512vnni")) return gemm_avx512;
+    if (__builtin_cpu_supports("avxvnni")) return gemm_avxvnni;
     if (__builtin_cpu_supports("avx2")) return gemm_avx2;
 #endif
 #if defined(E2_ARM) && defined(__ARM_FEATURE_DOTPROD)
@@ -843,6 +917,19 @@ static void pack_rows_s(const pack_arg *a, int r0, int r1) {
 
 typedef struct { const pack_arg *a; int fast, rows; int8_t *rowbuf; } pack_job;
 
+static int pack_fast_ok(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = 0;
+#ifdef E2_X86
+        __builtin_cpu_init();
+        v = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")
+            && __builtin_cpu_supports("avx512vl");
+#endif
+    }
+    return v;
+}
+
 static void pack_work(void *vp, int tid, int nt) {
     pack_job *j = vp;
     int r0 = (int)((long)j->rows * tid / nt);
@@ -865,7 +952,8 @@ int e2_pack_mat_into(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
     int8_t *rowbuf = k * nbuf <= (int)sizeof(sbuf) ? sbuf : malloc((size_t)k * nbuf);
     if (!rowbuf) return -1;
     pack_arg a = {w, n, k, rs, cs, blk, qw, sc, ws};
-    int fast = (cs == 1 && (k % 16) == 0 && (blk % 16) == 0 && !getenv("E2_PACK_SCALAR"));
+    int fast = (cs == 1 && (k % 16) == 0 && (blk % 16) == 0 &&
+                !getenv("E2_PACK_SCALAR") && pack_fast_ok());
     int ntile = (n + 15) / 16;
     pack_job j = {&a, fast, ntile * 16, rowbuf};
     if (nbuf > 1)

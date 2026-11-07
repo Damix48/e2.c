@@ -1191,7 +1191,7 @@ void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
     if (t <= 0 || heads <= 0) return;
     static int noint8 = -1;
     if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
-    if (!noint8 && simd() >= 2 && t >= 32) {
+    if (!noint8 && simd() >= 1 && t >= 32) {
         int off = 0;
         if (e2_attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window,
                          1, &off) == 0)
@@ -1222,7 +1222,7 @@ void e2_attention_text_multi(e2_ctx *ctx, float *out, const float *q, const floa
     size_t qs = (size_t)heads * head_dim, ks = (size_t)kv_heads * head_dim;
     static int noint8 = -1;
     if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
-    if (!noint8 && nseq > 1 && t >= 16 && simd() >= 2 &&
+    if (!noint8 && nseq > 1 && t >= 16 && simd() >= 1 &&
         e2_attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window,
                      nseq, seq_off) == 0)
         return;

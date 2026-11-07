@@ -58,6 +58,15 @@ typedef struct {
  * the zero-point correction needs is accumulated on the way. */
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+static int avx512_ok(void) {
+    static int v = -1;
+    if (v < 0) {
+        __builtin_cpu_init();
+        v = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")
+            && __builtin_cpu_supports("avx512vl");
+    }
+    return v;
+}
 /* 16 (dim) x 4 (key) block: convert four float rows to int8 with a per-dim
  * scale and transpose them into the packed [dim][4 keys] layout, which is a
  * 4x16 byte transpose (three unpack levels).  The per-dim sums the zero-point
@@ -129,7 +138,10 @@ static void pack_vt_dims_v(attn_job *j, const float *v, int rs, int8_t *qw,
 static void pack_vt_dims(attn_job *j, const float *v, int rs, int8_t *qw,
                          float *sc, int32_t *ws, int d0, int d1) {
 #if defined(__x86_64__) || defined(__i386__)
-    if (!getenv("E2_PACK_SCALAR")) { pack_vt_dims_v(j, v, rs, qw, sc, ws, d0, d1); return; }
+    if (!getenv("E2_PACK_SCALAR") && avx512_ok()) {
+        pack_vt_dims_v(j, v, rs, qw, sc, ws, d0, d1);
+        return;
+    }
 #endif
     int t = j->t, tpad = j->tpad;
     int tpb = j->tpb, k4 = tpad / 4;

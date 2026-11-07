@@ -217,8 +217,16 @@ static float softplus(float v) {
 /* dot product, AVX-512 when available (D is 128 here) */
 #if defined(__x86_64__)
 #include <immintrin.h>
+static int aud_avx512(void) {
+    static int v = -1;
+    if (v < 0) {
+        __builtin_cpu_init();
+        v = __builtin_cpu_supports("avx512f");
+    }
+    return v;
+}
 __attribute__((target("avx512f")))
-static float dot128(const float *a, const float *b, int n) {
+static float dot128_v(const float *a, const float *b, int n) {
     __m512 s0 = _mm512_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
     int i = 0;
     for (; i + 64 <= n; i += 64) {
@@ -236,7 +244,7 @@ static float dot128(const float *a, const float *b, int n) {
 }
 
 __attribute__((target("avx512f")))
-static void axpy(float *o, const float *v, float w, int n) {
+static void axpy_v(float *o, const float *v, float w, int n) {
     __m512 vw = _mm512_set1_ps(w);
     int i = 0;
     for (; i + 16 <= n; i += 16)
@@ -244,16 +252,21 @@ static void axpy(float *o, const float *v, float w, int n) {
                                                 _mm512_loadu_ps(o + i)));
     for (; i < n; i++) o[i] += w * v[i];
 }
-#else
+#endif
 static float dot128(const float *a, const float *b, int n) {
+#if defined(__x86_64__)
+    if (aud_avx512()) return dot128_v(a, b, n);
+#endif
     float s = 0.0f;
     for (int i = 0; i < n; i++) s += a[i] * b[i];
     return s;
 }
 static void axpy(float *o, const float *v, float w, int n) {
+#if defined(__x86_64__)
+    if (aud_avx512()) { axpy_v(o, v, w, n); return; }
+#endif
     for (int i = 0; i < n; i++) o[i] += w * v[i];
 }
-#endif
 
 /* Chunked local attention.  Work items are (chunk, head) so the pool keeps
  * every core busy while each item stays cache resident. */
@@ -373,7 +386,7 @@ static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
 
 #if defined(__x86_64__)
 __attribute__((target("avx512f")))
-static void dw_conv_add(float *op, const float *hp, const float *wp, int H) {
+static void dw_conv_add_v(float *op, const float *hp, const float *wp, int H) {
     int c0 = 0;
     for (; c0 + 16 <= H; c0 += 16)
         _mm512_storeu_ps(op + c0,
@@ -382,11 +395,13 @@ static void dw_conv_add(float *op, const float *hp, const float *wp, int H) {
                                          _mm512_loadu_ps(op + c0)));
     for (; c0 < H; c0++) op[c0] += hp[c0] * wp[c0];
 }
-#else
+#endif
 static void dw_conv_add(float *op, const float *hp, const float *wp, int H) {
+#if defined(__x86_64__)
+    if (aud_avx512()) { dw_conv_add_v(op, hp, wp, H); return; }
+#endif
     for (int c0 = 0; c0 < H; c0++) op[c0] += hp[c0] * wp[c0];
 }
-#endif
 
 static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
                         int H, int K) {

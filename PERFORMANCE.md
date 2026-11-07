@@ -298,26 +298,27 @@ addressed below.
   width instead of `t`, so the 6-124 padding keys entered the softmax whenever
   `t % 128 != 0`. Text at 256 tokens: 0.9996, at 260: 0.55.
 
-### Measured state (same-run ratios, `bench_compare --repeat 1 --iters 3`)
+### Measured state (same-run ratios, `bench_compare --repeat 2 --iters 3`)
 
-e2 / ov-int8, lower is better, **≤ 0.67 is the 1.5x goal**:
+e2 / ov-int8, lower is better, **≤ 0.67 is the 1.5x goal**.  Host load average
+was 6.2 for this run (e2 loses ~25% under load where OpenVINO loses ~5%).
 
-| task | length | e2 ms | ov-int8 ms | ratio | round 2 ratio |
-|---|---:|---:|---:|---:|---:|
-| text | 8 | 3.7 | 5.8 | **0.64** | 0.60 |
-| text | 64 | 6.9 | 10.4 | **0.66** | 0.91 |
-| text | 128 | 12.9 | 15.8 | 0.82 | 1.00 |
-| text | 512 | 49.5 | 60.5 | 0.82 | 1.07 |
-| text | 2048 | 248.8 | 509.8 | **0.49** | 0.84 |
-| batch | 8x64 | 41.7 | 49.1 | 0.85 | 1.03 |
-| batch | 32x64 | 213.5 | 197.1 | 1.08 | 1.38 |
-| image | 270 tok | 372.7 | 499.0 | 0.75 | 1.22 |
-| audio | 54 tok | 24.9 | 24.9 | 1.00 | 1.66 |
-| video | 8 frames | 1162.9 | 1629.0 | 0.71 | 1.11 |
+| task | length | e2 ms | ov-int8 ms | ratio | round 2 | round 1 |
+|---|---:|---:|---:|---:|---:|---:|
+| text | 8 | 3.5 | 6.8 | **0.51** | 0.60 | 0.53 |
+| text | 64 | 7.1 | 9.5 | 0.75 | 0.91 | 1.05 |
+| text | 128 | 13.4 | 15.9 | 0.84 | 1.00 | 1.60 |
+| text | 512 | 47.3 | 62.6 | 0.76 | 1.07 | 1.46 |
+| text | 2048 | 247.4 | 502.8 | **0.49** | 0.84 | 1.25 |
+| batch | 8x64 | 45.2 | 51.3 | 0.88 | 1.03 | 1.47 |
+| batch | 32x64 | 229.2 | 206.2 | 1.11 | 1.38 | 2.03 |
+| image | 270 tok | 374.1 | 551.8 | **0.68** | 1.22 | 1.58 |
+| audio | 54 tok | 27.3 | 26.3 | 1.04 | 1.66 | 2.35 |
+| video | 8 frames | 1210.8 | 1726.0 | **0.70** | 1.11 | 1.33 |
 
-The box was at load average 4.5 for this run; e2 loses ~25% under load where
-OpenVINO loses ~5% (see the note at the top), so these are pessimistic.  Run
-in the same session, e2's absolute times moved 5-15% between repetitions.
+Every row improved.  Absolute e2 throughput: text 512 738 → 47 ms,
+text 2048 665 → 247, image 3.2 s → 374 ms, audio 64 → 27 ms,
+video 9.5 s → 1.2 s.
 
 Accuracy against the float32 HF reference (`tools/e2_acc.py`):
 

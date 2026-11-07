@@ -129,11 +129,17 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
     size_t ts = w->tstride ? w->tstride : (size_t)k4 * 64;
     int wss = w->wsmstride ? w->wsmstride : nblk;
     int nb = nb0;
+    /* Row-block the K sweep so the f32 epilogue RMW stays in L1.  The old
+     * order (b outer, all rows inner) re-read the output from L2/L3 once per
+     * K block; for k=2048 that is 16 passes over a 4 MB matrix. */
+    enum { RB = 64 };
     for (; nb + 4 <= nb1; nb += 4) {
         int n0 = nb * 16;
         const int8_t *wp = w->q + (size_t)nb * ts;
         __m512 WSC4[4];
         for (int t2 = 0; t2 < 4; t2++) WSC4[t2] = _mm512_loadu_ps(w->scale + n0 + 16 * t2);
+        for (int rb = 0; rb < m; rb += RB) {
+        int rend = rb + RB; if (rend > m) rend = m;
         for (int b = 0; b < nblk; b++) {
             __m512i base[4];
             for (int t2 = 0; t2 < 4; t2++) {
@@ -150,8 +156,8 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
             const int8_t *wq1 = wq0 + tstride;
             const int8_t *wq2 = wq1 + tstride;
             const int8_t *wq3 = wq2 + tstride;
-            for (int r0 = 0; r0 < m; r0 += 4) {
-                int mm = m - r0; if (mm > 4) mm = 4;
+            for (int r0 = rb; r0 < rend; r0 += 4) {
+                int mm = rend - r0; if (mm > 4) mm = 4;
                 const uint8_t *ap = xq + (size_t)r0 * k + (size_t)b * blk;
                 __m512i p00 = base[0], p01 = base[0], p02 = base[0], p03 = base[0];
                 __m512i p10 = base[1], p11 = base[1], p12 = base[1], p13 = base[1];
@@ -190,6 +196,7 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
                     }
                 }
             }
+        }
         }
     }
     if (nb < nb1) gemm_t1(y, ns, xq, xs, xss, m, k, w, nb, nb1);
@@ -436,6 +443,21 @@ typedef struct {
 static void gemm_work(void *vp, int tid, int nt) {
     gemm_arg *a = vp;
     int nblk = (a->w->n + 15) / 16;
+    /* Split columns when there are enough 4-tile groups per thread; otherwise
+     * split rows.  A n=256 attention PV GEMM has 16 tiles, so the old column
+     * split gave each thread 2 tiles and fell into the 1-tile slow path. */
+    if (nblk < nt * 4) {
+        /* Disjoint 4-row-aligned row ranges.  Rounding only the start made
+         * adjacent threads overlap, and the b==0 store raced with the other
+         * thread's b>0 accumulate. */
+        int r0 = (int)((long)a->m * tid / nt) & ~3;
+        int r1 = (tid == nt - 1) ? a->m
+                                 : (int)((long)a->m * (tid + 1) / nt) & ~3;
+        if (r0 < r1)
+            a->kern(a->y + (size_t)r0 * a->ns, a->ns, a->xq + (size_t)r0 * a->k,
+                    a->xs + (size_t)r0 * a->xss, a->xss, r1 - r0, a->k, a->w, 0, nblk);
+        return;
+    }
     int nb0 = (int)((long)nblk * tid / nt);
     int nb1 = (int)((long)nblk * (tid + 1) / nt);
     if (nb0 < nb1) a->kern(a->y, a->ns, a->xq, a->xs, a->xss, a->m, a->k, a->w, nb0, nb1);
@@ -548,36 +570,80 @@ void e2_gemm_f32(float *y, const float *x, const float *w, int m, int k, int n) 
 /* Packer for on-the-fly int8 matrices (attention weights, ...).       */
 /* ------------------------------------------------------------------ */
 
-int e2_pack_mat(const float *w, int n, int k, int rs, int cs, int8_t **q,
-                float **scale, int32_t **wsum, int *blk_out) {
-    int blk = *blk_out ? *blk_out : BLK;
-    if ((k % blk) || (k % 4)) return -1;
-    int ntile = (n + 15) / 16, k4 = k / 4, nblk = k / blk;
-    int8_t *qw = calloc((size_t)ntile * k4 * 64 + 64, 1);
-    float *sc = malloc((size_t)ntile * 16 * sizeof(float));
-    int32_t *ws = calloc((size_t)ntile * 16 * nblk, sizeof(int32_t));
-    if (!qw || !sc || !ws) { free(qw); free(sc); free(ws); return -1; }
+typedef struct {
+    const float *w;
+    int n, k, rs, cs, blk;
+    int8_t *qw;
+    float *sc;
+    int32_t *ws;
+} pack_arg;
 
-    for (int r = 0; r < ntile * 16; r++) {
-        if (r >= n) { sc[r] = 1.0f; continue; }
-        const float *wr = w + (size_t)r * rs;
+/* cs == 1, k % 16 == 0 fast path: quantise a contiguous row with AVX-512,
+ * then scatter the 4-byte groups into the 16-row tile layout. */
+#ifdef E2_X86
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+static void pack_rows_avx512(const pack_arg *a, int r0, int r1, int8_t *row) {
+    const int k = a->k, k4 = k / 4, nblk = k / a->blk;
+    const __m512i sign = _mm512_set1_epi32((int)0x80000000u);
+    const __m512i ones8 = _mm512_set1_epi8(1);
+    const __m512i ones16 = _mm512_set1_epi16(1);
+    for (int r = r0; r < r1; r++) {
+        if (r >= a->n) { a->sc[r] = 1.0f; continue; }
+        const float *wr = a->w + (size_t)r * a->rs;
+        __m512 mx = _mm512_setzero_ps();
+        for (int i = 0; i < k; i += 16) {
+            __m512i v = _mm512_andnot_si512(sign, _mm512_loadu_si512((const void *)(wr + i)));
+            mx = _mm512_max_ps(mx, _mm512_castsi512_ps(v));
+        }
+        float s = _mm512_reduce_max_ps(mx) / 127.0f;
+        if (s < 1e-12f) s = 1e-12f;
+        a->sc[r] = s;
+        __m512 vinv = _mm512_set1_ps(1.0f / s);
+        for (int i = 0; i < k; i += 16) {
+            __m512 v = _mm512_loadu_ps(wr + i);
+            __m512i iv = _mm512_cvtps_epi32(_mm512_mul_ps(v, vinv));
+            _mm_storeu_si128((__m128i *)(row + i), _mm512_cvtsepi32_epi8(iv));
+        }
+        int8_t *dst = a->qw + (size_t)(r / 16) * k4 * 64 + (size_t)(r % 16) * 4;
+        for (int kb = 0; kb < k4; kb++)
+            memcpy(dst + (size_t)kb * 64, row + (size_t)kb * 4, 4);
+        int32_t *wrow = a->ws + (size_t)r * nblk;
+        for (int b = 0; b < nblk; b++) {
+            const int8_t *src = row + (size_t)b * a->blk;
+            __m512i acc = _mm512_setzero_si512();
+            for (int i = 0; i < a->blk; i += 64) {
+                __m512i v = _mm512_loadu_si512((const void *)(src + i));
+                __m512i p = _mm512_maddubs_epi16(ones8, v);
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p, ones16));
+            }
+            wrow[b] = _mm512_reduce_add_epi32(acc);
+        }
+    }
+}
+#endif
+
+static void pack_rows_s(const pack_arg *a, int r0, int r1) {
+    const int k = a->k, k4 = k / 4, nblk = k / a->blk;
+    for (int r = r0; r < r1; r++) {
+        if (r >= a->n) { a->sc[r] = 1.0f; continue; }
+        const float *wr = a->w + (size_t)r * a->rs;
         float mx = 0.0f;
         for (int i = 0; i < k; i++) {
-            float a = fabsf(wr[(size_t)i * cs]);
-            if (a > mx) mx = a;
+            float v = fabsf(wr[(size_t)i * a->cs]);
+            if (v > mx) mx = v;
         }
         float s = mx / 127.0f;
         if (s < 1e-12f) s = 1e-12f;
-        sc[r] = s;
+        a->sc[r] = s;
         float inv = 1.0f / s;
-        int8_t *dst = qw + (size_t)(r / 16) * k4 * 64 + (r % 16) * 4;
-        int32_t *wrow = ws + (size_t)r * nblk;
+        int8_t *dst = a->qw + (size_t)(r / 16) * k4 * 64 + (size_t)(r % 16) * 4;
+        int32_t *wrow = a->ws + (size_t)r * nblk;
         for (int b = 0; b < nblk; b++) {
             int32_t acc = 0;
-            for (int kb = b * (blk / 4); kb < (b + 1) * (blk / 4); kb++) {
-                int8_t *d = dst + (size_t)kb * 64;
+            for (int kk = b * (a->blk / 4); kk < (b + 1) * (a->blk / 4); kk++) {
+                int8_t *d = dst + (size_t)kk * 64;
                 for (int j = 0; j < 4; j++) {
-                    long v = lrintf(wr[(size_t)(kb * 4 + j) * cs] * inv);
+                    long v = lrintf(wr[(size_t)(kk * 4 + j) * a->cs] * inv);
                     if (v < -127) v = -127;
                     if (v > 127) v = 127;
                     d[j] = (int8_t)v;
@@ -587,10 +653,56 @@ int e2_pack_mat(const float *w, int n, int k, int rs, int cs, int8_t **q,
             wrow[b] = acc;
         }
     }
+}
+
+typedef struct { const pack_arg *a; int fast, rows; int8_t *rowbuf; } pack_job;
+
+static void pack_work(void *vp, int tid, int nt) {
+    pack_job *j = vp;
+    int r0 = (int)((long)j->rows * tid / nt);
+    int r1 = (int)((long)j->rows * (tid + 1) / nt);
+#ifdef E2_X86
+    if (j->fast) { pack_rows_avx512(j->a, r0, r1, j->rowbuf + (size_t)tid * j->a->k); return; }
+#endif
+    pack_rows_s(j->a, r0, r1);
+}
+
+static int pack_mat(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
+                    int8_t **q, float **scale, int32_t **wsum, int *blk_out) {
+    int blk = *blk_out ? *blk_out : BLK;
+    if ((k % blk) || (k % 4)) return -1;
+    int ntile = (n + 15) / 16, k4 = k / 4, nblk = k / blk;
+    int8_t *qw = calloc((size_t)ntile * k4 * 64 + 64, 1);
+    float *sc = malloc((size_t)ntile * 16 * sizeof(float));
+    int32_t *ws = calloc((size_t)ntile * 16 * nblk, sizeof(int32_t));
+    int nbuf = (ctx && ctx->nthreads > 1 && (long)n * k >= 65536) ? ctx->nthreads : 1;
+    int8_t *rowbuf = malloc((size_t)k * nbuf);
+    if (!qw || !sc || !ws || !rowbuf) {
+        free(qw); free(sc); free(ws); free(rowbuf); return -1;
+    }
+    pack_arg a = {w, n, k, rs, cs, blk, qw, sc, ws};
+    int fast = (cs == 1 && (k % 16) == 0 && (blk % 16) == 0 && !getenv("E2_PACK_SCALAR"));
+    pack_job j = {&a, fast, ntile * 16, rowbuf};
+    long work = (long)n * k;
+    if (ctx && ctx->nthreads > 1 && work >= 65536)
+        e2_parallel(ctx, pack_work, &j);
+    else
+        pack_work(&j, 0, 1);
+    free(rowbuf);
     free(*q); free(*scale); free(*wsum);
     *q = qw; *scale = sc; *wsum = ws;
     *blk_out = blk;
     return 0;
+}
+
+int e2_pack_mat(const float *w, int n, int k, int rs, int cs, int8_t **q,
+                float **scale, int32_t **wsum, int *blk_out) {
+    return pack_mat(NULL, w, n, k, rs, cs, q, scale, wsum, blk_out);
+}
+
+int e2_pack_mat_ctx(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
+                    int8_t **q, float **scale, int32_t **wsum, int *blk_out) {
+    return pack_mat(ctx, w, n, k, rs, cs, q, scale, wsum, blk_out);
 }
 
 void e2_pack_free(int8_t *q, float *scale, int32_t *wsum) {

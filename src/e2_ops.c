@@ -754,6 +754,9 @@ static void attn8_softmax(float *sr, int tpad, int lo, int hi) {
 static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                      const float *v, int t, int heads, int kv_heads, int head_dim,
                      int window) {
+    int prof = getenv("E2_PROFILE_ATTN") != NULL;
+    double pt[8] = {0};
+    double pt0 = e2_now_ms();
     int groups = heads / kv_heads;
     int ablk = (head_dim % 128 == 0) ? 128 : ((head_dim % 64 == 0) ? 64 : 0);
     if (!ablk) return -1;
@@ -778,11 +781,13 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
     }
     if (!ctx->ktbuf) { free(base); return -1; }
     memset(ctx->ktbuf, 0, ktn * sizeof(float));
+    double _t = e2_now_ms();
     kt_arg ka = {v, ctx->ktbuf, t, tpad, kv_heads, head_dim};
     if ((long)kv_heads * ((head_dim + 15) / 16) * ((t + 15) / 16) < 512)
         kt_work(&ka, 0, 1);
     else
         e2_parallel(ctx, kt_work, &ka);
+    if (prof) pt[0] += e2_now_ms() - _t;
 
     e2_qmat kq = {0}, vq = {0};
     kq.n = tpad; kq.k = head_dim; kq.blk = ablk; kq.packed = 1;
@@ -793,12 +798,16 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
         float *ksc = NULL, *vsc = NULL;
         int32_t *kwm = NULL, *vwm = NULL;
         int kb = ablk, vb = 128;
-        if (e2_pack_mat(k + (size_t)kh * head_dim, t, head_dim, kv_heads * head_dim, 1,
+        _t = e2_now_ms();
+        if (e2_pack_mat_ctx(ctx, k + (size_t)kh * head_dim, t, head_dim, kv_heads * head_dim, 1,
                         &kq_p, &ksc, &kwm, &kb)) { free(base); return -1; }
-        if (e2_pack_mat(ctx->ktbuf + (size_t)kh * head_dim * tpad, head_dim, tpad,
+        if (prof) pt[1] += e2_now_ms() - _t;
+        _t = e2_now_ms();
+        if (e2_pack_mat_ctx(ctx, ctx->ktbuf + (size_t)kh * head_dim * tpad, head_dim, tpad,
                         tpad, 1, &vq_p, &vsc, &vwm, &vb)) {
             e2_pack_free(kq_p, ksc, kwm); free(base); return -1;
         }
+        if (prof) pt[2] += e2_now_ms() - _t;
         kq.q = kq_p; kq.scale = ksc; kq.wsum = kwm;
         vq.q = vq_p; vq.scale = vsc; vq.wsum = vwm;
         e2_linear kql = {0}, vql = {0};
@@ -812,7 +821,10 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                     memcpy(qf + (size_t)r * head_dim,
                            q + ((size_t)(i0 + r) * heads + h) * head_dim,
                            (size_t)head_dim * sizeof(float));
+                _t = e2_now_ms();
                 e2_linear_forward(ctx, sc, qf, nq, &kql);
+                if (prof) pt[3] += e2_now_ms() - _t;
+                _t = e2_now_ms();
                 int lo = 0, hi = t;
                 for (int r = 0; r < nq; r++) {
                     int32_t lo_r = 0, hi_r = t;
@@ -823,15 +835,22 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                     attn8_softmax(sc + (size_t)r * tpad, tpad, lo_r, hi_r);
                 }
                 (void)lo; (void)hi;
+                if (prof) pt[4] += e2_now_ms() - _t;
+                _t = e2_now_ms();
                 e2_linear_forward(ctx, ob, sc, nq, &vql);
                 for (int r = 0; r < nq; r++)
                     memcpy(out + ((size_t)(i0 + r) * heads + h) * head_dim,
                            ob + (size_t)r * head_dim, (size_t)head_dim * sizeof(float));
+                if (prof) pt[5] += e2_now_ms() - _t;
             }
         }
         e2_pack_free(kq_p, ksc, kwm);
         e2_pack_free(vq_p, vsc, vwm);
     }
     free(base);
+    if (prof) {
+        fprintf(stderr, "attn8 t=%d: kt %.2f kpack %.2f vpack %.2f qk %.2f softmax %.2f pv %.2f total %.2f\n",
+                t, pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], e2_now_ms() - pt0);
+    }
     return 0;
 }

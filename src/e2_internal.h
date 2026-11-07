@@ -183,6 +183,8 @@ void e2_quant_rows_blk(const float *x, int m, int k, uint8_t *q, float *scale, i
 /* Pack a float [n][k] matrix into the int8 tile layout (row-major input). */
 int  e2_pack_mat(const float *w, int n, int k, int rs, int cs, int8_t **q,
                  float **scale, int32_t **wsum, int *blk_out);
+int  e2_pack_mat_ctx(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
+                     int8_t **q, float **scale, int32_t **wsum, int *blk_out);
 void e2_pack_free(int8_t *q, float *scale, int32_t *wsum);
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
 void e2_gemm_f32(float *y, const float *x, const float *w, int m, int k, int n);

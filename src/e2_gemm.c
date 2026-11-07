@@ -127,7 +127,9 @@ static int g_pf = 48;
  * 16 outputs stays in L1 (RB=32 -> 2 KB) and so does the activation slab
  * (RB x k bytes).  32 measured better than 64/128/256 once the accumulator
  * moved out of the output buffer. */
-static int g_rb = 32;
+static int g_rb = 32;      /* AVX-VNNI kernel default */
+static int g_rb512 = 64;   /* AVX-512 kernel default: it has no f32 tile to keep
+                            * in L1, and 32 measured 10-17% worse there */
 
 /* Fast path: 4 rows x 4 output tiles (64 columns).  24 uops per 16 vpdpbusd,
  * the minimum for a 16-accumulator budget. */
@@ -142,7 +144,7 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
     /* Row block outermost: a 64-row activation slab stays in L1 while every
      * output-tile group is swept.  The old order re-read the whole activation
      * matrix once per 64-column tile group, which dominated at large m. */
-    int RB = g_rb;
+    int RB = g_rb512;
     int nb4 = nb0 + ((nb1 - nb0) / 4) * 4;
     for (int rb = 0; rb < m; rb += RB) {
         int rend = rb + RB; if (rend > m) rend = m;
@@ -672,8 +674,7 @@ void e2_gemm_init(void) {
     const char *pf = getenv("E2_GEMM_PF");
     if (pf) g_pf = atoi(pf);
     const char *rb = getenv("E2_GEMM_RB");
-    if (rb) g_rb = atoi(rb);
-    if (g_rb <= 0) g_rb = 1 << 28;
+    if (rb) { g_rb = g_rb512 = atoi(rb); if (g_rb <= 0) g_rb = g_rb512 = 1 << 28; }
 }
 
 /* One linear, including the input-clip path the shared-quantiser version

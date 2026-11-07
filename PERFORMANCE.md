@@ -672,3 +672,47 @@ python tools/e2_acc.py text|image|audio --model ~/Projects/embeddinggemma-2
 The box is shared and thermally throttled: a single run of the same binary can
 read 4.6 or 8.0 ms on text 8 depending on what else is running. Only the
 same-run e2-vs-OV ratio means anything, and `--repeat 2` or 3 is required.
+
+## Round 5 audit — replaying round 5 on an AVX-512 host
+
+Round 5 was developed on an Arrow Lake laptop (no AVX-512). Re-running
+`master` (7bb7293) against this branch on the Ryzen 7 9700X, interleaved,
+min of 4-6 paired runs, showed two regressions, both in code that only runs
+on the AVX-512 path:
+
+| row | master | round 5 as merged | + this fix |
+|---|---:|---:|---:|
+| text 8 | 3.3 | 3.7 (+12%) | 3.3 (+1%) |
+| text 64 | 5.8 | 6.7 (+14%) | 6.0 (+3%) |
+| text 128 | 11.4 | 12.5 (+10%) | 11.4 (-2%) |
+| text 512 | 44.0 | 45.8 (+4%) | 43.0 (+1%) |
+| text 2048 | 239 | 257 (+7%) | 242 (+3%) |
+| batch 8x64 | 37.0 | 38.2 (+3%) | 36.5 (-1%) |
+| batch 32x64 | 179 | 198 (+11%) | 176 (-1%) |
+| image | 328 | 345 (+5%) | 334 (-2%) |
+| audio | 23.3 | 23.9 (+3%) | 21.9 (-4%) |
+| video | 1383 | 1428 (+3%) | 1413 (+1%) |
+
+1. **`e2_split()` truncation.**  Thread weights on a uniform CPU differ by
+   ~1% (calibration noise); truncating the cumulative boundary turned that
+   into a whole extra work unit (nblk=32 at 8 threads: thread 0 got 3 tiles,
+   thread 1 got 5).  That is -25%/+25%, and it cost 10-18% on every GEMM with
+   n = 512/768/1024 (`q` +18.6%, `mlp_gate` +14.6%).  *Single-threaded*
+   `mb gemm 512 512 512` was faster on this branch (496 vs 465 GMAC/s), which
+   is what pointed at the split rather than at the kernel.  Fixed by rounding
+   the boundary to the nearest unit; `lo(tid) == hi(tid-1)` still comes from
+   one cumulative sum, so ranges stay contiguous, and the proportional
+   weighting on a hybrid CPU is unchanged.
+
+2. **`g_rb` 64 -> 32 applied to both kernels.**  32 is right for the new
+   AVX-VNNI kernel (it keeps an RB x 16 f32 accumulator tile in L1);
+   `gemm_avx512` is byte-identical to round 4 and has no such tile, so 32 cost
+   8-17% on the short/mid text rows.  Split into `g_rb` (VNNI, 32) and
+   `g_rb512` (AVX-512, 64); `E2_GEMM_RB` still overrides both.
+
+Neither regression touches AVX2-only hosts: the AVX2/FMA kernels are inactive
+here (`simd()` returns 2) and the prefetch knob only lives in `gemm_avxvnni`.
+
+Confirmed while auditing: the `e2_linear_forward_multi` skip bug was real —
+text embeddings are bit-identical to round 4, the audio embedding changed and
+its cosine against the HF reference improved 0.99847 -> 0.99865.

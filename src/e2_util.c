@@ -235,8 +235,11 @@ void e2_split(int n, int tid, int nt, int *lo, int *hi) {
         if (i < tid) start += w;
     }
     int w = (tid < 256 && g_tw[tid] > 0) ? g_tw[tid] : 1;
-    *lo = (int)((long)n * start / tot);
-    *hi = (int)((long)n * (start + w) / tot);
+    /* round to the nearest unit: truncating turned a 1% weight difference into
+     * a whole extra tile for one thread (3 vs 5 tiles at n=32/nt=8), which cost
+     * 15-25% on a uniform CPU. */
+    *lo = (int)(((long)n * start + tot / 2) / tot);
+    *hi = (int)(((long)n * (start + w) + tot / 2) / tot);
 }
 
 static void set_ftz_w(void) {

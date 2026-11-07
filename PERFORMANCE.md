@@ -513,3 +513,96 @@ layer is correct.
 3. **Short-sequence key blocking**: `vblk = 64` when `t <= 64` halves the
    score tile, the softmax and the P x V step for batch 8x64 / 32x64 and audio
    (t = 54), worth ~4% on the batch rows.
+
+## Round 5 — a different machine: Arrow Lake, no AVX-512
+
+The host changed under us. Round 1-4 numbers were measured on the Ryzen 7
+9700X. The current box is an **Intel Core Ultra 9 285H (Arrow Lake) laptop**:
+
+| | |
+|---|---|
+| ISA | **no AVX-512 at all**; AVX2 + FMA + AVX-VNNI (256-bit `vpdpbusd`) |
+| cores | 16: `0-5` P-cores, `6-13` E-cores, `14-15` LP E-cores |
+| measured int8 peaks (`/tmp/peak`, 8 accumulators) | 1 thread 238 GMAC/s, 6 P 1308, 8 threads 1551, 12 threads 2116 |
+| f32 FMA peak | 520 GMAC/s at 8 threads (3x below int8) |
+| LP E-cores | **23 GMAC/s** vs 178 for a P-core — 8x slower |
+| THP | `always`; page-cache and anonymous reads measure the same |
+
+Two immediate consequences: every AVX-512-only kernel in the tree had been
+silently falling back to scalar, and any worker placed on cpu 14/15 poisoned
+its barrier. Measured baseline before this round (`bench_compare --repeat 2`):
+e2/ov-int8 ratios text 8 1.26, text 64 1.12, text 128 1.21, text 512 0.74,
+text 2048 0.61, batch8 0.89, batch32 0.97, image 1.06, audio 1.39, video 0.97 —
+i.e. the library was *slower* than OpenVINO on half the rows.
+
+### Wins kept (measured, same-run ratios)
+
+| # | change | effect |
+|---|---|---|
+| 1 | **AVX2+FMA twins of every hot op** in `e2_ops.c` (`vexp8`, `vsigmoid8`, gelu/silu/tanh/gated-silu/scale/add, span-max/exp-sum/softmax, rmsnorm (all 4 modes incl. fused rope), l2norm). `simd()` now returns 1 for AVX2+FMA and every dispatch site has an `simd() == 1` branch. Same polynomial, same clamping as the AVX-512 versions; `_mm512_rcp14_ps` became `_mm256_rcp_ps` + 1 Newton step and `scalef` became an integer exponent shift. | gated-mul 23.6 -> 8.1 ms, plemul 3.3 -> 0.9, rope 3.1 -> 2.5, softmax/exp in attention vectorised again; text 512 profile 208 -> 152 ms |
+| 2 | **AVX2 activation quantiser** (`quant_rows_avx2`, worker commit): 16-wide block max, `vcvtps2dq` (bit-identical to the old `lrintf`), offset added in the integer domain, saturating 16->8 pack. Bit-exact against `quant_rows_s` on 4 patterns incl. outliers and the 1e-12 floor. | 2691 -> 203 ns/row (13x). It was fully scalar on this host before. |
+| 3 | **LP E-cores excluded from the pool** (`/sys/devices/cpu_lowpower/cpus`), workers pinned *and* calibrated at thread start instead of on the first dispatch | a straggler on cpu14/15 costs more than 2 extra threads are worth: the pool no longer livelocks; 16 threads went from 377 GMAC/s to 2135 in the raw peak test |
+| 4 | **Speed-weighted work splits** (`e2_split`): each worker runs the real GEMM kernel once at startup (best of 5, serialised so threads do not calibrate while others spin) to get its own throughput, then ranges are handed out in proportion. 8 threads on 6 P + 2 E cores now behave like 6x1.52 + 2x1 units instead of 8 equal ones. | m=64 GEMM at 8 threads 975 -> 1415 GMAC/s (+45%); batch 8x64 and every mid-size text row |
+| 5 | **VNNI kernel: fold the weight load into `dpbusd`** (worker commit) + 3 KB run-ahead prefetch | single core 192 -> 215 GMAC/s; m=8 cold 0.105 -> 0.062 ms |
+| 6 | **f32 accumulators per row block in L1** (`gemm_avxvnni`): the epilogue used to read-modify-write the whole output once per 128-wide k block (3 extra RW passes for k=512, 15 for the attention PV). The f32 tile for a 128-row block (8 KB) now lives on the stack and each output element is written once. | m=2048 k=512 n=2048: 1009 -> 1512 GMAC/s; k=2048 n=512: 909 -> 1325; batch 32x64 1216 -> 615 ms (**2x**) |
+
+### Tried, measured, reverted or not kept
+
+| try | outcome |
+|---|---|
+| pool spin 4000 / 500 instead of 20000 `pause` (to stop burning power on a throttling laptop) | **much worse**: 8 -> 47 ms on text 8. A sleeping worker costs ~150 us of wake latency and a forward has 300+ dispatches. Kept 20000, made it `E2_POOL_SPIN` for experimenting. |
+| restarting workers on the *calibration* FMA loop instead of the real GEMM kernel | the FMA loop ranks an E-core at 1.13x slower than a P-core, which is wrong (it is 1.4-1.5x slower at VNNI: 2 vs 1 256-bit VNNI port, but similar FP width). Measuring the actual kernel is what fixed the split. |
+| letting threads calibrate concurrently at pool start | the first threads measured while the rest were still spinning up, which made the *fast* cores look slow and skewed every later split (one P-core came out at half speed). Calibration is now serialised with an atomic ticket. |
+| nope | — |
+
+### Where the time goes now (text 128, `E2_PROFILE=1`, quiet host, 8 threads)
+
+GEMM 23 of 35 ms, attention 5.7, elementwise/rope/ple ~5. The GEMM runs at
+~570 GMAC/s in situ against 1080 GMAC/s for the identical 218-GEMM sequence
+called in a tight loop with the same (copied) weights — the difference is the
+activation working set the forward keeps live between GEMMs (the `ple` buffer
+alone is `n x 24 x 512` floats). perf attributes 53% of P-core cycles to
+`gemm_avxvnni` and **28% to the pool spin loop**, i.e. a large part of the
+non-GEMM time is the main thread running alone.
+
+### Measured state after round 5 (`--repeat 2 --iters 3`, quiet host, 8 threads)
+
+e2 / ov-int8, lower is better, **<= 0.67 is the 1.5x goal**:
+
+| task | length | e2 ms | ov-int8 ms | ratio | round 5 start |
+|---|---:|---:|---:|---:|---:|
+| text | 8 | 4.4 | 6.5 | 0.68 | 1.26 |
+| text | 64 | 11.9 | 24.2 | **0.49** | 1.12 |
+| text | 128 | 23.0 | 47.8 | **0.48** | 1.21 |
+| text | 512 | 90.8 | 203.0 | **0.45** | 0.74 |
+| text | 2048 | 583.4 | 1378.5 | **0.42** | 0.61 |
+| batch | 8x64 | 82.7 | 154.9 | **0.53** | 0.89 |
+| batch | 32x64 | 443.4 | 615.7 | 0.72 | 0.97 |
+| image | 270 tok | 760.0 | 1482.9 | **0.51** | 1.06 |
+| audio | 54 tok | 38.4 | 55.2 | 0.70 | 1.39 |
+| video | 8 frames | 2337.4 | 5042.0 | **0.46** | 0.97 |
+
+The batch 32x64 row above predates the L1-accumulator kernel; measured
+interleaved against the pre-change binary it goes 1216 -> 615 ms, i.e. ~0.36.
+Remaining over the line: text 8 (0.68), audio (0.70) and batch 32x64 before
+the accumulator change.
+
+Accuracy is unchanged (the kernel changes are numerically equivalent):
+`e2_acc.py text` -> embedding 0.99970, last_hidden_state 0.99938, per-layer
+0.9994-0.9999.
+
+### Notes for the next round
+
+1. `gemm_avx512` still does the per-k-block read-modify-write. The accumulator
+   trick above is worth ~1.4x for large m and should be ported to it on a host
+   that actually has AVX-512 (it cannot be tested here).
+2. The gap between the in-situ GEMM (570 GMAC/s) and the same GEMMs in a tight
+   loop (1080) is the biggest single remaining lever for the short rows: it is
+   activation working-set traffic, so the fix is fewer f32 intermediates
+   (quantise the `up` projection straight to u8, have the PV GEMM write the
+   o_proj input as u8, keep the PLE table in a narrower form).
+3. `pack_vt_dims` (attention V^T packer) is still AVX-512-only and shows up at
+   1-3% of cycles; it needs an AVX2 twin like the ops got.
+4. The 28% spin in `worker` is idle time of the *workers* while the main thread
+   runs serial code. Cutting the number of serial regions (or the dispatch
+   count) is worth more than any kernel work at 8 threads.

@@ -269,6 +269,14 @@ static void gemm_avx2(float *y, int ns, const uint8_t *xq, const float *xs,
 /* AVX-VNNI (Alder Lake / Arrow Lake / Zen 5 have the 256-bit VEX form):
  * 4 rows x 1 tile, 8 accumulators, ~18 MAC/uop. */
 #ifdef E2_X86
+/* AVX-VNNI (Alder Lake / Arrow Lake / Zen 4/5 have the 256-bit VEX form):
+ * 4 rows x 1 output tile (16 columns), 8 integer accumulators.
+ *
+ * The f32 accumulators for a whole row block live in a small stack buffer that
+ * stays in L1, so each output element is written once instead of
+ * `nblk` times (read-modify-write per 128-wide k block).  For k=512/n=2048/m=2048
+ * that is 112 MB of output traffic per GEMM turned into 16 MB. */
+#define VNNI_ACC_ROWS 128
 __attribute__((target("avx2,avxvnni")))
 static void gemm_avxvnni(float *y, int ns, const uint8_t *xq, const float *xs,
                          int xss, int m, int k, const e2_qmat *w, int nb0, int nb1) {
@@ -276,66 +284,79 @@ static void gemm_avxvnni(float *y, int ns, const uint8_t *xq, const float *xs,
     size_t ts = w->tstride ? w->tstride : (size_t)(k / 4) * 64;
     int wss = w->wsmstride ? w->wsmstride : nblk;
     const __m256i k128 = _mm256_set1_epi32(128);
-    for (int nb = nb0; nb < nb1; nb++) {
-        int n0 = nb * 16;
-        int cnt = w->n - n0; if (cnt > 16) cnt = 16;
-        const int8_t *wp = w->q + (size_t)nb * ts;
-        __m256 wscale0 = _mm256_loadu_ps(w->scale + n0);
-        __m256 wscale1 = _mm256_loadu_ps(w->scale + n0 + 8);
-        for (int b = 0; b < nblk; b++) {
-            int32_t wsbuf[16];
-            for (int t = 0; t < 16; t++) wsbuf[t] = w->wsum[(size_t)(n0 + t) * wss + b];
-            __m256i base0 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_mullo_epi32(
-                _mm256_loadu_si256((const __m256i *)wsbuf), k128));
-            __m256i base1 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_mullo_epi32(
-                _mm256_loadu_si256((const __m256i *)(wsbuf + 8)), k128));
-            const int8_t *wq = wp + (size_t)b * (blk / 4) * 64;
-            for (int r0 = 0; r0 < m; r0 += 4) {
-                int mm = m - r0; if (mm > 4) mm = 4;
-                const uint8_t *ap = xq + (size_t)r0 * k + (size_t)b * blk;
-                __m256i a0l = base0, a0h = base1, a1l = base0, a1h = base1;
-                __m256i a2l = base0, a2h = base1, a3l = base0, a3h = base1;
-                for (int kb = 0; kb < blk / 4; kb++) {
-                    /* letting dpbusd read the weight from memory (gcc still
-                     * CSEs the two uses) measures ~3% faster than explicit
-                     * locals.  The 3 KB run-ahead covers DRAM latency when m
-                     * is small enough that the weight stream is the limit
-                     * (m=8 cold: 0.105 -> 0.062 ms) and costs nothing when the
-                     * weights are cached. */
-                    const __m256i *wv = (const __m256i *)(wq + (size_t)kb * 64);
-                    __builtin_prefetch((const char *)wv + 48 * 64, 0, 3);
-                    int x0, x1, x2, x3;
-                    memcpy(&x0, ap + (size_t)kb * 4, 4);
-                    memcpy(&x1, ap + k + (size_t)kb * 4, 4);
-                    memcpy(&x2, ap + 2 * k + (size_t)kb * 4, 4);
-                    memcpy(&x3, ap + 3 * k + (size_t)kb * 4, 4);
-                    __m256i v;
-                    v = _mm256_set1_epi32(x0);
-                    a0l = _mm256_dpbusd_epi32(a0l, v, _mm256_loadu_si256(wv));
-                    a0h = _mm256_dpbusd_epi32(a0h, v, _mm256_loadu_si256(wv + 1));
-                    v = _mm256_set1_epi32(x1);
-                    a1l = _mm256_dpbusd_epi32(a1l, v, _mm256_loadu_si256(wv));
-                    a1h = _mm256_dpbusd_epi32(a1h, v, _mm256_loadu_si256(wv + 1));
-                    v = _mm256_set1_epi32(x2);
-                    a2l = _mm256_dpbusd_epi32(a2l, v, _mm256_loadu_si256(wv));
-                    a2h = _mm256_dpbusd_epi32(a2h, v, _mm256_loadu_si256(wv + 1));
-                    v = _mm256_set1_epi32(x3);
-                    a3l = _mm256_dpbusd_epi32(a3l, v, _mm256_loadu_si256(wv));
-                    a3h = _mm256_dpbusd_epi32(a3h, v, _mm256_loadu_si256(wv + 1));
+    int RB = g_rb;
+    if (RB > VNNI_ACC_ROWS) RB = VNNI_ACC_ROWS;
+    for (int rb = 0; rb < m; rb += RB) {
+        int rend = rb + RB; if (rend > m) rend = m;
+        for (int nb = nb0; nb < nb1; nb++) {
+            int n0 = nb * 16;
+            int cnt = w->n - n0; if (cnt > 16) cnt = 16;
+            const int8_t *wp = w->q + (size_t)nb * ts;
+            __m256 wscale0 = _mm256_loadu_ps(w->scale + n0);
+            __m256 wscale1 = _mm256_loadu_ps(w->scale + n0 + 8);
+            float acc[RB][16];
+            memset(acc, 0, (size_t)(rend - rb) * sizeof(acc[0]));
+            for (int b = 0; b < nblk; b++) {
+                int32_t wsbuf[16];
+                for (int t = 0; t < 16; t++) wsbuf[t] = w->wsum[(size_t)(n0 + t) * wss + b];
+                __m256i base0 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_mullo_epi32(
+                    _mm256_loadu_si256((const __m256i *)wsbuf), k128));
+                __m256i base1 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_mullo_epi32(
+                    _mm256_loadu_si256((const __m256i *)(wsbuf + 8)), k128));
+                const int8_t *wq = wp + (size_t)b * (blk / 4) * 64;
+                for (int r0 = rb; r0 < rend; r0 += 4) {
+                    int mm = rend - r0; if (mm > 4) mm = 4;
+                    const uint8_t *ap = xq + (size_t)r0 * k + (size_t)b * blk;
+                    __m256i a0l = base0, a0h = base1, a1l = base0, a1h = base1;
+                    __m256i a2l = base0, a2h = base1, a3l = base0, a3h = base1;
+                    for (int kb = 0; kb < blk / 4; kb++) {
+                        /* letting dpbusd read the weight from memory (gcc still
+                         * CSEs the two uses) measures ~3% faster than explicit
+                         * locals.  The 3 KB run-ahead covers DRAM latency when
+                         * m is small enough that the weight stream is the limit
+                         * (m=8 cold: 0.105 -> 0.062 ms) and costs nothing when
+                         * the weights are cached. */
+                        const __m256i *wv = (const __m256i *)(wq + (size_t)kb * 64);
+                        __builtin_prefetch((const char *)wv + 48 * 64, 0, 3);
+                        int x0, x1, x2, x3;
+                        memcpy(&x0, ap + (size_t)kb * 4, 4);
+                        memcpy(&x1, ap + k + (size_t)kb * 4, 4);
+                        memcpy(&x2, ap + 2 * k + (size_t)kb * 4, 4);
+                        memcpy(&x3, ap + 3 * k + (size_t)kb * 4, 4);
+                        __m256i v;
+                        v = _mm256_set1_epi32(x0);
+                        a0l = _mm256_dpbusd_epi32(a0l, v, _mm256_loadu_si256(wv));
+                        a0h = _mm256_dpbusd_epi32(a0h, v, _mm256_loadu_si256(wv + 1));
+                        v = _mm256_set1_epi32(x1);
+                        a1l = _mm256_dpbusd_epi32(a1l, v, _mm256_loadu_si256(wv));
+                        a1h = _mm256_dpbusd_epi32(a1h, v, _mm256_loadu_si256(wv + 1));
+                        v = _mm256_set1_epi32(x2);
+                        a2l = _mm256_dpbusd_epi32(a2l, v, _mm256_loadu_si256(wv));
+                        a2h = _mm256_dpbusd_epi32(a2h, v, _mm256_loadu_si256(wv + 1));
+                        v = _mm256_set1_epi32(x3);
+                        a3l = _mm256_dpbusd_epi32(a3l, v, _mm256_loadu_si256(wv));
+                        a3h = _mm256_dpbusd_epi32(a3h, v, _mm256_loadu_si256(wv + 1));
+                    }
+                    __m256i R[4][2] = {{a0l, a0h}, {a1l, a1h}, {a2l, a2h}, {a3l, a3h}};
+                    for (int i = 0; i < mm; i++) {
+                        __m256 s = _mm256_set1_ps(xs[(size_t)(r0 + i) * xss + b]);
+                        __m256 f0 = _mm256_mul_ps(_mm256_mul_ps(
+                            _mm256_cvtepi32_ps(R[i][0]), s), wscale0);
+                        __m256 f1 = _mm256_mul_ps(_mm256_mul_ps(
+                            _mm256_cvtepi32_ps(R[i][1]), s), wscale1);
+                        float *ap2 = acc[r0 + i - rb];
+                        _mm256_storeu_ps(ap2, _mm256_add_ps(_mm256_loadu_ps(ap2), f0));
+                        _mm256_storeu_ps(ap2 + 8, _mm256_add_ps(_mm256_loadu_ps(ap2 + 8), f1));
+                    }
                 }
-                __m256i R[4][2] = {{a0l, a0h}, {a1l, a1h}, {a2l, a2h}, {a3l, a3h}};
-                for (int i = 0; i < mm; i++) {
-                    float *yp = y + (size_t)(r0 + i) * ns + n0;
-                    __m256 s = _mm256_set1_ps(xs[(size_t)(r0 + i) * xss + b]);
-                    float out[16];
-                    _mm256_storeu_ps(out, _mm256_mul_ps(_mm256_mul_ps(
-                        _mm256_cvtepi32_ps(R[i][0]), s), wscale0));
-                    _mm256_storeu_ps(out + 8, _mm256_mul_ps(_mm256_mul_ps(
-                        _mm256_cvtepi32_ps(R[i][1]), s), wscale1));
-                    if (b == 0)
-                        for (int t = 0; t < cnt; t++) yp[t] = out[t];
-                    else
-                        for (int t = 0; t < cnt; t++) yp[t] += out[t];
+            }
+            for (int r = rb; r < rend; r++) {
+                float *yp = y + (size_t)r * ns + n0;
+                if (cnt == 16) {
+                    _mm256_storeu_ps(yp, _mm256_loadu_ps(acc[r - rb]));
+                    _mm256_storeu_ps(yp + 8, _mm256_loadu_ps(acc[r - rb] + 8));
+                } else {
+                    for (int t = 0; t < cnt; t++) yp[t] = acc[r - rb][t];
                 }
             }
         }

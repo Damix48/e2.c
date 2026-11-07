@@ -25,25 +25,22 @@ pools the samples of several passes so a busy host cannot fake a result.
 
 ## Speed
 
-| task | length | e2 int8 | OpenVINO f32 | OpenVINO int8 |
+| task | length | e2 int8 | OpenVINO int8 | e2 / OV |
 |---|---:|---:|---:|---:|
-| text | 8 tokens | 7.2 ms | 9.5 ms | **5.5 ms** |
-| text | 64 tokens | 43.7 ms | 13.0 ms | **10.7 ms** |
-| text | 128 tokens | 91.0 ms | 19.0 ms | **17.2 ms** |
-| text | 512 tokens | 502 ms | 71.8 ms | **62.6 ms** |
-| text | 2048 tokens | 2821 ms | 524 ms | **501 ms** |
-| text batch | 8 x 64 | 350 ms | 68.6 ms | **49.3 ms** |
-| text batch | 32 x 64 | 1382 ms | 236 ms | **206 ms** |
-| image 640x480 | 270 tok | 3209 ms | 556 ms | **520 ms** |
-| audio 2 s | 54 tok | 130 ms | 38.3 ms | **28.5 ms** |
-| video 8 frames | 1058 tok | 9551 ms | 1897 ms | **1681 ms** |
+| text | 8 tokens | **3.2 ms** | 5.5 ms | 0.57 |
+| text | 64 tokens | **6.2 ms** | 9.0 ms | 0.69 |
+| text | 128 tokens | **13.2 ms** | 15.9 ms | 0.83 |
+| text | 512 tokens | **40.8 ms** | 62.5 ms | 0.65 |
+| text | 2048 tokens | **234.7 ms** | 483.8 ms | 0.49 |
+| text batch | 8 x 64 | **34.8 ms** | 50.2 ms | 0.69 |
+| text batch | 32 x 64 | **183.3 ms** | 212.4 ms | 0.86 |
+| image 640x480 | 270 tok | **331.4 ms** | 526.3 ms | 0.63 |
+| audio 2 s | 54 tok | **22.8 ms** | 24.7 ms | 0.93 |
+| video 8 frames | 1058 tok | **1094.7 ms** | 1630.8 ms | 0.67 |
 
-Text is competitive at 8 tokens (e2 beats OV f32) and falls behind as the
-sequence grows: e2 is ~2-4x slower at 512 tokens and ~5x at 2048, where OV
-int8 and f32 converge (the 2048-token encoder is memory-bound). Image, audio
-and video are 5-6x behind OpenVINO. The vision attention (bidirectional,
-~2.4k patches) is the dominant cost in e2 and is memory-bound in the current
-4-query-row kernel; the audio path is dominated by many small-M int8 GEMMs.
+OpenVINO f32 is slower than its int8 on every row and is omitted.
+`--repeat 3` pools 9 samples per row; alone, the same-run ratio still moves
++/-10% with host load (see PERFORMANCE.md).
 
 ## Accuracy
 

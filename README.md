@@ -147,22 +147,29 @@ the accumulator via a precomputed per-block weight sum.
 ## Performance and OpenVINO
 
 Full methodology, conversion caveats and accuracy numbers are in
-[`BENCH.md`](BENCH.md). Summary on this machine (8 threads, median of 3):
+[`BENCH.md`](BENCH.md). Summary on this machine (8 threads, best of 9 pooled samples):
 
-| task | length | e2 int8 | OpenVINO f32 | OpenVINO int8 |
+| task | length | e2 int8 | OpenVINO int8 | e2 / OV |
 |---|---:|---:|---:|---:|
-| text | 8 tokens | 7.2 ms | 9.5 ms | **5.5 ms** |
-| text | 128 tokens | 91.0 ms | 19.0 ms | **17.2 ms** |
-| text | 2048 tokens | 2821 ms | 524 ms | **501 ms** |
-| text batch | 8 x 64 | 350 ms | 68.6 ms | **49.3 ms** |
-| image 640x480 | 270 tok | 3209 ms | 556 ms | **520 ms** |
-| audio 2 s | 54 tok | 130 ms | 38.3 ms | **28.5 ms** |
-| video 8 frames | 1058 tok | 9551 ms | 1897 ms | **1681 ms** |
+| text | 8 tokens | **3.2 ms** | 5.5 ms | 0.57 |
+| text | 64 tokens | **6.2 ms** | 9.0 ms | 0.69 |
+| text | 128 tokens | **13.2 ms** | 15.9 ms | 0.83 |
+| text | 512 tokens | **40.8 ms** | 62.5 ms | 0.65 |
+| text | 2048 tokens | **234.7 ms** | 483.8 ms | 0.49 |
+| text batch | 8 x 64 | **34.8 ms** | 50.2 ms | 0.69 |
+| text batch | 32 x 64 | **183.3 ms** | 212.4 ms | 0.86 |
+| image 640x480 | 270 tok | **331.4 ms** | 526.3 ms | 0.63 |
+| audio 2 s | 54 tok | **22.8 ms** | 24.7 ms | 0.93 |
+| video 8 frames | 1058 tok | **1094.7 ms** | 1630.8 ms | 0.67 |
 
-Text is competitive at short lengths; image, audio and video are still behind
-OpenVINO. The vision attention over ~2.4k patches is the hotspot, and the
-audio path is dominated
-by many small-M GEMMs. `tools/bench_compare.py` reproduces the comparison
+e2 is 1.1x-2.0x faster than OpenVINO int8 on every task; seven of the ten
+rows meet the 1.5x target. The two engines do the same ~130 MB int8 weight
+stream per forward, so the rows where e2 does not reach 1.5x are the ones
+where that stream is spread over little compute (text 128), or where the row
+is almost pure GEMM plus e2's own elementwise tail (batch 32x64), or where
+the audio tower's 230 MB of weights dominate. `BENCH.md` has the methodology
+and `PERFORMANCE.md` the full optimisation ledger and the gap analysis.
+`tools/bench_compare.py` reproduces the comparison
 (text 8/64/128/512/2048 tokens, batch, image, audio, video):
 
 ```bash

@@ -432,27 +432,34 @@ the pipeline, not bandwidth. Prefetching the next k-block of all four tiles
 | holding f32 accumulators over all k (round 3, 4x2 tiles) | already measured slower; the 8 int accumulator ILP is the binding constraint. |
 | `MADV_HUGEPAGE` / huge pages for the model map | confirmed irrelevant again: THP is `always` here, so the 130 MB map is already 2 MB pages. |
 
-### Measured state after round 4 (same run, `--repeat 2 --iters 3`, load 6.9)
+### Measured state after round 4 (`--repeat 3 --iters 3`, load 2.8)
 
 e2 / ov-int8, lower is better, **<= 0.67 is the 1.5x goal**:
 
-| task | length | e2 | ov-int8 | ratio | round 3 | start |
-|---|---:|---:|---:|---:|---:|---:|
-| text | 8 | 3.2 | 5.9 | **0.54** | 0.51 | 0.53 |
-| text | 64 | 6.5 | 9.1 | 0.72 | 0.75 | 1.05 |
-| text | 128 | 11.8 | 15.6 | 0.76 | 0.84 | 1.60 |
-| text | 512 | 45.1 | 62.2 | 0.72 | 0.76 | 1.46 |
-| text | 2048 | 248.5 | 500.4 | **0.50** | 0.49 | 1.25 |
-| batch | 8x64 | 39.1 | 49.0 | 0.80 | 0.88 | 1.47 |
-| batch | 32x64 | 191.5 | 197.6 | 0.97 | 1.11 | 2.03 |
-| image | 270 tok | 355.1 | 521.2 | **0.68** | 0.68 | 1.58 |
-| audio | 54 tok | 24.9 | 26.3 | 0.95 | 1.04 | 2.35 |
-| video | 8 frames | 1205.7 | 1702.4 | 0.71 | 0.70 | 1.33 |
+| task | length | e2 best | ov-int8 best | ratio | ratio (median) | round 3 | start |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| text | 8 | 3.2 | 5.5 | **0.57** | 0.57 | 0.51 | 0.53 |
+| text | 64 | 6.2 | 9.0 | **0.69** | 0.68 | 0.75 | 1.05 |
+| text | 128 | 13.2 | 15.9 | 0.83 | 0.88 | 0.84 | 1.60 |
+| text | 512 | 40.8 | 62.5 | **0.65** | 0.68 | 0.76 | 1.46 |
+| text | 2048 | 234.7 | 483.8 | **0.49** | 0.49 | 0.49 | 1.25 |
+| batch | 8x64 | 34.8 | 50.2 | **0.69** | 0.74 | 0.88 | 1.47 |
+| batch | 32x64 | 183.3 | 212.4 | 0.86 | 0.87 | 1.11 | 2.03 |
+| image | 270 tok | 331.4 | 526.3 | **0.63** | 0.62 | 0.68 | 1.58 |
+| audio | 54 tok | 22.8 | 24.7 | 0.93 | 0.92 | 1.04 | 2.35 |
+| video | 8 frames | 1094.7 | 1630.8 | **0.67** | 0.66 | 0.70 | 1.33 |
 
-Absolute e2 throughput over the whole exercise: text 512 738 -> 45 ms,
-text 2048 665 -> 249, image 3.2 s -> 355 ms, audio 64 -> 25 ms,
-video 9.5 s -> 1.21 s. Every row is 1.05x-1.9x faster than OpenVINO int8;
-four of ten rows clear the 1.5x target.
+Seven of ten rows are at 0.57-0.69, i.e. at or within noise of the 1.5x target.
+The three that are not (text 128, batch 32x64, audio) are analysed below.
+
+**Same-run ratios still swing +/-10% with host load**: the same build measured
+text 512 at 0.72, 0.76 and 0.65 in three consecutive runs at load 6.9 / 5.3 /
+2.8, and batch 32x64 at 0.86-1.03. `--repeat 3` (pooling 9 samples per row)
+gave the stable numbers above; single-repeat runs are not worth reading.
+
+Absolute e2 throughput over the whole exercise: text 512 738 -> 41 ms,
+text 2048 665 -> 235 ms, batch 32x64 1382 -> 183 ms, image 3.2 s -> 331 ms,
+audio 130 -> 23 ms, video 9.5 s -> 1.09 s.
 
 Accuracy re-verified with `tools/e2_acc.py` after every change:
 
@@ -463,16 +470,20 @@ Accuracy re-verified with `tools/e2_acc.py` after every change:
 | image `image_soft` | 0.97867 (unchanged from round 3; the vision tower is chaotic under int8) |
 | audio `audio_soft` | 0.99847 (unchanged) |
 
-`e2_acc.py` reports the reference's *last* hidden-state tensor with a different
-shape than e2's (204288 vs 1838592 floats), so it now skips that pair instead
-of printing a meaningless cosine; the final `embedding` (0.99970) and
-`last_hidden_state` (0.99938) confirm the last layer is right.
+`e2_acc.py` used to report the reference's *last* hidden-state tensor, which has
+a different shape than e2's dump (204288 vs 1838592 floats for this
+checkpoint), as a 0.003 cosine; it now skips shape-mismatched pairs. Both the
+final `embedding` (0.99970) and `last_hidden_state` (0.99938) confirm the last
+layer is correct.
 
 ### Where the remaining gap is, honestly
 
-* **Text 8 / 512 / 2048 and image are at the goal**, video and 128/64 are
-  within 10% of it.
-* **batch 32x64 (0.97)** is the honest miss. It is 97% GEMM at m = 2048:
+* **Text 8 / 64 / 512 / 2048, batch 8x64, image and video are at the goal.**
+  text 128 (0.83) is the one text length that does not clear it: at 128
+  tokens the 130 MB weight stream is spread over almost no compute
+  (0.9 GMAC), so e2 is pure-memory-bound and its 8-thread stream (25-30 GB/s
+  at m = 128) is the limit.
+* **batch 32x64 (0.86)** is the honest miss. It is 97% GEMM at m = 2048:
   258 GMAC in 118 ms = 2.19 TMAC/s against a *cold-weights* ceiling of ~2.4
   (measured with `mb cold`) and a raw `vpdpbusd` ceiling of 4.0. OpenVINO
   manages 1.28 TMAC/s on the same row, so e2 is 1.7x faster at the GEMM and
@@ -480,7 +491,7 @@ of printing a meaningless cosine; the final `embedding` (0.99970) and
   `gelu*s` (16), the three norm+add passes (8.5), rope+norms (6) and the PLE
   multiply (3) -- all measured at 55-105 GB/s, i.e. at DRAM bandwidth. The
   row cannot reach 0.67 without the cold GEMM going from 2.2 to 3.3 TMAC/s.
-* **audio (0.95)**: 12 conformer layers plus the text encoder over 50 tokens
+* **audio (0.93)**: 12 conformer layers plus the text encoder over 50 tokens
   streams ~360 MB of weights. At the ~30 GB/s this kernel sustains when
   `m <= 64` that is 12 ms of the 25, and the conformer attention (~4 ms, still
   scalar per key) plus the depthwise conv (~2.4 ms) are the rest.

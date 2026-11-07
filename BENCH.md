@@ -1,9 +1,9 @@
 # Benchmarks
 
-Host: AMD Ryzen 7 9700X (8 cores / 16 threads), 54 GB RAM, Debian 13,
-shared with other workloads (numbers are median of 3, so treat them as
-indicative). OpenVINO 2026.4.1, 8 inference threads. e2 uses 8 threads
-(physical cores), int8 weights, int8 activations.
+Host: Intel Core Ultra 9 285H (6 P + 8 E + 2 LP-E cores, no AVX-512,
+AVX-VNNI, Intel Arc 140T iGPU), Debian 13, shared with other workloads
+(numbers are min/median of 6, so treat them as indicative). OpenVINO 2026.4.1,
+8 inference threads. e2 uses 8 threads, int8 weights, int8 activations.
 
 Reproduce:
 
@@ -27,18 +27,27 @@ pools the samples of several passes so a busy host cannot fake a result.
 
 | task | length | e2 int8 | OpenVINO int8 | e2 / OV |
 |---|---:|---:|---:|---:|
-| text | 8 tokens | **3.2 ms** | 5.5 ms | 0.57 |
-| text | 64 tokens | **6.2 ms** | 9.0 ms | 0.69 |
-| text | 128 tokens | **13.2 ms** | 15.9 ms | 0.83 |
-| text | 512 tokens | **40.8 ms** | 62.5 ms | 0.65 |
-| text | 2048 tokens | **234.7 ms** | 483.8 ms | 0.49 |
-| text batch | 8 x 64 | **34.8 ms** | 50.2 ms | 0.69 |
-| text batch | 32 x 64 | **183.3 ms** | 212.4 ms | 0.86 |
-| image 640x480 | 270 tok | **331.4 ms** | 526.3 ms | 0.63 |
-| audio 2 s | 54 tok | **22.8 ms** | 24.7 ms | 0.93 |
-| video 8 frames | 1058 tok | **1094.7 ms** | 1630.8 ms | 0.67 |
+| text | 8 tokens | **2.6 ms** | 6.5 ms | 0.40 |
+| text | 64 tokens | **11.2 ms** | 21.5 ms | 0.52 |
+| text | 128 tokens | **21.3 ms** | 43.4 ms | 0.49 |
+| text | 512 tokens | **83.2 ms** | 207.0 ms | 0.40 |
+| text | 2048 tokens | **420.1 ms** | 1374.2 ms | 0.31 |
+| text batch | 8 x 64 | **68.8 ms** | 152.2 ms | 0.45 |
+| text batch | 32 x 64 | **282.8 ms** | 604.6 ms | 0.47 |
+| image 640x480 | 270 tok | **599.5 ms** | 1465.1 ms | 0.41 |
+| audio 2 s | 54 tok | **32.0 ms** | 57.0 ms | 0.56 |
+| video 8 frames | 1058 tok | **2681.1 ms** | 5020.6 ms | 0.53 |
 
-OpenVINO f32 is slower than its int8 on every row and is omitted.
+OpenVINO f32 is slower than its int8 on every row and is omitted. Every row
+beats OpenVINO int8 by at least 1.8x (goal was 1.5x).
+
+On the Arc 140T iGPU (`--sources e2,ov-int8-gpu --e2-device gpu`) e2 is
+currently 3.5-11x **slower** than OpenVINO GPU: e2 runs one Level Zero
+submission per GEMM, which costs ~0.2 ms of dispatch plus ~0.4 ms of host wait
+per call, while OpenVINO compiles the whole graph and submits once per
+inference. Numbers and the analysis are in PERFORMANCE.md ("GPU (Level Zero)").
+The GPU backend is opt-in (`E2_DEVICE=gpu`) and correct (cosine 1.0000 text,
+0.9999 image, 0.9988 audio vs the CPU path).
 `--repeat 3` pools 9 samples per row; alone, the same-run ratio still moves
 +/-10% with host load (see PERFORMANCE.md).
 

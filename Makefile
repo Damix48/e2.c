@@ -45,7 +45,7 @@ SRC := src/e2.c src/e2_model.c src/e2_util.c src/e2_gemm.c src/e2_ops.c \
 OBJ := $(SRC:.c=.o)
 HDR := e2.h src/e2_internal.h src/e2_gpu.h src/e2_gpu_l0.h src/e2_gpu_spv.h
 
-.PHONY: all clean test bench compare pack help
+.PHONY: all clean test bench compare pack help spv
 
 all: libe2.a e2cli
 	@echo "e2: system-image=$(USE_SYSTEM_IMAGE) webp=$(USE_WEBP) sndfile=$(USE_SNDFILE)"
@@ -75,6 +75,11 @@ tests/e2_bench: tests/e2_bench.c libe2.a $(HDR)
 
 tests/e2_bench_full: tests/e2_bench_full.c libe2.a $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< libe2.a $(LDFLAGS)
+
+# regenerate src/e2_gpu_spv.h from tools/gpu/*.cl (needs clang + xxd; the
+# generated header is checked in so a normal build does not)
+spv:
+	sh tools/e2_spv.sh
 
 # dev-only Level Zero GEMM probe (not shipped; dlopens libze_loader at runtime)
 gpu-probe: tools/gpu_probe.c src/e2_gpu_l0.c libe2.a $(HDR) src/e2_gpu_l0.h src/e2_gpu_spv.h

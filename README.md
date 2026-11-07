@@ -30,6 +30,11 @@ make bench           # text throughput / latency
 `-march=native` is **not** required: the hot kernels are compiled with
 `__attribute__((target(...)))` and selected at runtime.
 
+The Intel GPU (Level Zero) backend is opt-in and needs no build dependency
+(`libze_loader.so.1` is dlopen'd, the SPIR-V module is a checked-in generated
+header): `E2_DEVICE=gpu ./e2cli ...` or `e2_set_device(ctx, E2_DEVICE_GPU)`.
+On the current Arc 140T it is slower than the CPU -- see PERFORMANCE.md.
+
 Optional system libraries are auto-detected with `pkg-config`: libpng +
 libjpeg-turbo replace the vendored decoders, libwebp adds WebP input, and
 libsndfile adds FLAC/OGG/Opus/MP3 audio loading. Force any of them off/on:

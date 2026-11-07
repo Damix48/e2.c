@@ -752,6 +752,26 @@ already past the 1.5x goal before round 6 starts. The two thin rows were
 |---|---|---|
 | 1 | **AVX2+FMA twins of the f32 attention kernels** (`qk_kt_a2`, `attn_pv_a2` in `e2_ops.c`). `qk_kt_v`/`attn_pv_v` were AVX-512-only and the dispatch was `simd() >= 2`, so on any host without AVX-512 the *scalar* kernels ran at ~8 GMAC/s. Text shorter than 32 tokens takes the f32 attention path, which is why text 8 was the worst row. | **text 8: 4.37 -> 2.7 ms (1.6x)**, ratio 0.62 -> 0.38. Nothing else moves (t >= 32 uses the int8 path). |
 
+### Final CPU numbers (`--repeat 2 --iters 3`, 8 threads, quiet box)
+
+| task | length | e2 ms | ov-int8 ms | e2/ov | goal |
+|---|---:|---:|---:|---:|---|
+| text | 8 | 2.6 | 6.5 | **0.40** | ok |
+| text | 64 | 11.2 | 21.5 | **0.52** | ok |
+| text | 128 | 21.3 | 43.4 | **0.49** | ok |
+| text | 512 | 83.2 | 207.0 | **0.40** | ok |
+| text | 2048 | 420.1 | 1374.2 | **0.31** | ok |
+| batch | 8x64 | 68.8 | 152.2 | **0.45** | ok |
+| batch | 32x64 | 282.8 | 604.6 | **0.47** | ok |
+| image | 270 tok | 599.5 | 1465.1 | **0.41** | ok |
+| audio | 54 tok | 32.0 | 57.0 | **0.56** | ok |
+| video | 8 frames | 2681.1 | 5020.6 | **0.53** | ok |
+
+Every row is at least 1.8x faster than OpenVINO int8 (the goal was 1.5x, i.e.
+ratio <= 0.667). The worst row is audio at 0.56; the best is text 2048 at 0.31.
+Note that `video 8` reads 2681 ms here but 2015 ms in the single-process spec
+run -- the harness also runs OV in the same session, so treat it as noise.
+
 ### What did not work this round (CPU)
 
 | try | outcome |

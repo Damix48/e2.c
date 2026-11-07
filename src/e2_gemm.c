@@ -14,6 +14,7 @@
  * computes 16 (AVX-512) or 8 (AVX-VNNI) output channels from 4 k values.
  */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -681,6 +682,13 @@ void e2_gemm_init(void) {
  * cannot express. */
 static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
 
+/* Try the GPU GEMM; returns 0 if it produced y, nonzero to use the CPU. */
+static int gpu_try(e2_ctx *ctx, float *y, int ns, const uint8_t *xq, const float *xs,
+                   int xss, int m, int k, const e2_qmat *w) {
+    if (!ctx || ctx->device != E2_DEVICE_GPU || !ctx->gpu || m < 32) return -1;
+    return e2_gpu_gemm(ctx, y, ns, xq, xs, xss, m, k, w, 0, (w->n + 15) / 16);
+}
+
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l) {
     if (l->in_min || l->in_max) { linear_one(ctx, y, x, m, l); return; }
     e2_linear_forward_multi(ctx, x, m, &l, &y, 1);
@@ -749,10 +757,13 @@ void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
         a.w = &l->w;
         a.ns = l->w.n;
         long work = (long)m * l->w.n * k;
-        if (ctx->nthreads <= 1 || work < 2000000L)
-            gemm_work(&a, 0, 1);
-        else
-            e2_parallel(ctx, gemm_work, &a);
+        int gpu = gpu_try(ctx, ys[i], l->w.n, xq, xs, nblk, m, k, &l->w) == 0;
+        if (!gpu) {
+            if (ctx->nthreads <= 1 || work < 2000000L)
+                gemm_work(&a, 0, 1);
+            else
+                e2_parallel(ctx, gemm_work, &a);
+        }
         if (l->w.bias || l->out_min || l->out_max) {
             float lo = l->out_min ? l->out_min[0] : -INFINITY;
             float hi = l->out_max ? l->out_max[0] : INFINITY;
@@ -823,10 +834,12 @@ static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
     }
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
     long work = (long)m * w->n * k;
-    if (ctx->nthreads <= 1 || work < 2000000L)
-        gemm_work(&a, 0, 1);
-    else
-        e2_parallel(ctx, gemm_work, &a);
+    if (gpu_try(ctx, y, w->n, xq, xs, nblk, m, k, w) != 0) {
+        if (ctx->nthreads <= 1 || work < 2000000L)
+            gemm_work(&a, 0, 1);
+        else
+            e2_parallel(ctx, gemm_work, &a);
+    }
     if (w->bias || l->out_min || l->out_max) {
         float lo = l->out_min ? l->out_min[0] : -INFINITY;
         float hi = l->out_max ? l->out_max[0] : INFINITY;
@@ -890,10 +903,12 @@ void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
     int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
     long work = (long)m * w->n * k;
-    if (!ctx || ctx->nthreads <= 1 || work < 2000000L)
-        gemm_work(&a, 0, 1);
-    else
-        e2_parallel(ctx, gemm_work, &a);
+    if (gpu_try(ctx, y, w->n, xq, xs, nblk, m, k, w) != 0) {
+        if (!ctx || ctx->nthreads <= 1 || work < 2000000L)
+            gemm_work(&a, 0, 1);
+        else
+            e2_parallel(ctx, gemm_work, &a);
+    }
 }
 
 /* Caller-owned m4-padded u8 activation scratch (ctx->qbuf) plus its block

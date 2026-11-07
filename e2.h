@@ -48,6 +48,14 @@ int  e2_modalities(const e2_ctx *ctx);
 void e2_set_threads(e2_ctx *ctx, int nthreads);
 int  e2_threads(const e2_ctx *ctx);
 
+/* Compute device.  CPU is the default and the reference; the GPU backend is
+ * opt-in (also selectable at load time with E2_DEVICE=gpu). */
+enum { E2_DEVICE_CPU = 0, E2_DEVICE_GPU = 1 };
+/* Switch device.  Returns 0 on success, -1 if the GPU is unavailable (the
+ * context then stays on the CPU). */
+int  e2_set_device(e2_ctx *ctx, int device);
+int  e2_device(const e2_ctx *ctx);
+
 /* Last error, never NULL. */
 const char *e2_error(void);
 

@@ -47,6 +47,8 @@ static void fft512(const float *in, float *mag) {
 
 /* Features: [T,128] float, mask [T] (1 valid), zeroed for invalid frames. */
 
+static double aud_prof[12];
+
 /* 3x3 stride-2 conv, parallel over output channels. */
 typedef struct {
     const float *in, *w;
@@ -170,7 +172,8 @@ static float softplus(float v) {
 }
 
 static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
-                            const uint8_t *mask, int H, int heads, int D) {
+                            const uint8_t *mask, int H, int heads, int D,
+                            const float *pe, int pos_len) {
     e2_meta *c = &ctx->m.meta;
     int nb = (T + c->audio_chunk - 1) / c->audio_chunk;
     int chunk = c->audio_chunk;
@@ -181,36 +184,30 @@ static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     float *v = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
     float *out = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
     if (!q || !k || !v || !out) return;
+    double _a0 = e2_now_ms();
     e2_linear_forward(ctx, q, x, T, &L->q);
     e2_linear_forward(ctx, k, x, T, &L->k);
     e2_linear_forward(ctx, v, x, T, &L->v);
+    aud_prof[4] += e2_now_ms() - _a0;
+    _a0 = e2_now_ms();
+    float qs[256];
+    for (int d = 0; d < D; d++)
+        qs[d] = c->audio_qscale * softplus(L->per_dim_scale[d]);
+    const float kscale = c->audio_kscale;
     for (int t = 0; t < T; t++) {
         for (int hh = 0; hh < heads; hh++) {
             float *qp = q + ((size_t)t * heads + hh) * D;
             float *kp = k + ((size_t)t * heads + hh) * D;
-            for (int d = 0; d < D; d++) {
-                qp[d] *= c->audio_qscale * softplus(L->per_dim_scale[d]);
-                kp[d] *= c->audio_kscale;
-            }
+            for (int d = 0; d < D; d++) { qp[d] *= qs[d]; kp[d] *= kscale; }
         }
     }
-    /* relative position embeddings [ctx/2+1, H] with sin...cos layout */
-    int pos_len = ctxsz / 2 + 1;
-    float *pe = e2_arena_alloc(&ctx->scratch, (size_t)pos_len * H * sizeof(float));
-    int half = H / 2;
-    float loginc = logf(10000.0f) / (float)(half - 1 > 0 ? half - 1 : 1);
-    for (int p = 0; p < pos_len; p++) {
-        int pos = pos_len - 1 - p;
-        for (int i = 0; i < half; i++) {
-            float ts = expf(-(float)i * loginc);
-            float a = (float)pos * ts;
-            pe[(size_t)p * H + i] = sinf(a);
-            pe[(size_t)p * H + half + i] = cosf(a);
-        }
-    }
+    aud_prof[5] += e2_now_ms() - _a0;
+    _a0 = e2_now_ms();
     float *rk = e2_arena_alloc(&ctx->scratch, (size_t)pos_len * H * sizeof(float));
     e2_linear_forward(ctx, rk, pe, pos_len, &L->rel_k);
     /* rk layout [pos_len, heads*D]; view as [pos_len][heads][D] */
+    aud_prof[6] += e2_now_ms() - _a0;
+    _a0 = e2_now_ms();
     memset(out, 0, (size_t)T * H * sizeof(float));
     float scores[512];
     for (int b = 0; b < nb; b++) {
@@ -269,7 +266,10 @@ static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
             }
         }
     }
+    aud_prof[7] += e2_now_ms() - _a0;
+    _a0 = e2_now_ms();
     e2_linear_forward(ctx, x, out, T, &L->post);
+    aud_prof[8] += e2_now_ms() - _a0;
 }
 
 static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
@@ -308,15 +308,20 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
     e2_model *m = &ctx->m;
     e2_meta *c = &m->meta;
     if (!(c->flags & E2_MOD_AUDIO)) return e2_fail("model has no audio tower");
+    int prof = getenv("E2_PROFILE") != NULL;
+    double now0 = e2_now_ms();
+    memset(aud_prof, 0, sizeof(aud_prof));
     float *feat = NULL;
     uint8_t *mask = NULL;
     int T = 0;
     if (audio_mel(ctx, samples, n, &feat, &mask, &T) != 0) return -1;
+    double t_mel = e2_now_ms() - now0;
 
     const int H = c->audio_hidden, heads = c->audio_heads, D = c->audio_head_dim;
     const int I = c->audio_inter, K = c->audio_conv_k, sub0 = 128, sub1 = 32;
     e2_arena_reset(&ctx->scratch);
 
+    double t_sub0 = e2_now_ms();
     /* ---- subsample conv (two 3x3 stride-2 convs) ---- */
     int T0 = (T - 1) / 2 + 1;
     int W0 = 64;
@@ -394,28 +399,59 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
                 flat[((size_t)t * W1 + w) * sub1 + ch] = c1[((size_t)ch * T1 + t) * W1 + w];
     e2_linear linproj = {0}; linproj.w = m->aud_in_proj;
     e2_linear_forward(ctx, x, flat, T1, &linproj);
+    double t_sub = e2_now_ms() - t_sub0;
     adump("aud_in", x, (size_t)T1 * H);
 
+    /* relative position embedding table: same for every layer */
+    float *pe = NULL;
+    int pos_len = 0;
+    {
+        int chunk = c->audio_chunk;
+        int ctxsz = chunk + (c->audio_ctx_left - 1) + c->audio_ctx_right;
+        pos_len = ctxsz / 2 + 1;
+        pe = e2_arena_alloc(&ctx->scratch, (size_t)pos_len * H * sizeof(float));
+        int half = H / 2;
+        float loginc = logf(10000.0f) / (float)(half - 1 > 0 ? half - 1 : 1);
+        for (int p = 0; p < pos_len; p++) {
+            int pos = pos_len - 1 - p;
+            for (int i = 0; i < half; i++) {
+                float ts = expf(-(float)i * loginc);
+                float a = (float)pos * ts;
+                pe[(size_t)p * H + i] = sinf(a);
+                pe[(size_t)p * H + half + i] = cosf(a);
+            }
+        }
+    }
     /* ---- conformer layers ---- */
+    double t_layers0 = e2_now_ms();
     for (int li = 0; li < c->audio_layers; li++) {
         e2_audio_layer *L = &m->al[li];
+        double _l0 = e2_now_ms();
         audio_ff(ctx, L, x, T1, 0, H, I);
+        aud_prof[0] += e2_now_ms() - _l0;
         /* attention */
         float *res = e2_arena_alloc(&ctx->scratch, (size_t)T1 * H * sizeof(float));
         float *hn = e2_arena_alloc(&ctx->scratch, (size_t)T1 * H * sizeof(float));
         memcpy(res, x, (size_t)T1 * H * sizeof(float));
         e2_rmsnorm(hn, x, L->pre_attn_norm, T1, H, c->audio_eps);
-        audio_attention(ctx, L, hn, T1, m1, H, heads, D);
+        _l0 = e2_now_ms();
+        audio_attention(ctx, L, hn, T1, m1, H, heads, D, pe, pos_len);
+        aud_prof[1] += e2_now_ms() - _l0;
         e2_rmsnorm(hn, hn, L->post_attn_norm, T1, H, c->audio_eps);
         e2_add_inplace(res, hn, T1 * H);
         memcpy(x, res, (size_t)T1 * H * sizeof(float));
+        _l0 = e2_now_ms();
         audio_lconv(ctx, L, x, T1, H, K);
+        aud_prof[2] += e2_now_ms() - _l0;
+        _l0 = e2_now_ms();
         audio_ff(ctx, L, x, T1, 1, H, I);
+        aud_prof[3] += e2_now_ms() - _l0;
         e2_rmsnorm(x, x, L->norm_out, T1, H, c->audio_eps);
         char nm[32]; snprintf(nm, sizeof(nm), "aud_l%d", li + 1);
         adump(nm, x, (size_t)T1 * H);
     }
 
+    double t_layers = e2_now_ms() - t_layers0;
     /* ---- output projection + text projection ---- */
     float *aout = e2_arena_alloc(&ctx->scratch, (size_t)T1 * c->audio_output_dim * sizeof(float));
     float *soft = e2_arena_alloc(&ctx->scratch, (size_t)T1 * c->text_hidden * sizeof(float));
@@ -435,6 +471,13 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
             cnt++;
         }
     *ntok = cnt;
+    if (prof)
+        fprintf(stderr, "audio: T=%d T1=%d H=%d I=%d L=%d mel %.2f sub %.2f layers %.2f "
+                "[ff1 %.2f attn %.2f lconv %.2f ff2 %.2f | qkv %.2f scale %.2f pe %.2f loop %.2f post %.2f] out %.2f total %.2f\n",
+                T, T1, H, I, c->audio_layers, t_mel, t_sub, t_layers,
+                aud_prof[0], aud_prof[1], aud_prof[2], aud_prof[3],
+                aud_prof[4], aud_prof[5], aud_prof[6], aud_prof[7], aud_prof[8],
+                e2_now_ms() - t_layers0 - t_layers, e2_now_ms() - now0);
     free(feat);
     free(mask);
     return 0;

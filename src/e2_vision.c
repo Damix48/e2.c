@@ -83,17 +83,14 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
         if (prof) tp[0] += e2_now_ms() - _t0;
 
         e2_linear_forward(ctx, tmp, att, P, &L->o);
-        e2_rmsnorm(tmp, tmp, L->post_attn_norm, P, H, c->vision_eps);
-        e2_add_inplace(x, tmp, P * H);
+        e2_rmsnorm_add(x, tmp, L->post_attn_norm, P, H, c->vision_eps);
 
         e2_rmsnorm(hb, x, L->pre_ff_norm, P, H, c->vision_eps);
         e2_linear_forward(ctx, tmp, hb, P, &L->gate);
         e2_linear_forward(ctx, up, hb, P, &L->up);
-        e2_gelu_tanh_ctx(ctx, tmp, P * I);
-        for (size_t i = 0; i < (size_t)P * I; i++) tmp[i] *= up[i];
+        e2_gelu_mul(ctx, tmp, up, P * I);
         e2_linear_forward(ctx, hb, tmp, P, &L->down);
-        e2_rmsnorm(hb, hb, L->post_ff_norm, P, H, c->vision_eps);
-        e2_add_inplace(x, hb, P * H);
+        e2_rmsnorm_add(x, hb, L->post_ff_norm, P, H, c->vision_eps);
         if (prof) tp[1] += e2_now_ms() - _t0;
         {
             char nm[32]; snprintf(nm, sizeof(nm), "vis_l%d", li + 1);

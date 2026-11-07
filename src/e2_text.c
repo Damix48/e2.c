@@ -35,6 +35,9 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
                           float *out) {
     int prof_on = getenv("E2_PROFILE") != NULL;
     double prof[16] = {0};
+    double p2[10] = {0};
+    double _q = 0;
+    double t_all = e2_now_ms();
     int _i = 0;
     e2_model *m = &ctx->m;
     e2_meta *c = &m->meta;
@@ -59,8 +62,9 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
     e2_linear lple = {0}; lple.w = m->ple_proj;
     _i = 1;
     PROF_T(e2_linear_forward(ctx, ple, x, n, &lple));
-    e2_vec_scale(ple, n * L * P, c->text_ple_scale);
-    e2_rmsnorm(ple, ple, m->ple_norm, n * L, P, c->text_eps);
+    _q = e2_now_ms();
+    e2_rmsnorm_pre(ple, ple, m->ple_norm, n * L, P, c->text_eps, c->text_ple_scale);
+    p2[0] += e2_now_ms() - _q;
     dump_tensor("ple", ple, (size_t)n * L * P);
 
     for (int li = 0; li < L; li++) {
@@ -82,20 +86,24 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
         _i = 4;
 
         if (li == 0) dump_tensor("l0_vraw", v, (size_t)n * kvh * hd);
+        _q = e2_now_ms();
         e2_rmsnorm(q, q, ly->q_norm, n * c->text_heads, hd, c->text_eps);
         e2_rmsnorm(k, k, ly->k_norm, n * kvh, hd, c->text_eps);
         e2_rmsnorm(v, v, NULL, n * kvh, hd, c->text_eps);
+        p2[2] += e2_now_ms() - _q;
         if (li == 0) {
             dump_tensor("l0_qpre", q, (size_t)n * c->text_heads * hd);
             dump_tensor("l0_kpre", k, (size_t)n * kvh * hd);
             dump_tensor("l0_vpre", v, (size_t)n * kvh * hd);
         }
 
+        _q = e2_now_ms();
         float theta = ly->is_full ? c->text_rope_theta_full : c->text_rope_theta_sliding;
         for (int sq = 0; sq < nseq; sq++)
             e2_rope_text(ctx, q + (size_t)seq_off[sq] * c->text_heads * hd,
                          k + (size_t)seq_off[sq] * kvh * hd, seq_len[sq],
                          c->text_heads, kvh, hd, 0, theta);
+        p2[1] += e2_now_ms() - _q;
         if (li == 0 && nseq == 1) {
             dump_tensor("l0_q", q, (size_t)n * c->text_heads * hd);
             dump_tensor("l0_k", k, (size_t)n * kvh * hd);
@@ -103,67 +111,75 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
         }
 
         int window = ly->is_full ? -1 : c->text_sliding;
+        int same_len = nseq > 1;
+        for (int sq = 1; sq < nseq && same_len; sq++)
+            if (seq_len[sq] != seq_len[0]) same_len = 0;
         _i = 6;
-        if (prof_on) {
-            double _t = e2_now_ms();
+        double _t = e2_now_ms();
+        if (same_len)
+            e2_attention_text_multi(ctx, att, q, k, v, seq_len[0], seq_off, nseq,
+                                    c->text_heads, kvh, hd, window);
+        else
             for (int sq = 0; sq < nseq; sq++)
                 e2_attention_text(ctx, att + (size_t)seq_off[sq] * c->text_heads * hd,
                                   q + (size_t)seq_off[sq] * c->text_heads * hd,
                                   k + (size_t)seq_off[sq] * kvh * hd,
                                   v + (size_t)seq_off[sq] * kvh * hd,
                                   seq_len[sq], c->text_heads, kvh, hd, window);
-            prof[6] += e2_now_ms() - _t;
-        } else {
-            for (int sq = 0; sq < nseq; sq++)
-                e2_attention_text(ctx, att + (size_t)seq_off[sq] * c->text_heads * hd,
-                                  q + (size_t)seq_off[sq] * c->text_heads * hd,
-                                  k + (size_t)seq_off[sq] * kvh * hd,
-                                  v + (size_t)seq_off[sq] * kvh * hd,
-                                  seq_len[sq], c->text_heads, kvh, hd, window);
-        }
+        if (prof_on) prof[6] += e2_now_ms() - _t;
         if (li == 0 && nseq == 1) dump_tensor("l0_att", att, (size_t)n * c->text_heads * hd);
 
         /* out projection + post-attention norm + residual */
         _i = 7;
         PROF_T(e2_linear_forward(ctx, tmp, att, n, &ly->o));
         _i = 8;
-        e2_rmsnorm(tmp, tmp, ly->post_attn_norm, n, H, c->text_eps);
-        e2_add_inplace(x, tmp, n * H);
+        _q = e2_now_ms();
+        e2_rmsnorm_add(x, tmp, ly->post_attn_norm, n, H, c->text_eps);
+        p2[3] += e2_now_ms() - _q;
         if (li == 0 && nseq == 1) dump_tensor("l0_x1", x, (size_t)n * H);
 
         /* MLP */
+        _q = e2_now_ms();
         e2_rmsnorm(h, x, ly->pre_ff_norm, n, H, c->text_eps);
+        p2[4] += e2_now_ms() - _q;
         _i = 9;
         PROF_T(e2_linear_forward(ctx, tmp, h, n, &ly->gate));
         _i = 10;
         PROF_T(e2_linear_forward(ctx, up, h, n, &ly->up));
         _i = 14;
-        PROF_T(e2_gelu_tanh_ctx(ctx, tmp, n * c->text_inter));
-        for (size_t i = 0; i < (size_t)n * c->text_inter; i++) tmp[i] *= up[i];
+        _q = e2_now_ms();
+        e2_gelu_mul(ctx, tmp, up, n * c->text_inter);
+        p2[5] += e2_now_ms() - _q;
         _i = 11;
         PROF_T(e2_linear_forward(ctx, h, tmp, n, &ly->down));
-        e2_rmsnorm(h, h, ly->post_ff_norm, n, H, c->text_eps);
-        e2_add_inplace(x, h, n * H);
+        _q = e2_now_ms();
+        e2_rmsnorm_add(x, h, ly->post_ff_norm, n, H, c->text_eps);
+        p2[6] += e2_now_ms() - _q;
         if (li == 0 && nseq == 1) dump_tensor("l0_x2", x, (size_t)n * H);
 
         /* PLE block: gate, gelu, multiply by this layer's per-token slice */
         _i = 12;
         PROF_T(e2_linear_forward(ctx, h, x, n, &ly->ple_gate));
         PROF_T(e2_gelu_tanh_ctx(ctx, h, n * P));
+        _q = e2_now_ms();
         for (int t = 0; t < n; t++) {
             const float *pl = ple + ((size_t)t * L + li) * P;
             float *hp = h + (size_t)t * P;
             for (int i = 0; i < P; i++) hp[i] *= pl[i];
         }
+        p2[7] += e2_now_ms() - _q;
         _i = 13;
         PROF_T(e2_linear_forward(ctx, tmp, h, n, &ly->ple_proj));
         _i = 15;
-        e2_rmsnorm(tmp, tmp, ly->ple_norm, n, H, c->text_eps);
-        e2_add_inplace(x, tmp, n * H);
+        _q = e2_now_ms();
+        e2_rmsnorm_add(x, tmp, ly->ple_norm, n, H, c->text_eps);
+        p2[8] += e2_now_ms() - _q;
 
         if (li == 0 && nseq == 1) dump_tensor("l0_x3", x, (size_t)n * H);
         float ls = ly->layer_scalar ? ly->layer_scalar[0] : 1.0f;
+        _q = e2_now_ms();
         if (ls != 1.0f) e2_vec_scale(x, n * H, ls);
+        p2[9] += e2_now_ms() - _q;
 
         if (nseq == 1) {
             char nm[32];
@@ -200,7 +216,14 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
     if (prof_on) {
         static const char *nm[16] = {"embed","ple_proj","rmsnorm_in","q","k","v","attn",
             "o_proj","-","mlp_gate","mlp_up","mlp_down","ple_gate","ple_proj2","gelu","other"};
+        double timed = 0;
+        for (int i = 0; i < 15; i++) timed += prof[i];
+        prof[15] = (e2_now_ms() - t_all) - timed;
         for (int i = 0; i < 16; i++) if (prof[i] > 0) fprintf(stderr, "%-10s %7.2f ms\n", nm[i], prof[i]);
+        fprintf(stderr, "%-10s %7.2f ms\n", "total", e2_now_ms() - t_all);
+        static const char *nm2[10] = {"ple_scale","rope","qkvnorms","postattn","preff",
+            "gatedmul","postff","plemul","plenorm","layerscale"};
+        for (int i = 0; i < 10; i++) if (p2[i] > 0) fprintf(stderr, "  %-8s %7.2f ms\n", nm2[i], p2[i]);
     }
     return 0;
 }

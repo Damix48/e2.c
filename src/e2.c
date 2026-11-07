@@ -138,6 +138,7 @@ int e2_embed_text_batch(e2_ctx *ctx, const char *const *texts, int n, float *out
     int *len = calloc((size_t)n, sizeof(int));
     int *off = calloc((size_t)n, sizeof(int));
     if (!ids || !len || !off) { free(ids); free(len); free(off); return e2_fail("oom"); }
+    double _tt = e2_now_ms();
     int total = 0;
     for (int i = 0; i < n; i++) {
         int cap = (int)strlen(texts[i]) * 2 + 16;
@@ -150,13 +151,16 @@ int e2_embed_text_batch(e2_ctx *ctx, const char *const *texts, int n, float *out
         off[i] = total;
         total += l;
     }
+    if (getenv("E2_PROFILE")) fprintf(stderr, "batch tokenize %.2f ms\n", e2_now_ms() - _tt);
     {
         float *emb = malloc((size_t)total * H * sizeof(float));
         float *pooled = malloc((size_t)n * E2_EMBED_DIM * sizeof(float));
         if (!emb || !pooled) { free(emb); free(pooled); goto oom; }
         for (int i = 0; i < n; i++)
             e2_text_embed_ids(ctx, ids[i], len[i], emb + (size_t)off[i] * H);
+        double _tf = e2_now_ms();
         int rc = e2_text_forward_multi(ctx, emb, total, off, len, n, pooled);
+        if (getenv("E2_PROFILE")) fprintf(stderr, "batch embed+forward %.2f ms\n", e2_now_ms() - _tf);
         free(emb);
         if (rc != 0) { free(pooled); goto oom; }
         for (int i = 0; i < n; i++) {

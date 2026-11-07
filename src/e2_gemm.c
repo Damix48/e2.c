@@ -119,6 +119,8 @@ static void gemm_t1(float *y, int ns, const uint8_t *xq, const float *xs,
     }
 }
 
+static int g_rb = 64, g_pf = 0;
+
 /* Fast path: 4 rows x 4 output tiles (64 columns).  24 uops per 16 vpdpbusd,
  * the minimum for a 16-accumulator budget. */
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
@@ -132,7 +134,7 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
     /* Row-block the K sweep so the f32 epilogue RMW stays in L1.  The old
      * order (b outer, all rows inner) re-read the output from L2/L3 once per
      * K block; for k=2048 that is 16 passes over a 4 MB matrix. */
-    enum { RB = 64 };
+    int RB = g_rb;
     for (; nb + 4 <= nb1; nb += 4) {
         int n0 = nb * 16;
         const int8_t *wp = w->q + (size_t)nb * ts;
@@ -164,6 +166,15 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
                 __m512i p20 = base[2], p21 = base[2], p22 = base[2], p23 = base[2];
                 __m512i p30 = base[3], p31 = base[3], p32 = base[3], p33 = base[3];
                 for (int kb = 0; kb < blk / 4; kb++) {
+                    if (g_pf) {
+                        int p = kb + g_pf;
+                        if (p < blk / 4) {
+                            _mm_prefetch((const char *)(wq0 + (size_t)p * 64), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(wq1 + (size_t)p * 64), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(wq2 + (size_t)p * 64), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(wq3 + (size_t)p * 64), _MM_HINT_T0);
+                        }
+                    }
                     const uint8_t *a = ap + kb * 4;
                     __m512i a0 = _mm512_set1_epi32(*(const int *)(a));
                     __m512i a1 = _mm512_set1_epi32(*(const int *)(a + k));
@@ -465,7 +476,14 @@ static void gemm_work(void *vp, int tid, int nt) {
 
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l) {
     const e2_qmat *w = &l->w;
-    if (!g_kernel) g_kernel = select_kernel();
+    if (!g_kernel) {
+        g_kernel = select_kernel();
+        const char *rb = getenv("E2_GEMM_RB");
+        if (rb) g_rb = atoi(rb);
+        if (g_rb <= 0) g_rb = 1 << 28;
+        const char *pf = getenv("E2_GEMM_PF");
+        if (pf) g_pf = atoi(pf);
+    }
     int k = w->k;
     int blk = w->blk ? w->blk : BLK;
     int nblk = k / blk;
@@ -535,6 +553,44 @@ void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
                 for (int j = 0; j < n; j++) yp[j] += w->bias[j];
             if (l->out_min || l->out_max)
                 for (int j = 0; j < n; j++) {
+                    if (yp[j] < lo) yp[j] = lo;
+                    if (yp[j] > hi) yp[j] = hi;
+                }
+        }
+    }
+}
+
+/* Single-threaded linear with caller-owned scratch.  Used by the batched
+ * short-sequence attention path, where the outer parallel loop already owns
+ * the threads and all ctx scratch buffers would race. */
+void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
+                          uint8_t *xq, float *xs, float *tmp) {
+    const e2_qmat *w = &l->w;
+    if (!g_kernel) g_kernel = select_kernel();
+    int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
+    if (l->in_min || l->in_max) {
+        float lo = l->in_min ? l->in_min[0] : -INFINITY;
+        float hi = l->in_max ? l->in_max[0] : INFINITY;
+        for (int i = 0; i < m * k; i++) {
+            float v = x[i];
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            tmp[i] = v;
+        }
+        x = tmp;
+    }
+    e2_quant_rows_blk(x, m, k, xq, xs, blk);
+    gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
+    gemm_work(&a, 0, 1);
+    if (w->bias || l->out_min || l->out_max) {
+        float lo = l->out_min ? l->out_min[0] : -INFINITY;
+        float hi = l->out_max ? l->out_max[0] : INFINITY;
+        for (int r = 0; r < m; r++) {
+            float *yp = y + (size_t)r * w->n;
+            if (w->bias)
+                for (int j = 0; j < w->n; j++) yp[j] += w->bias[j];
+            if (l->out_min || l->out_max)
+                for (int j = 0; j < w->n; j++) {
                     if (yp[j] < lo) yp[j] = lo;
                     if (yp[j] > hi) yp[j] = hi;
                 }

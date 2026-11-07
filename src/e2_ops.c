@@ -247,6 +247,177 @@ void e2_add_inplace(float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) a[i] += b[i];
 }
 
+#ifdef E2_X86OPS
+__attribute__((target("avx512f")))
+static void rmsnorm_pre_v(float *out, const float *x, const float *w, int rows,
+                          int dim, float eps, float pre) {
+    float inv_dim = 1.0f / (float)dim;
+    __m512 vp = _mm512_set1_ps(pre);
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int i = 0;
+        for (; i + 64 <= dim; i += 64) {
+            __m512 v0 = _mm512_mul_ps(_mm512_loadu_ps(xp + i), vp);
+            __m512 v1 = _mm512_mul_ps(_mm512_loadu_ps(xp + i + 16), vp);
+            __m512 v2 = _mm512_mul_ps(_mm512_loadu_ps(xp + i + 32), vp);
+            __m512 v3 = _mm512_mul_ps(_mm512_loadu_ps(xp + i + 48), vp);
+            a0 = _mm512_fmadd_ps(v0, v0, a0); a1 = _mm512_fmadd_ps(v1, v1, a1);
+            a2 = _mm512_fmadd_ps(v2, v2, a2); a3 = _mm512_fmadd_ps(v3, v3, a3);
+        }
+        for (; i + 16 <= dim; i += 16) {
+            __m512 v0 = _mm512_mul_ps(_mm512_loadu_ps(xp + i), vp);
+            a0 = _mm512_fmadd_ps(v0, v0, a0);
+        }
+        float sum = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(a0, a1),
+                                                       _mm512_add_ps(a2, a3)));
+        for (; i < dim; i++) { float v = xp[i] * pre; sum += v * v; }
+        __m512 vs = _mm512_set1_ps(1.0f / sqrtf(sum * inv_dim + eps));
+        i = 0;
+        if (w) {
+            for (; i + 16 <= dim; i += 16)
+                _mm512_storeu_ps(op + i,
+                    _mm512_mul_ps(_mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(xp + i), vp), vs),
+                                  _mm512_loadu_ps(w + i)));
+        } else {
+            for (; i + 16 <= dim; i += 16)
+                _mm512_storeu_ps(op + i, _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(xp + i), vp), vs));
+        }
+        for (; i < dim; i++)
+            op[i] = w ? xp[i] * pre * (vs[0] * w[i]) : xp[i] * pre * vs[0];
+    }
+}
+
+__attribute__((target("avx512f")))
+static void rmsnorm_add_v(float *x, const float *src, const float *w, int rows,
+                          int dim, float eps) {
+    float inv_dim = 1.0f / (float)dim;
+    for (int r = 0; r < rows; r++) {
+        const float *sp = src + (size_t)r * dim;
+        float *xp = x + (size_t)r * dim;
+        __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int i = 0;
+        for (; i + 64 <= dim; i += 64) {
+            __m512 v0 = _mm512_loadu_ps(sp + i), v1 = _mm512_loadu_ps(sp + i + 16);
+            __m512 v2 = _mm512_loadu_ps(sp + i + 32), v3 = _mm512_loadu_ps(sp + i + 48);
+            a0 = _mm512_fmadd_ps(v0, v0, a0); a1 = _mm512_fmadd_ps(v1, v1, a1);
+            a2 = _mm512_fmadd_ps(v2, v2, a2); a3 = _mm512_fmadd_ps(v3, v3, a3);
+        }
+        for (; i + 16 <= dim; i += 16) {
+            __m512 v0 = _mm512_loadu_ps(sp + i);
+            a0 = _mm512_fmadd_ps(v0, v0, a0);
+        }
+        float sum = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(a0, a1),
+                                                       _mm512_add_ps(a2, a3)));
+        for (; i < dim; i++) sum += sp[i] * sp[i];
+        __m512 vs = _mm512_set1_ps(1.0f / sqrtf(sum * inv_dim + eps));
+        i = 0;
+        if (w) {
+            for (; i + 16 <= dim; i += 16)
+                _mm512_storeu_ps(xp + i, _mm512_fmadd_ps(
+                    _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(sp + i), vs),
+                                  _mm512_loadu_ps(w + i)),
+                    _mm512_set1_ps(1.0f), _mm512_loadu_ps(xp + i)));
+        } else {
+            for (; i + 16 <= dim; i += 16)
+                _mm512_storeu_ps(xp + i, _mm512_fmadd_ps(
+                    _mm512_mul_ps(_mm512_loadu_ps(sp + i), vs),
+                    _mm512_set1_ps(1.0f), _mm512_loadu_ps(xp + i)));
+        }
+        for (; i < dim; i++) xp[i] += w ? sp[i] * (vs[0] * w[i]) : sp[i] * vs[0];
+    }
+}
+
+__attribute__((target("avx512f")))
+static void gelu_mul_v(float *x, const float *up, int n) {
+    const __m512 k = _mm512_set1_ps(0.7978845608028654f);
+    const __m512 c = _mm512_set1_ps(0.044715f);
+    const __m512 two = _mm512_set1_ps(2.0f);
+    const __m512 big = _mm512_set1_ps(15.0f);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 t = _mm512_mul_ps(k, _mm512_fmadd_ps(c, _mm512_mul_ps(v, _mm512_mul_ps(v, v)), v));
+        __m512 s = vsigmoid(_mm512_mul_ps(two, _mm512_min_ps(t, big)));
+        __mmask16 sat = _mm512_cmp_ps_mask(t, big, _CMP_GT_OQ);
+        __m512 r = _mm512_mul_ps(v, s);
+        r = _mm512_mask_mov_ps(r, sat, v);
+        _mm512_storeu_ps(x + i, _mm512_mul_ps(r, _mm512_loadu_ps(up + i)));
+    }
+    for (; i < n; i++) x[i] = gelu1(x[i]) * up[i];
+}
+
+typedef struct { float *x; const float *up; int n, chunk; } mul_arg;
+static void gelu_mul_work(void *vp, int tid, int nt) {
+    mul_arg *a = vp;
+    int lo = tid * a->chunk;
+    if (lo >= a->n) return;
+    int hi = lo + a->chunk;
+    if (hi > a->n) hi = a->n;
+    gelu_mul_v(a->x + lo, a->up + lo, hi - lo);
+}
+#endif
+
+static void rmsnorm_pre_s(float *out, const float *x, const float *w, int rows,
+                          int dim, float eps, float pre) {
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        float sum = 0.0f;
+        for (int i = 0; i < dim; i++) { float v = xp[i] * pre; sum += v * v; }
+        float s = 1.0f / sqrtf(sum / (float)dim + eps);
+        for (int i = 0; i < dim; i++)
+            op[i] = xp[i] * pre * (w ? s * w[i] : s);
+    }
+}
+
+static void rmsnorm_add_s(float *x, const float *src, const float *w, int rows,
+                          int dim, float eps) {
+    for (int r = 0; r < rows; r++) {
+        const float *sp = src + (size_t)r * dim;
+        float *xp = x + (size_t)r * dim;
+        float sum = 0.0f;
+        for (int i = 0; i < dim; i++) sum += sp[i] * sp[i];
+        float s = 1.0f / sqrtf(sum / (float)dim + eps);
+        for (int i = 0; i < dim; i++) xp[i] += w ? sp[i] * (s * w[i]) : sp[i] * s;
+    }
+}
+
+void e2_rmsnorm_pre(float *out, const float *x, const float *w, int rows, int dim,
+                    float eps, float pre) {
+    if (pre == 1.0f) { e2_rmsnorm(out, x, w, rows, dim, eps); return; }
+#ifdef E2_X86OPS
+    if (simd() >= 2) { rmsnorm_pre_v(out, x, w, rows, dim, eps, pre); return; }
+#endif
+    rmsnorm_pre_s(out, x, w, rows, dim, eps, pre);
+}
+
+void e2_rmsnorm_add(float *x, const float *src, const float *w, int rows, int dim,
+                    float eps) {
+#ifdef E2_X86OPS
+    if (simd() >= 2) { rmsnorm_add_v(x, src, w, rows, dim, eps); return; }
+#endif
+    rmsnorm_add_s(x, src, w, rows, dim, eps);
+}
+
+void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n) {
+    if (!ctx || ctx->nthreads <= 1 || n < 65536) {
+#ifdef E2_X86OPS
+        if (simd() >= 2) { gelu_mul_v(x, up, n); return; }
+#endif
+        for (int i = 0; i < n; i++) x[i] = gelu1(x[i]) * up[i];
+        return;
+    }
+    int nt = ctx->nthreads;
+    if (n / 65536 < nt) nt = n / 65536;
+    if (nt < 1) nt = 1;
+    int chunk = (int)(((long)n + nt - 1) / nt);
+    chunk = (chunk + 63) & ~63;
+    mul_arg a = {x, up, n, chunk};
+    e2_parallel(ctx, gelu_mul_work, &a);
+}
+
 void e2_rmsnorm(float *out, const float *x, const float *w, int rows, int dim, float eps) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { rmsnorm_v(out, x, w, rows, dim, eps); return; }
@@ -672,9 +843,10 @@ static void attn_work(void *vp, int tid, int nt) {
     free(sc);
 }
 
+typedef struct attn_ws attn_ws;
 static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                      const float *v, int t, int heads, int kv_heads, int head_dim,
-                     int window);
+                     int window, attn_ws *ws);
 
 void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
                        const float *v, int t, int heads, int kv_heads, int head_dim,
@@ -684,7 +856,7 @@ void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
     if (simd() >= 2 && t >= 32) {
         static int noint8 = -1;
         if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
-        if (!noint8 && attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window) == 0)
+        if (!noint8 && attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window, NULL) == 0)
             return;
     }
 #endif
@@ -751,9 +923,16 @@ static void attn8_softmax(float *sr, int tpad, int lo, int hi) {
     e2_softmax(sr, tpad);
 }
 
+struct attn_ws {
+    float *kt;        /* kv_heads * head_dim * tpad */
+    uint8_t *xq;      /* max(t*head_dim, t*tpad) */
+    float *xs;        /* activation scales */
+    float *tmp;       /* clip scratch */
+};
+
 static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                      const float *v, int t, int heads, int kv_heads, int head_dim,
-                     int window) {
+                     int window, attn_ws *ws) {
     int prof = getenv("E2_PROFILE_ATTN") != NULL;
     double pt[8] = {0};
     double pt0 = e2_now_ms();
@@ -774,16 +953,22 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
 
     /* V^T via the blocked transpose so the packer walks contiguous rows */
     size_t ktn = (size_t)kv_heads * head_dim * tpad;
-    if (ctx->ktcap < ktn) {
-        free(ctx->ktbuf);
-        ctx->ktbuf = malloc(ktn * sizeof(float));
-        ctx->ktcap = ctx->ktbuf ? ktn : 0;
+    float *kt;
+    if (ws) {
+        kt = ws->kt;
+    } else {
+        if (ctx->ktcap < ktn) {
+            free(ctx->ktbuf);
+            ctx->ktbuf = malloc(ktn * sizeof(float));
+            ctx->ktcap = ctx->ktbuf ? ktn : 0;
+        }
+        if (!ctx->ktbuf) { free(base); return -1; }
+        kt = ctx->ktbuf;
     }
-    if (!ctx->ktbuf) { free(base); return -1; }
-    memset(ctx->ktbuf, 0, ktn * sizeof(float));
+    memset(kt, 0, ktn * sizeof(float));
     double _t = e2_now_ms();
-    kt_arg ka = {v, ctx->ktbuf, t, tpad, kv_heads, head_dim};
-    if ((long)kv_heads * ((head_dim + 15) / 16) * ((t + 15) / 16) < 512)
+    kt_arg ka = {v, kt, t, tpad, kv_heads, head_dim};
+    if (ws || (long)kv_heads * ((head_dim + 15) / 16) * ((t + 15) / 16) < 512)
         kt_work(&ka, 0, 1);
     else
         e2_parallel(ctx, kt_work, &ka);
@@ -799,12 +984,20 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
         int32_t *kwm = NULL, *vwm = NULL;
         int kb = ablk, vb = 128;
         _t = e2_now_ms();
-        if (e2_pack_mat_ctx(ctx, k + (size_t)kh * head_dim, t, head_dim, kv_heads * head_dim, 1,
-                        &kq_p, &ksc, &kwm, &kb)) { free(base); return -1; }
+        if ((ws ? e2_pack_mat(k + (size_t)kh * head_dim, t, head_dim,
+                              kv_heads * head_dim, 1, &kq_p, &ksc, &kwm, &kb)
+                : e2_pack_mat_ctx(ctx, k + (size_t)kh * head_dim, t, head_dim,
+                                  kv_heads * head_dim, 1, &kq_p, &ksc, &kwm, &kb))) {
+            free(base); return -1;
+        }
         if (prof) pt[1] += e2_now_ms() - _t;
         _t = e2_now_ms();
-        if (e2_pack_mat_ctx(ctx, ctx->ktbuf + (size_t)kh * head_dim * tpad, head_dim, tpad,
-                        tpad, 1, &vq_p, &vsc, &vwm, &vb)) {
+        int vrc = ws ? e2_pack_mat(kt + (size_t)kh * head_dim * tpad, head_dim,
+                                   tpad, tpad, 1, &vq_p, &vsc, &vwm, &vb)
+                     : e2_pack_mat_ctx(ctx, kt + (size_t)kh * head_dim * tpad,
+                                       head_dim, tpad, tpad, 1, &vq_p, &vsc,
+                                       &vwm, &vb);
+        if (vrc) {
             e2_pack_free(kq_p, ksc, kwm); free(base); return -1;
         }
         if (prof) pt[2] += e2_now_ms() - _t;
@@ -822,7 +1015,8 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                            q + ((size_t)(i0 + r) * heads + h) * head_dim,
                            (size_t)head_dim * sizeof(float));
                 _t = e2_now_ms();
-                e2_linear_forward(ctx, sc, qf, nq, &kql);
+                if (ws) e2_linear_forward_st(sc, qf, nq, &kql, ws->xq, ws->xs, ws->tmp);
+                else e2_linear_forward(ctx, sc, qf, nq, &kql);
                 if (prof) pt[3] += e2_now_ms() - _t;
                 _t = e2_now_ms();
                 int lo = 0, hi = t;
@@ -837,7 +1031,8 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                 (void)lo; (void)hi;
                 if (prof) pt[4] += e2_now_ms() - _t;
                 _t = e2_now_ms();
-                e2_linear_forward(ctx, ob, sc, nq, &vql);
+                if (ws) e2_linear_forward_st(ob, sc, nq, &vql, ws->xq, ws->xs, ws->tmp);
+                else e2_linear_forward(ctx, ob, sc, nq, &vql);
                 for (int r = 0; r < nq; r++)
                     memcpy(out + ((size_t)(i0 + r) * heads + h) * head_dim,
                            ob + (size_t)r * head_dim, (size_t)head_dim * sizeof(float));
@@ -853,4 +1048,87 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                 t, pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], e2_now_ms() - pt0);
     }
     return 0;
+}
+
+
+/* Batched short-sequence int8 attention: one work item per sequence.  A
+ * separate e2_parallel per (head, group, block) costs more than the actual
+ * 64-token attention, so the batch path runs each sequence on one worker. */
+typedef struct {
+    float *out; const float *q, *k, *v;
+    int t, heads, kv_heads, head_dim, window, nseq;
+    const int *seq_off;
+    attn_ws *ws;
+    int err;
+} attn_multi_arg;
+
+static void attn_multi_work(void *vp, int tid, int nt) {
+    attn_multi_arg *a = vp;
+    size_t qs = (size_t)a->heads * a->head_dim;
+    size_t ks = (size_t)a->kv_heads * a->head_dim;
+    for (int s = tid; s < a->nseq; s += nt) {
+        size_t off = (size_t)a->seq_off[s];
+        if (attn_int8(NULL, a->out + off * qs, a->q + off * qs, a->k + off * ks,
+                      a->v + off * ks, a->t, a->heads, a->kv_heads, a->head_dim,
+                      a->window, &a->ws[tid]) != 0) {
+            a->err = 1;
+            return;
+        }
+    }
+}
+
+void e2_attention_text_multi(e2_ctx *ctx, float *out, const float *q, const float *k,
+                             const float *v, int t, const int *seq_off, int nseq,
+                             int heads, int kv_heads, int head_dim, int window) {
+    size_t qs = (size_t)heads * head_dim, ks = (size_t)kv_heads * head_dim;
+    static int noint8 = -1;
+    if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
+    if (nseq <= 1 || t < 32 || t > 256 || noint8 || simd() < 2 ||
+        (head_dim % 64) != 0) {
+        for (int s = 0; s < nseq; s++) {
+            size_t off = (size_t)seq_off[s];
+            e2_attention_text(ctx, out + off * qs, q + off * qs, k + off * ks,
+                              v + off * ks, t, heads, kv_heads, head_dim, window);
+        }
+        return;
+    }
+    int nt = ctx->nthreads;
+    int tpad = (t + 127) & ~127;
+    int ablk = (head_dim % 128 == 0) ? 128 : 64;
+    size_t ktn = (size_t)kv_heads * head_dim * tpad;
+    size_t qcap = (size_t)t * (head_dim > tpad ? head_dim : tpad);
+    size_t sblk = (size_t)(head_dim / ablk);
+    size_t pblk = (size_t)(tpad / 128);
+    size_t scap = (size_t)t * (sblk > pblk ? sblk : pblk);
+    attn_ws *ws = calloc((size_t)nt, sizeof(*ws));
+    float *kt = malloc(ktn * sizeof(float) * nt);
+    uint8_t *xq = malloc(qcap * nt);
+    float *xs = malloc(scap * sizeof(float) * nt);
+    float *tmp = malloc(qcap * sizeof(float) * nt);
+    if (!ws || !kt || !xq || !xs || !tmp) {
+        free(ws); free(kt); free(xq); free(xs); free(tmp);
+        for (int s = 0; s < nseq; s++) {
+            size_t off = (size_t)seq_off[s];
+            e2_attention_text(ctx, out + off * qs, q + off * qs, k + off * ks,
+                              v + off * ks, t, heads, kv_heads, head_dim, window);
+        }
+        return;
+    }
+    for (int i = 0; i < nt; i++) {
+        ws[i].kt = kt + ktn * i;
+        ws[i].xq = xq + qcap * i;
+        ws[i].xs = xs + scap * i;
+        ws[i].tmp = tmp + qcap * i;
+    }
+    attn_multi_arg a = {out, q, k, v, t, heads, kv_heads, head_dim, window, nseq,
+                        seq_off, ws, 0};
+    e2_parallel(ctx, attn_multi_work, &a);
+    if (a.err) {
+        for (int s = 0; s < nseq; s++) {
+            size_t off = (size_t)seq_off[s];
+            e2_attention_text(ctx, out + off * qs, q + off * qs, k + off * ks,
+                              v + off * ks, t, heads, kv_heads, head_dim, window);
+        }
+    }
+    free(ws); free(kt); free(xq); free(xs); free(tmp);
 }

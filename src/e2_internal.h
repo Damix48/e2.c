@@ -187,12 +187,19 @@ int  e2_pack_mat_ctx(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
                      int8_t **q, float **scale, int32_t **wsum, int *blk_out);
 void e2_pack_free(int8_t *q, float *scale, int32_t *wsum);
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
+void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
+                          uint8_t *xq, float *xs, float *tmp);
 void e2_gemm_f32(float *y, const float *x, const float *w, int m, int k, int n);
 void e2_gemm_nt_f32(float *y, const float *x, const float *w, int m, int k, int n);
 void e2_dequant_row(const e2_qmat *w, int row, float *out);
 
 /* ops */
 void e2_rmsnorm(float *out, const float *x, const float *w, int rows, int dim, float eps);
+void e2_rmsnorm_pre(float *out, const float *x, const float *w, int rows, int dim,
+                    float eps, float pre);
+void e2_rmsnorm_add(float *x, const float *src, const float *w, int rows, int dim,
+                    float eps);
+void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n);
 void e2_rmsnorm_noweight(float *out, const float *x, int rows, int dim, float eps);
 void e2_gelu_tanh(float *x, int n);
 void e2_gelu_tanh_ctx(e2_ctx *ctx, float *x, int n);
@@ -209,6 +216,9 @@ void e2_rope_vision(e2_ctx *ctx, float *q, float *k, int t, int heads, int head_
 void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
                        const float *v, int t, int heads, int kv_heads, int head_dim,
                        int window);
+void e2_attention_text_multi(e2_ctx *ctx, float *out, const float *q, const float *k,
+                             const float *v, int t, const int *seq_off, int nseq,
+                             int heads, int kv_heads, int head_dim, int window);
 void e2_attention_vision(e2_ctx *ctx, float *out, const float *q, const float *k,
                          const float *v, int t, int heads, int head_dim);
 void e2_attention_full(e2_ctx *ctx, float *out, const float *q, const float *k,

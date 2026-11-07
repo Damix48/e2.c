@@ -181,6 +181,38 @@ int e2_tok_id(e2_tok *t, const char *token) {
     return vocab_find(t, token, (int)strlen(token));
 }
 
+typedef struct { int rank, node; } bpe_ev;
+
+static void heap_push(bpe_ev *h, int *n, int rank, int node) {
+    if (rank == 0x7fffffff) return;
+    int i = (*n)++;
+    h[i].rank = rank; h[i].node = node;
+    while (i > 0) {
+        int p = (i - 1) >> 1;
+        if (h[p].rank < h[i].rank ||
+            (h[p].rank == h[i].rank && h[p].node <= h[i].node)) break;
+        bpe_ev tmp = h[p]; h[p] = h[i]; h[i] = tmp;
+        i = p;
+    }
+}
+
+static bpe_ev heap_pop(bpe_ev *h, int *n) {
+    bpe_ev top = h[0];
+    h[0] = h[--(*n)];
+    int i = 0;
+    for (;;) {
+        int c = 2 * i + 1;
+        if (c >= *n) break;
+        if (c + 1 < *n && (h[c + 1].rank < h[c].rank ||
+            (h[c + 1].rank == h[c].rank && h[c + 1].node < h[c].node))) c++;
+        if (h[i].rank < h[c].rank ||
+            (h[i].rank == h[c].rank && h[i].node <= h[c].node)) break;
+        bpe_ev tmp = h[c]; h[c] = h[i]; h[i] = tmp;
+        i = c;
+    }
+    return top;
+}
+
 /* Encode one already-normalized byte string into symbol ids (no specials). */
 static int encode_piece(e2_tok *t, const unsigned char *s, int n, int *ids, int max) {
     int *sym = malloc((size_t)n * sizeof(int));
@@ -206,26 +238,46 @@ static int encode_piece(e2_tok *t, const unsigned char *s, int n, int *ids, int 
         }
         i += clen;
     }
-    /* BPE: merge lowest-rank adjacent pair until none applies. */
-    while (ns > 1) {
-        int best = 0x7fffffff, bi = -1;
-        for (int i = 0; i + 1 < ns; i++) {
-            int r = merge_rank(t, sym[i], sym[i + 1]);
-            if (r < best) { best = r; bi = i; }
+    /* BPE with a rank heap and a linked list: O(n log n) instead of the
+     * O(n^2) rescans.  A stale entry is detected by rechecking the pair. */
+    {
+        int *prev = malloc((size_t)n * sizeof(int));
+        int *next = malloc((size_t)n * sizeof(int));
+        int *alive = malloc((size_t)n * sizeof(int));
+        bpe_ev *heap = malloc((size_t)(3 * n + 8) * sizeof(bpe_ev));
+        if (!prev || !next || !alive || !heap) {
+            free(prev); free(next); free(alive); free(heap);
+            free(sym); return -1;
         }
-        if (bi < 0) break;
-        int l = sym[bi], rgt = sym[bi + 1];
-        int merged = merge_find(t, l, rgt);
+        int hn = 0;
+        for (int i = 0; i < ns; i++) { prev[i] = i - 1; next[i] = i + 1; alive[i] = 1; }
+        next[ns - 1] = -1;
+        for (int i = 0; i + 1 < ns; i++)
+            heap_push(heap, &hn, merge_rank(t, sym[i], sym[i + 1]), i);
+        while (hn) {
+            bpe_ev ev = heap_pop(heap, &hn);
+            int i = ev.node;
+            if (ev.rank == 0x7fffffff || !alive[i]) continue;
+            int j = next[i];
+            if (j < 0 || !alive[j]) continue;
+            if (merge_rank(t, sym[i], sym[j]) != ev.rank) continue;
+            int merged = merge_find(t, sym[i], sym[j]);
+            if (merged < 0) continue;
+            sym[i] = merged;
+            int k = next[j];
+            alive[j] = 0;
+            next[i] = k;
+            if (k >= 0) prev[k] = i;
+            if (prev[i] >= 0)
+                heap_push(heap, &hn, merge_rank(t, sym[prev[i]], sym[i]), prev[i]);
+            if (k >= 0)
+                heap_push(heap, &hn, merge_rank(t, sym[i], sym[k]), i);
+        }
         int out = 0;
-        for (int i = 0; i < ns;) {
-            if (i + 1 < ns && sym[i] == l && sym[i + 1] == rgt) {
-                sym[out++] = merged;
-                i += 2;
-            } else {
-                sym[out++] = sym[i++];
-            }
-        }
+        for (int i = 0; i < ns; i++)
+            if (alive[i]) { sym[out++] = sym[i]; }
         ns = out;
+        free(prev); free(next); free(alive); free(heap);
     }
     if (ns > max) { free(sym); return -1; }
     for (int i = 0; i < ns; i++) ids[i] = sym[i];
@@ -250,7 +302,7 @@ int e2_tok_encode(e2_tok *t, const char *text, int *ids, int max_ids) {
     int seg = 0;
     for (int i = 0; i < nn;) {
         int matched = -1, mlen = 0;
-        for (int j = 0; j < t->nspecial; j++) {
+        for (int j = 0; norm[i] == '<' && j < t->nspecial; j++) {
             int l = (int)t->sp[j].len;
             if (l > mlen && i + l <= nn &&
                 memcmp(norm + i, t->blob + t->sp[j].off, (size_t)l) == 0) {

@@ -696,19 +696,18 @@ void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
     int blk = w->blk ? w->blk : BLK;
     int nblk = k / blk;
     if (!g_kernel || nblk == 0) return;
-    /* only the same-k, unclipped case shares the quantiser */
-    for (int i = 1; i < n; i++) {
-        const e2_qmat *q = &ls[i]->w;
-        if (q->k != k || (q->blk ? q->blk : BLK) != blk || ls[i]->in_min || ls[i]->in_max) {
-            linear_one(ctx, ys[i], x, m, ls[i]);
-            n = i;
-            break;
-        }
-    }
-    if (n <= 0) return;
+    /* A linear that needs a clip, or a different k/block, cannot use the shared
+     * activation quantisation; it takes the single-linear path instead.  (This
+     * used to *truncate* the list, which silently skipped every linear after
+     * the first clipped one -- e.g. the audio tower's v_proj.) */
     if (ls[0]->in_min || ls[0]->in_max) {
         for (int i = 0; i < n; i++) linear_one(ctx, ys[i], x, m, ls[i]);
         return;
+    }
+    for (int i = 1; i < n; i++) {
+        const e2_qmat *q = &ls[i]->w;
+        if (q->k != k || (q->blk ? q->blk : BLK) != blk || ls[i]->in_min || ls[i]->in_max)
+            linear_one(ctx, ys[i], x, m, ls[i]);
     }
 
     int m4 = (m + 15) & ~15;
@@ -742,6 +741,9 @@ void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
     gemm_arg a = {0, xq, xs, nblk, m, k, w->n, w, g_kernel};
     for (int i = 0; i < n; i++) {
         const e2_linear *l = ls[i];
+        if (i && (l->w.k != k || (l->w.blk ? l->w.blk : BLK) != blk ||
+                  l->in_min || l->in_max))
+            continue;                    /* already done above */
         a.y = ys[i];
         a.w = &l->w;
         a.ns = l->w.n;

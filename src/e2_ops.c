@@ -190,6 +190,7 @@ static void softmax_exp_v(float *sc, int n) {
 
 static int simd_pick(void) {
 #ifdef E2_X86OPS
+    if (getenv("E2_OPS_SCALAR")) return 0;   /* debugging: force the scalar ops */
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx512f")) return 2;
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) return 1;
@@ -297,9 +298,13 @@ A2 static void silu_a2(float *x, int n) {
 
 A2 static void tanh_a2(float *x, int n) {
     const __m256 two = _mm256_set1_ps(2.0f);
+    /* tanh(+-20) is already +-1 in f32; clamping keeps the exp finite for the
+     * +-inf sentinels callers use (see the audio attention mask) */
+    const __m256 lim = _mm256_set1_ps(20.0f), nlim = _mm256_set1_ps(-20.0f);
     int i = 0;
     for (; i + 8 <= n; i += 8) {
         __m256 v = _mm256_loadu_ps(x + i);
+        v = _mm256_max_ps(_mm256_min_ps(v, lim), nlim);
         _mm256_storeu_ps(x + i, _mm256_fmsub_ps(vsigmoid8(_mm256_mul_ps(v, two)), two,
                                                 _mm256_set1_ps(1.0f)));
     }
@@ -502,9 +507,10 @@ A2 static void l2norm_a2(float *x, int rows, int dim) {
 __attribute__((target("avx512f")))
 static void tanh_v(float *x, int n) {
     const __m512 two = _mm512_set1_ps(2.0f), one = _mm512_set1_ps(1.0f);
+    const __m512 lim = _mm512_set1_ps(20.0f), nlim = _mm512_set1_ps(-20.0f);
     int i = 0;
     for (; i + 16 <= n; i += 16) {
-        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 v = _mm512_max_ps(_mm512_min_ps(_mm512_loadu_ps(x + i), lim), nlim);
         __m512 s = vsigmoid(_mm512_mul_ps(v, two));
         _mm512_storeu_ps(x + i, _mm512_sub_ps(_mm512_mul_ps(s, two), one));
     }

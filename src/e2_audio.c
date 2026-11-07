@@ -454,21 +454,26 @@ static void aud_att_work(void *vp, int tid, int nt) {
                 }
                 sc[j] = s;
             }
-            /* logit soft cap */
+            /* logit soft cap.  The mask lives in its own array: tanh maps
+             * -inf to -1 (and used to map it to NaN), so it cannot double as
+             * the sentinel. */
+            uint8_t ok[128];
             int any = 0;
-            for (int j = 0; j < a->ctxsz; j++)
-                if (sc[j] != -INFINITY) { sc[j] /= a->softcap; any = 1; }
+            for (int j = 0; j < a->ctxsz; j++) {
+                ok[j] = sc[j] != -INFINITY;
+                if (ok[j]) { sc[j] /= a->softcap; any = 1; }
+            }
             if (!any) continue;
             e2_tanh_span(sc, a->ctxsz);
             mx = -INFINITY;
             for (int j = 0; j < a->ctxsz; j++) {
-                if (sc[j] == -INFINITY) continue;
+                if (!ok[j]) continue;
                 sc[j] *= a->softcap;
                 if (sc[j] > mx) mx = sc[j];
             }
             float sum = 0.0f;
             for (int j = 0; j < a->ctxsz; j++) {
-                if (sc[j] == -INFINITY) { sc[j] = 0.0f; continue; }
+                if (!ok[j]) { sc[j] = 0.0f; continue; }
                 sc[j] = e2_fexp(sc[j] - mx);
                 sum += sc[j];
             }

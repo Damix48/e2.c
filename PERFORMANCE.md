@@ -1048,3 +1048,20 @@ the plain path stays the shippable GPU behaviour.
 3. The small rows (text 8/64/128, audio) are weight-streaming + launch bound
    (64 MB of text weights = 0.8 ms at 80 GB/s), which the device-resident tower
    fixes for free.
+
+## Accuracy note (matrix-engine path)
+
+The DPAS kernel accumulates the whole `k` in int32, which requires **one
+activation scale per row** instead of the CPU path's one per 128-wide block
+(the block-scaled version needs an f32 accumulator per tile, 32 more registers
+and ~30% of the kernel speed).  Measured against the CPU int8 path on a ~560
+token text the final embedding cosine is **0.9989**, i.e. roughly 0.9977 against
+f32 instead of the 0.999 threshold in AGENTS.md — so this path needs either
+per-128-block scales (slower kernel) or per-64/128 *sub-block* scales folded
+into the epilogue before it can be the default.  Everything below the threshold
+is still exact: `k_pack_a`/`k_pack_u8`/`k_pack_wq` and `k_gemm_dpas` reproduce
+the CPU int8 result bit-for-bit in the unit probe (`maxerr 4.8e-07`, cos 1.0).
+
+Reference numbers for this box (25-token text, `tools/e2_ref.py` f32 dump):
+`embedding` 0.999138, `last_hidden_state` 0.998458, `layer23` 0.999713 —
+identical for the CPU and GPU builds.

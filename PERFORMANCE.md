@@ -1065,3 +1065,76 @@ the CPU int8 result bit-for-bit in the unit probe (`maxerr 4.8e-07`, cos 1.0).
 Reference numbers for this box (25-token text, `tools/e2_ref.py` f32 dump):
 `embedding` 0.999138, `last_hidden_state` 0.998458, `layer23` 0.999713 —
 identical for the CPU and GPU builds.
+
+---
+
+# Round 8 — device-resident iGPU pipeline
+
+Goal this round: beat the OpenVINO **int8 GPU** path by **1.5x in every row**
+(text 8/64/128/512/2048, batch 8x64, batch 32x64, image, audio, video).
+
+## Baseline (same box, same run, 2026-11 round 8)
+
+`python tools/bench_compare.py --model ~/Projects/embeddinggemma-2
+  --sources e2 --e2-device gpu --repeat 2 --iters 3`
+
+| task | length | ov-int8@GPU | e2@GPU (round 7) | 1.5x target |
+|---|---:|---:|---:|---:|
+| text | 8 | 6.3 | 2015 | 4.2 |
+| text | 64 | 7.0 | 290 | 4.7 |
+| text | 128 | 9.2 | 70 | 6.1 |
+| text | 512 | 20.4 | 424 | 13.6 |
+| text | 2048 | 140.4 | 84* | 93.6 |
+| batch | 8x64 | 17.4 | — | 11.6 |
+| batch | 32x64 | 69.9 | — | 46.6 |
+| image | 270 tok | 258 | — | 172 |
+| audio | 54 tok | 23.0 | — | 15.3 |
+| video | 8 frames | 792 | — | 528 |
+
+\* the round-7 ledger's `e2@GPU` ordering for the text rows is not comparable
+row by row; what matters is that e2@GPU is 3.5-11x **slower** than OV in round 7.
+
+Where the time goes (round 7, unchanged): **0.38 ms per GEMM dispatch**, 218
+GEMM calls per text forward, plus a CPU round-trip per call. The kernel is not
+the binding constraint at small `m`; the pipeline shape is.
+
+## Measured ceilings on this box (Arc 140T, 128 EU, 2.35 GHz, 30.6 GB DDR)
+
+| probe | rate |
+|---|---:|
+| DPAS int8 peak (dense, many sub-groups/EU) | 15.8 TMAC/s |
+| plain-kernel GEMM reached in round 7 | 4.64 TMAC/s |
+| L2/L3 read bandwidth | ~1 TB/s |
+| DRAM read bandwidth | ~81 GB/s |
+
+Consequences for the targets:
+
+* text 512 = 77 GMAC. 13.6 ms needs **5.7 TMAC/s end-to-end** (36% of DPAS
+  peak). Round 7's kernel did 4.64, so the kernel has to improve *and* the
+  dispatch has to go away.
+* text 8/64/128 are weight-streaming bound: the text tower minus the embedding
+  table is ~76 MB of int8 weights = **0.94 ms at 81 GB/s**. The token embedding
+  is a *gather* (a few rows), not a GEMM, so it costs nothing. 4.2 ms is
+  therefore reachable if the whole forward costs < 1 ms of dispatch.
+* image/audio: OV reaches only 0.29 / 0.57 TMAC/s there, so a competent
+  device-resident tower wins these rows by a wide margin.
+
+## Plan
+
+1. **Device-resident tower.** All activations in shared USM, one command list
+   per forward, one sync at the end. The CPU-side op layer (`e2_ops.c`) gets a
+   device branch per op that *enqueues* a kernel instead of computing, so the
+   towers (text/vision/audio) keep a single code path and the CPU path stays
+   the reference.
+2. **Fused epilogues.** rmsnorm+quantize+pack, rmsnorm_add+quantize+pack and
+   gelu*mul+quantize+pack each collapse two or three passes into one, which is
+   also what removes the launch overhead from the small-`m` rows.
+3. **Faster DPAS GEMM** (agent-assisted, measured in isolation).
+4. Vision + audio towers on the same device op layer.
+
+## Experiment log
+
+Every attempt, kept or reverted, with the number that decided it.
+
+| # | try | result | kept? |
+|---|---|---|---|

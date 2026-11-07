@@ -227,6 +227,52 @@ static float exp_sum_v(float *x, int n, float mx) {
 
 /* max and exp(x-mx) over a span; the attention softmax needs both without the
  * normalisation (it folds 1/sum into the P x V epilogue). */
+#ifdef E2_X86OPS
+__attribute__((target("avx512f")))
+static void tanh_v(float *x, int n) {
+    const __m512 two = _mm512_set1_ps(2.0f), one = _mm512_set1_ps(1.0f);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 s = vsigmoid(_mm512_mul_ps(v, two));
+        _mm512_storeu_ps(x + i, _mm512_sub_ps(_mm512_mul_ps(s, two), one));
+    }
+    for (; i < n; i++) x[i] = tanhf(x[i]);
+}
+
+/* x[r][d] *= sigmoid(x[r][dim+d]) -- the gated feed-forward */
+__attribute__((target("avx512f")))
+static void gated_silu_v(float *x, int rows, int dim) {
+    for (int r = 0; r < rows; r++) {
+        float *a = x + (size_t)r * 2 * dim;
+        const float *b = a + dim;
+        int i = 0;
+        for (; i + 16 <= dim; i += 16)
+            _mm512_storeu_ps(a + i, _mm512_mul_ps(_mm512_loadu_ps(a + i),
+                                                 vsigmoid(_mm512_loadu_ps(b + i))));
+        for (; i < dim; i++) a[i] *= 1.0f / (1.0f + e2_fexp(-b[i]));
+    }
+}
+#endif
+
+void e2_tanh_span(float *x, int n) {
+#ifdef E2_X86OPS
+    if (simd() >= 2) { tanh_v(x, n); return; }
+#endif
+    for (int i = 0; i < n; i++) x[i] = tanhf(x[i]);
+}
+
+void e2_gated_silu(float *x, int rows, int dim) {
+#ifdef E2_X86OPS
+    if (simd() >= 2) { gated_silu_v(x, rows, dim); return; }
+#endif
+    for (int r = 0; r < rows; r++) {
+        float *a = x + (size_t)r * 2 * dim;
+        for (int i = 0; i < dim; i++)
+            a[i] *= 1.0f / (1.0f + e2_fexp(-a[dim + i]));
+    }
+}
+
 float e2_span_max(const float *x, int n) {
 #ifdef E2_X86OPS
     if (simd() >= 2) return span_max_v(x, n);
@@ -458,7 +504,7 @@ static void norm_work(void *vp, int tid, int nt) {
 }
 
 static void norm_run(e2_ctx *ctx, norm_arg *a) {
-    if (!ctx || ctx->nthreads <= 1 || (long)a->rows * a->dim < 65536) {
+    if (!ctx || ctx->nthreads <= 1 || (long)a->rows * a->dim < 16384) {
         norm_rows(a, 0, a->rows);
         return;
     }
@@ -529,7 +575,7 @@ static void l2norm_work(void *vp, int tid, int nt) {
 
 void e2_l2norm_rows(e2_ctx *ctx, float *x, int rows, int dim) {
     norm_arg a = {x, x, NULL, NULL, rows, dim, 0, 1.0f, 0};
-    if (!ctx || ctx->nthreads <= 1 || (long)rows * dim < 65536) {
+    if (!ctx || ctx->nthreads <= 1 || (long)rows * dim < 16384) {
         l2norm_span(x, rows, dim);
         return;
     }

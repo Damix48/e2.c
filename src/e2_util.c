@@ -27,29 +27,44 @@ struct e2_arena_block {
 
 #define ARENA_MIN (1u << 20)
 
+/* Blocks are appended and refilled in allocation order, so a repeated forward
+ * (same sizes every call) reuses the blocks it allocated last time instead of
+ * growing the arena without bound -- which is what pushed audio (many 800 KB
+ * buffers) into a page fault per 16 KB per layer. */
 void *e2_arena_alloc(e2_arena *a, size_t n) {
     n = (n + 63) & ~(size_t)63;
-    if (a->head && a->head->used + n <= a->head->size) {
-        void *p = a->head->data + a->head->used;
-        a->head->used += n;
-        a->used += n;
-        return p;
-    }
+    for (e2_arena_block *b = a->cur; b; b = b->next)
+        if (b->used + n <= b->size) {
+            void *p = b->data + b->used;
+            b->used += n;
+            a->cur = b;
+            a->used += n;
+            return p;
+        }
     size_t sz = n > ARENA_MIN ? n : ARENA_MIN;
     if (sz < a->cap) sz = a->cap;
     e2_arena_block *b = malloc(sizeof(*b) + sz);
     if (!b) return NULL;
     b->size = sz;
     b->used = n;
-    b->next = a->head;
-    a->head = b;
+    b->next = NULL;
+    if (a->cur) a->cur->next = b;
+    else a->head = b;
+    a->cur = b;
     a->cap = sz;
     a->used += n;
     return b->data;
 }
 
+void e2_arena_stat(const e2_arena *a, long *blocks, size_t *bytes) {
+    long n = 0; size_t b = 0;
+    for (e2_arena_block *x = a->head; x; x = x->next) { n++; b += x->size; }
+    *blocks = n; *bytes = b;
+}
+
 void e2_arena_reset(e2_arena *a) {
     for (e2_arena_block *b = a->head; b; b = b->next) b->used = 0;
+    a->cur = a->head;
     a->used = 0;
 }
 

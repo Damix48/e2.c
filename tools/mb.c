@@ -18,6 +18,32 @@ static int cmp(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+/* cycle through `nb` packed matrices so the weights are cold in L3 */
+static void bench_gemm_cold(int m, int k, int n, int nt, int nb) {
+    e2_ctx ctx; memset(&ctx, 0, sizeof(ctx));
+    if (e2_pool_init(&ctx, nt) != 0) { printf("pool fail\n"); return; }
+    float *w = malloc((size_t)n * k * sizeof(float));
+    float *x = malloc((size_t)m * k * sizeof(float));
+    float *y = malloc((size_t)m * n * sizeof(float));
+    for (long i = 0; i < (long)n * k; i++) w[i] = (float)((i % 251) - 125) * 0.01f;
+    for (long i = 0; i < (long)m * k; i++) x[i] = (float)((i % 233) - 116) * 0.01f;
+    e2_linear *ls = calloc((size_t)nb, sizeof(e2_linear));
+    for (int b = 0; b < nb; b++) {
+        int8_t *q = NULL; float *sc = NULL; int32_t *ws = NULL; int blk = 128;
+        if (e2_pack_mat(w, n, k, k, 1, &q, &sc, &ws, &blk) != 0) { printf("pack fail\n"); return; }
+        ls[b].w.q = q; ls[b].w.scale = sc; ls[b].w.wsum = ws;
+        ls[b].w.n = n; ls[b].w.k = k; ls[b].w.packed = 1; ls[b].w.blk = blk;
+    }
+    for (int i = 0; i < nb; i++) e2_linear_forward(&ctx, y, x, m, &ls[i]);
+    double t0 = now();
+    for (int i = 0; i < nb; i++) e2_linear_forward(&ctx, y, x, m, &ls[i]);
+    double t = (now() - t0) / nb;
+    printf("cold gemm m=%d k=%d n=%d nt=%d x%d  %.3f ms  %.2f GMAC/s\n",
+           m, k, n, nt, nb, t, (double)m * n * k / 1e9 / (t / 1e3));
+    free(w); free(x); free(y); free(ls);
+    e2_pool_free(&ctx);
+}
+
 static void bench_gemm(int m, int k, int n, int nt) {
     e2_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -235,6 +261,11 @@ int main(int argc, char **argv) {
         test_attn_file(argv[2], argv[3], argv[4], atoi(argv[5]), atoi(argv[6]),
                        atoi(argv[7]), argc > 8 ? atoi(argv[8]) : 64,
                        argc > 9 ? atoi(argv[9]) : 0, argc > 10 ? atoi(argv[10]) : 8);
+    } else if (!strcmp(argv[1], "cold") && argc >= 5) {
+        int m = atoi(argv[2]), k = atoi(argv[3]), n = atoi(argv[4]);
+        int nt = argc > 5 ? atoi(argv[5]) : 8;
+        int nb = argc > 6 ? atoi(argv[6]) : 24;
+        bench_gemm_cold(m, k, n, nt, nb);
     } else if (!strcmp(argv[1], "par")) {
         int nt = argc > 2 ? atoi(argv[2]) : 8;
         bench_par(nt, 2000);

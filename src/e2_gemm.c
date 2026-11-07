@@ -543,10 +543,14 @@ void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
 
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
     long work = (long)m * w->n * k;
+    double _t = getenv("E2_GEMM_PROF") ? e2_now_ms() : 0;
     if (ctx->nthreads <= 1 || work < 2000000L)
         gemm_work(&a, 0, 1);
     else
         e2_parallel(ctx, gemm_work, &a);
+    if (getenv("E2_GEMM_PROF"))
+        fprintf(stderr, "linear m=%d k=%d n=%d  %.3f ms  %.2f GMAC/s\n", m, k, w->n,
+                e2_now_ms() - _t, (double)work / 1e9 / ((e2_now_ms() - _t) / 1e3));
 
     if (w->bias || l->out_min || l->out_max) {
         float lo = l->out_min ? l->out_min[0] : -INFINITY;

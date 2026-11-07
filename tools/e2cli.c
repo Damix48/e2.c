@@ -129,11 +129,13 @@ int main(int argc, char **argv) {
         free(lines); free(e);
     } else if (!strcmp(cmd, "image")) {
         if (argc < 5) return 2;
+        if (argc > 5) { nth = atoi(argv[5]); if (nth) e2_set_threads(ctx, nth); }
         float e[768];
         if (e2_embed_image(ctx, argv[4], e, 768)) { fprintf(stderr, "%s\n", e2_error()); return 1; }
         print_emb(e, 768, e2_last_ms(ctx));
     } else if (!strcmp(cmd, "audio")) {
         if (argc < 5) return 2;
+        if (argc > 5) { nth = atoi(argv[5]); if (nth) e2_set_threads(ctx, nth); }
         int n = 0;
         float *s = NULL;
         if (e2_audio_read(argv[4], &s, &n) != 0) {

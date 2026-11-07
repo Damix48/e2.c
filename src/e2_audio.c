@@ -49,35 +49,98 @@ static void fft512(const float *in, float *mag) {
 
 static double aud_prof[12];
 
-/* 3x3 stride-2 conv, parallel over output channels. */
+/* 3x3 stride-2 conv, channel-last in/out, vectorised over output channels.
+ * wT is [3][3][c_in][c_out_pad] so 16 output channels are one 64-byte load.
+ * The reduction order stays (ic, ky, kx), so results match the scalar loop. */
 typedef struct {
-    const float *in, *w;
-    float *out;
-    int c_in, T_in, W_in, c_out, T_out, W_out;
-} conv_arg;
+    const float *in, *wT; float *out;
+    int c_in, T_in, W_in, c_out, T_out, W_out, cpad;
+} conv3_arg;
 
-static void conv2_work(void *vp, int tid, int nt) {
-    conv_arg *a = vp;
-    int o0 = (int)((long)a->c_out * tid / nt), o1 = (int)((long)a->c_out * (tid + 1) / nt);
-    for (int oc = o0; oc < o1; oc++)
-        for (int t = 0; t < a->T_out; t++)
-            for (int w = 0; w < a->W_out; w++) {
-                float s = 0.0f;
-                for (int ic = 0; ic < a->c_in; ic++) {
-                    const float *wts = a->w + ((size_t)oc * a->c_in + ic) * 9;
-                    for (int ky = 0; ky < 3; ky++) {
-                        int iy = t * 2 - 1 + ky;
-                        if (iy < 0 || iy >= a->T_in) continue;
-                        const float *row = a->in + ((size_t)ic * a->T_in + iy) * a->W_in;
-                        for (int kx = 0; kx < 3; kx++) {
-                            int ix = w * 2 - 1 + kx;
-                            if (ix < 0 || ix >= a->W_in) continue;
-                            s += row[ix] * wts[ky * 3 + kx];
-                        }
+typedef struct {
+    float *x; int T, W, C; const float *norm; float eps;
+} ln_arg;
+
+static void conv3_work(void *vp, int tid, int nt) {
+    conv3_arg *a = vp;
+    int cpad = a->cpad, c_out = a->c_out;
+    int nv = (c_out + 15) / 16;
+    int t0 = (int)((long)a->T_out * tid / nt), t1 = (int)((long)a->T_out * (tid + 1) / nt);
+    float acc[128];
+    for (int t = t0; t < t1; t++) {
+        for (int w = 0; w < a->W_out; w++) {
+            for (int i = 0; i < cpad; i++) acc[i] = 0.0f;
+            for (int ic = 0; ic < a->c_in; ic++) {
+                for (int ky = 0; ky < 3; ky++) {
+                    int iy = t * 2 - 1 + ky;
+                    if (iy < 0 || iy >= a->T_in) continue;
+                    for (int kx = 0; kx < 3; kx++) {
+                        int ix = w * 2 - 1 + kx;
+                        if (ix < 0 || ix >= a->W_in) continue;
+                        float v = a->in[((size_t)iy * a->W_in + ix) * a->c_in + ic];
+                        const float *wt = a->wT + ((size_t)(ky * 3 + kx) * a->c_in + ic) * cpad;
+                        for (int j = 0; j < cpad; j++) acc[j] += v * wt[j];
                     }
                 }
-                a->out[((size_t)oc * a->T_out + t) * a->W_out + w] = s;
             }
+            float *op = a->out + ((size_t)t * a->W_out + w) * c_out;
+            for (int j = 0; j < c_out; j++) op[j] = acc[j];
+            (void)nv;
+        }
+    }
+}
+
+/* layernorm over the last (channel) axis + relu, in place, one thread per pixel
+ * row block; the reduction order over channels is unchanged. */
+static void ln_relu_work(void *vp, int tid, int nt) {
+    ln_arg *a = vp;
+    int px = a->T * a->W, C = a->C;
+    int p0 = (int)((long)px * tid / nt), p1 = (int)((long)px * (tid + 1) / nt);
+    for (int p = p0; p < p1; p++) {
+        float *v = a->x + (size_t)p * C;
+        float mean = 0.0f, var = 0.0f;
+        for (int c = 0; c < C; c++) mean += v[c];
+        mean /= (float)C;
+        for (int c = 0; c < C; c++) { float d = v[c] - mean; var += d * d; }
+        var /= (float)C;
+        float inv = 1.0f / sqrtf(var + a->eps);
+        for (int c = 0; c < C; c++) {
+            float y = (v[c] - mean) * inv * a->norm[c];
+            v[c] = y > 0.0f ? y : 0.0f;
+        }
+    }
+}
+
+typedef struct {
+    const float *samples; int n, T; float *feat; uint8_t *mask;
+    const float *hann, *mel; float floor;
+} mel_arg;
+
+static void mel_work(void *vp, int tid, int nt) {
+    mel_arg *a = vp;
+    int t0 = (int)((long)a->T * tid / nt), t1 = (int)((long)a->T * (tid + 1) / nt);
+    float frame[512];
+    float mag[257];
+    for (int t = t0; t < t1; t++) {
+        /* padded waveform has 160 leading zeros; frame starts at t*160 */
+        for (int i = 0; i < 320; i++) {
+            int idx = t * 160 + i - 160;
+            float v = (idx >= 0 && idx < a->n) ? a->samples[idx] : 0.0f;
+            frame[i] = v * a->hann[i];
+        }
+        for (int i = 320; i < 512; i++) frame[i] = 0.0f;
+        fft512(frame, mag);
+        for (int c = 0; c < 128; c++) {
+            float s = 0.0f;
+            for (int f = 0; f < 257; f++) s += mag[f] * a->mel[f * 128 + c];
+            a->feat[(size_t)t * 128 + c] = logf(s + a->floor);
+        }
+        a->mask[t] = (t * 160 + 160) < a->n;
+        if (!a->mask[t]) {
+            float *p = a->feat + (size_t)t * 128;
+            for (int c = 0; c < 128; c++) p[c] = 0.0f;
+        }
+    }
 }
 
 static int audio_mel(e2_ctx *ctx, const float *samples, int n,
@@ -91,30 +154,10 @@ static int audio_mel(e2_ctx *ctx, const float *samples, int n,
     float *feat = calloc((size_t)T * 128, sizeof(float));
     uint8_t *mask = calloc((size_t)T, 1);
     if (!feat || !mask) { free(feat); free(mask); return e2_fail("oom"); }
-    const float *hann = m->hann;
-    const float *mel = m->mel_filters;
-    float frame[512];
-    float mag[257];
-    for (int t = 0; t < T; t++) {
-        /* padded waveform has 160 leading zeros; frame starts at t*160 */
-        for (int i = 0; i < 320; i++) {
-            int idx = t * 160 + i - 160;
-            float v = (idx >= 0 && idx < n) ? samples[idx] : 0.0f;
-            frame[i] = v * hann[i];
-        }
-        for (int i = 320; i < 512; i++) frame[i] = 0.0f;
-        fft512(frame, mag);
-        for (int c = 0; c < 128; c++) {
-            float s = 0.0f;
-            for (int f = 0; f < 257; f++) s += mag[f] * mel[f * 128 + c];
-            feat[(size_t)t * 128 + c] = logf(s + ctx->m.meta.mel_floor);
-        }
-        mask[t] = (t * 160 + 160) < n;
-        if (!mask[t]) {
-            float *p = feat + (size_t)t * 128;
-            for (int c = 0; c < 128; c++) p[c] = 0.0f;
-        }
-    }
+    mel_arg ma = {samples, n, T, feat, mask, m->hann, m->mel_filters,
+                  ctx->m.meta.mel_floor};
+    if (ctx->nthreads > 1 && T >= 32) e2_parallel(ctx, mel_work, &ma);
+    else mel_work(&ma, 0, 1);
     {
         const char *dir = getenv("E2_DUMP");
         if (dir) {
@@ -156,19 +199,137 @@ static void audio_ff(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     const float *post = which == 0 ? L->ff1_post_norm : L->ff2_post_norm;
     /* residual + clamp, norm, two linears with SiLU */
     float *res = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
+    double _q = e2_now_ms();
     memcpy(res, x, (size_t)T * H * sizeof(float));
     e2_rmsnorm(ctx, h, x, pre, T, H, c->audio_eps);
+    double _n1 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_linear_forward(ctx, up, h, T, a);
+    double _g1 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_silu_ctx(ctx, up, T * I);
+    double _s1 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_linear_forward(ctx, h, up, T, b);
+    double _g2 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_rmsnorm(ctx, h, h, post, T, H, c->audio_eps);
     for (size_t i = 0; i < (size_t)T * H; i++) x[i] = res[i] + h[i] * c->audio_residual;
+    aud_prof[9] += _n1; aud_prof[10] += _g1 + _g2; aud_prof[11] += _s1 + e2_now_ms() - _q;
 }
 
 static float softplus(float v) {
     if (v > 20.0f) return v;
     if (v < -20.0f) return expf(v);
     return log1pf(e2_fexp(v));
+}
+
+/* dot product, AVX-512 when available (D is 128 here) */
+#if defined(__x86_64__)
+#include <immintrin.h>
+__attribute__((target("avx512f")))
+static float dot128(const float *a, const float *b, int n) {
+    __m512 s0 = _mm512_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+    int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), s0);
+        s1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), s1);
+        s2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32), s2);
+        s3 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 48), _mm512_loadu_ps(b + i + 48), s3);
+    }
+    for (; i + 16 <= n; i += 16)
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), s0);
+    float s = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(s0, s1),
+                                                 _mm512_add_ps(s2, s3)));
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+__attribute__((target("avx512f")))
+static void axpy(float *o, const float *v, float w, int n) {
+    __m512 vw = _mm512_set1_ps(w);
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        _mm512_storeu_ps(o + i, _mm512_fmadd_ps(vw, _mm512_loadu_ps(v + i),
+                                                _mm512_loadu_ps(o + i)));
+    for (; i < n; i++) o[i] += w * v[i];
+}
+#else
+static float dot128(const float *a, const float *b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+static void axpy(float *o, const float *v, float w, int n) {
+    for (int i = 0; i < n; i++) o[i] += w * v[i];
+}
+#endif
+
+/* Chunked local attention.  Work items are (chunk, head) so the pool keeps
+ * every core busy while each item stays cache resident. */
+typedef struct {
+    const float *q, *k, *v, *rk;
+    float *out;
+    int T, heads, D, chunk, ctx_left, ctxsz, pos_len, nb;
+    const uint8_t *mask;
+    float softcap, kscale;
+} aud_att_arg;
+
+static void aud_att_work(void *vp, int tid, int nt) {
+    aud_att_arg *a = vp;
+    int nh = a->nb * a->heads;
+    float sc[128];
+    for (int it = tid; it < nh; it += nt) {
+        int b = it / a->heads, hh = it % a->heads;
+        for (int i = 0; i < a->chunk; i++) {
+            int qg = b * a->chunk + i;
+            if (qg >= a->T || !a->mask[qg]) continue;
+            const float *qp = a->q + ((size_t)qg * a->heads + hh) * a->D;
+            float mx = -INFINITY;
+            for (int j = 0; j < a->ctxsz; j++) {
+                int kg = b * a->chunk - (a->ctx_left - 1) + j;
+                float s = -INFINITY;
+                if (kg >= 0 && kg < a->T && a->mask[kg]) {
+                    int dist = i + (a->ctx_left - 1) - j;
+                    if (dist >= 0 && dist < a->ctx_left - 1) {
+                        const float *kp = a->k + ((size_t)kg * a->heads + hh) * a->D;
+                        s = dot128(qp, kp, a->D);
+                        int r = j - i;
+                        if (r >= 0 && r < a->pos_len) {
+                            const float *rp = a->rk + ((size_t)r * a->heads + hh) * a->D;
+                            s += dot128(qp, rp, a->D);
+                        }
+                    }
+                }
+                sc[j] = s;
+            }
+            /* logit soft cap */
+            int any = 0;
+            for (int j = 0; j < a->ctxsz; j++)
+                if (sc[j] != -INFINITY) { sc[j] /= a->softcap; any = 1; }
+            if (!any) continue;
+            e2_tanh_span(sc, a->ctxsz);
+            mx = -INFINITY;
+            for (int j = 0; j < a->ctxsz; j++) {
+                if (sc[j] == -INFINITY) continue;
+                sc[j] *= a->softcap;
+                if (sc[j] > mx) mx = sc[j];
+            }
+            float sum = 0.0f;
+            for (int j = 0; j < a->ctxsz; j++) {
+                if (sc[j] == -INFINITY) { sc[j] = 0.0f; continue; }
+                sc[j] = e2_fexp(sc[j] - mx);
+                sum += sc[j];
+            }
+            if (sum <= 0.0f) continue;
+            float inv = 1.0f / sum;
+            float *op = a->out + ((size_t)qg * a->heads + hh) * a->D;
+            for (int j = 0; j < a->ctxsz; j++) {
+                float w = sc[j] * inv;
+                if (w == 0.0f) continue;
+                int kg = b * a->chunk - (a->ctx_left - 1) + j;
+                if (kg < 0 || kg >= a->T) continue;
+                const float *vp2 = a->v + ((size_t)kg * a->heads + hh) * a->D;
+                axpy(op, vp2, w, a->D);
+            }
+        }
+    }
 }
 
 static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
@@ -178,7 +339,6 @@ static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     int nb = (T + c->audio_chunk - 1) / c->audio_chunk;
     int chunk = c->audio_chunk;
     int ctxsz = chunk + (c->audio_ctx_left - 1) + c->audio_ctx_right;
-    /* rel pos embedding and its projection are recomputed per layer small */
     float *q = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
     float *k = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
     float *v = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
@@ -205,95 +365,55 @@ static void audio_attention(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     _a0 = e2_now_ms();
     float *rk = e2_arena_alloc(&ctx->scratch, (size_t)pos_len * H * sizeof(float));
     e2_linear_forward(ctx, rk, pe, pos_len, &L->rel_k);
-    /* rk layout [pos_len, heads*D]; view as [pos_len][heads][D] */
     aud_prof[6] += e2_now_ms() - _a0;
     _a0 = e2_now_ms();
     memset(out, 0, (size_t)T * H * sizeof(float));
-    float scores[512];
-    for (int b = 0; b < nb; b++) {
-        for (int hh = 0; hh < heads; hh++) {
-            for (int i = 0; i < chunk; i++) {
-                int qg = b * chunk + i;
-                if (qg >= T) break;
-                if (!mask[qg]) continue;
-                float *qp = q + ((size_t)qg * heads + hh) * D;
-                float mx = -INFINITY;
-                for (int j = 0; j < ctxsz; j++) {
-                    int kg = b * chunk - (c->audio_ctx_left - 1) + j;
-                    float s = 0.0f;
-                    if (kg >= 0 && kg < T && mask[kg]) {
-                        const float *kp = k + ((size_t)kg * heads + hh) * D;
-                        for (int d = 0; d < D; d++) s += qp[d] * kp[d];
-                        int r = j - i;
-                        if (r >= 0 && r < pos_len) {
-                            const float *rp = rk + ((size_t)r * heads + hh) * D;
-                            for (int d = 0; d < D; d++) s += qp[d] * rp[d];
-                        }
-                        /* window: 0 <= q-kv < audio_ctx_left */
-                        int dist = i + (c->audio_ctx_left - 1) - j;
-                        if (dist < 0 || dist >= c->audio_ctx_left - 1) s = -INFINITY;
-                    } else {
-                        s = -INFINITY;
-                    }
-                    scores[j] = s;
-                    if (s > mx) mx = s;
-                }
-                if (mx == -INFINITY) continue;
-                /* the logit soft cap applies before softmax */
-                mx = -INFINITY;
-                for (int j = 0; j < ctxsz; j++) {
-                    if (scores[j] == -INFINITY) continue;
-                    scores[j] = tanhf(scores[j] / c->audio_softcap) * c->audio_softcap;
-                    if (scores[j] > mx) mx = scores[j];
-                }
-                float sum = 0.0f;
-                for (int j = 0; j < ctxsz; j++) {
-                    if (scores[j] == -INFINITY) { scores[j] = 0.0f; continue; }
-                    scores[j] = e2_fexp(scores[j] - mx);
-                    sum += scores[j];
-                }
-                if (sum <= 0.0f) continue;
-                float inv = 1.0f / sum;
-                float *op = out + ((size_t)qg * heads + hh) * D;
-                for (int j = 0; j < ctxsz; j++) {
-                    float w = scores[j] * inv;
-                    if (w == 0.0f) continue;
-                    int kg = b * chunk - (c->audio_ctx_left - 1) + j;
-                    if (kg < 0 || kg >= T) continue;
-                    const float *vp = v + ((size_t)kg * heads + hh) * D;
-                    for (int d = 0; d < D; d++) op[d] += w * vp[d];
-                }
-            }
-        }
-    }
+    aud_att_arg aa = {q, k, v, rk, out, T, heads, D, chunk, c->audio_ctx_left,
+                      ctxsz, pos_len, nb, mask, c->audio_softcap, kscale};
+    e2_parallel(ctx, aud_att_work, &aa);
     aud_prof[7] += e2_now_ms() - _a0;
     _a0 = e2_now_ms();
     e2_linear_forward(ctx, x, out, T, &L->post);
     aud_prof[8] += e2_now_ms() - _a0;
 }
 
+#if defined(__x86_64__)
+__attribute__((target("avx512f")))
+static void dw_conv_add(float *op, const float *hp, const float *wp, int H) {
+    int c0 = 0;
+    for (; c0 + 16 <= H; c0 += 16)
+        _mm512_storeu_ps(op + c0,
+                         _mm512_fmadd_ps(_mm512_loadu_ps(hp + c0),
+                                         _mm512_loadu_ps(wp + c0),
+                                         _mm512_loadu_ps(op + c0)));
+    for (; c0 < H; c0++) op[c0] += hp[c0] * wp[c0];
+}
+#else
+static void dw_conv_add(float *op, const float *hp, const float *wp, int H) {
+    for (int c0 = 0; c0 < H; c0++) op[c0] += hp[c0] * wp[c0];
+}
+#endif
+
 static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
                         int H, int K) {
     e2_meta *c = &ctx->m.meta;
     float *h = e2_arena_alloc(&ctx->scratch, (size_t)T * 2 * H * sizeof(float));
-    if (!h) return;
+    float *conv = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
+    float *dwt = e2_arena_alloc(&ctx->scratch, (size_t)K * H * sizeof(float));
+    if (!h || !conv || !dwt) return;
     e2_rmsnorm(ctx, h, x, L->lc_pre_norm, T, H, c->audio_eps);
     e2_linear_forward(ctx, h, h, T, &L->lc_start);   /* [T, 2H] */
+    e2_gated_silu(h, T, H);
+    for (int ch = 0; ch < H; ch++)
+        for (int j = 0; j < K; j++) dwt[j * H + ch] = L->dw_conv[ch * K + j];
+    /* causal depthwise conv over time, vectorised over channels */
     for (int t = 0; t < T; t++) {
-        float *p = h + (size_t)t * 2 * H;
-        for (int i = 0; i < H; i++) p[i] = p[i] / (1.0f + e2_fexp(-p[H + i]));
-    }
-    /* causal depthwise conv over time */
-    float *conv = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
-    for (int t = 0; t < T; t++) {
-        for (int ch = 0; ch < H; ch++) {
-            float s = 0.0f;
-            for (int j = 0; j < K; j++) {
-                int tt = t - (K - 1) + j;
-                if (tt < 0 || tt >= T) continue;
-                s += h[(size_t)tt * 2 * H + ch] * L->dw_conv[ch * K + j];
-            }
-            conv[(size_t)t * H + ch] = s;
+        float *op = conv + (size_t)t * H;
+        for (int c0 = 0; c0 < H; c0++) op[c0] = 0.0f;
+        for (int j = 0; j < K; j++) {
+            int tt = t - (K - 1) + j;
+            if (tt < 0 || tt >= T) continue;
+            dw_conv_add(op, h + (size_t)tt * 2 * H, dwt + (size_t)j * H, H);
         }
     }
     e2_rmsnorm(ctx, conv, conv, L->lc_conv_norm, T, H, c->audio_eps);
@@ -322,83 +442,57 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
     e2_arena_reset(&ctx->scratch);
 
     double t_sub0 = e2_now_ms();
-    /* ---- subsample conv (two 3x3 stride-2 convs) ---- */
+    /* ---- subsample conv (two 3x3 stride-2 convs), channel-last ---- */
     int T0 = (T - 1) / 2 + 1;
     int W0 = 64;
     int T1 = (T0 - 1) / 2 + 1;
     int W1 = 32;
-    float *c0 = e2_arena_alloc(&ctx->scratch, (size_t)sub0 * T0 * W0 * sizeof(float));
-    float *c1 = e2_arena_alloc(&ctx->scratch, (size_t)sub1 * T1 * W1 * sizeof(float));
-    if (!c0 || !c1) { free(feat); free(mask); return e2_fail("oom"); }
-    /* input masked */
     for (int t = 0; t < T; t++)
         if (!mask[t]) for (int f = 0; f < 128; f++) feat[(size_t)t * 128 + f] = 0.0f;
-    /* layer0: in 1 channel, out 128, k=3, s=2, p=1 */
+    /* weights transposed once per forward: [3][3][c_in][c_out] */
+    float *w0t = e2_arena_alloc(&ctx->scratch, 3 * 3 * 1 * sub0 * sizeof(float));
+    float *w1t = e2_arena_alloc(&ctx->scratch, 3 * 3 * sub0 * sub1 * sizeof(float));
+    float *c0 = e2_arena_alloc(&ctx->scratch, (size_t)T0 * W0 * sub0 * sizeof(float));
+    float *c1 = e2_arena_alloc(&ctx->scratch, (size_t)T1 * W1 * sub1 * sizeof(float));
+    if (!w0t || !w1t || !c0 || !c1) { free(feat); free(mask); return e2_fail("oom"); }
+    for (int ky = 0; ky < 3; ky++)
+        for (int kx = 0; kx < 3; kx++)
+            for (int oc = 0; oc < sub0; oc++)          /* conv0: 1 input channel */
+                w0t[(ky * 3 + kx) * sub0 + oc] = m->aud_conv0[(size_t)oc * 9 + ky * 3 + kx];
+    for (int ky = 0; ky < 3; ky++)
+        for (int kx = 0; kx < 3; kx++)
+            for (int ic = 0; ic < sub0; ic++)
+                for (int oc = 0; oc < sub1; oc++)
+                    w1t[((size_t)(ky * 3 + kx) * sub0 + ic) * sub1 + oc] =
+                        m->aud_conv1[((size_t)oc * sub0 + ic) * 9 + ky * 3 + kx];
     {
-        conv_arg ca = {feat, m->aud_conv0, c0, 1, T, 128, sub0, T0, W0};
-        e2_parallel(ctx, conv2_work, &ca);
+        conv3_arg ca = {feat, w0t, c0, 1, T, 128, sub0, T0, W0, sub0};
+        e2_parallel(ctx, conv3_work, &ca);
+        ln_arg la = {c0, T0, W0, sub0, m->aud_sub0_norm, c->audio_eps};
+        e2_parallel(ctx, ln_relu_work, &la);
     }
-    /* layernorm over channels at each (t,w), relu */
-    for (int t = 0; t < T0; t++)
-        for (int w = 0; w < W0; w++) {
-            float mean = 0, var = 0;
-            for (int ch = 0; ch < sub0; ch++) mean += c0[((size_t)ch * T0 + t) * W0 + w];
-            mean /= sub0;
-            for (int ch = 0; ch < sub0; ch++) {
-                float d = c0[((size_t)ch * T0 + t) * W0 + w] - mean;
-                var += d * d;
-            }
-            var /= sub0;
-            float inv = 1.0f / sqrtf(var + c->audio_eps);
-            for (int ch = 0; ch < sub0; ch++) {
-                float v = (c0[((size_t)ch * T0 + t) * W0 + w] - mean) * inv * m->aud_sub0_norm[ch];
-                c0[((size_t)ch * T0 + t) * W0 + w] = v > 0 ? v : 0;
-            }
-        }
-    /* mask downsample, layer1 in 128 out 32 */
     uint8_t *m0 = e2_arena_alloc(&ctx->scratch, (size_t)T0);
     if (!m0) return e2_fail("oom");
     for (int t = 0; t < T0; t++) m0[t] = mask[t * 2];
     for (int t = 0; t < T0; t++)
-        if (!m0[t]) for (int ch = 0; ch < sub0; ch++)
-            for (int w = 0; w < W0; w++) c0[((size_t)ch * T0 + t) * W0 + w] = 0.0f;
+        if (!m0[t]) for (int i = 0; i < W0 * sub0; i++) c0[(size_t)t * W0 * sub0 + i] = 0.0f;
     {
-        conv_arg ca = {c0, m->aud_conv1, c1, sub0, T0, W0, sub1, T1, W1};
-        e2_parallel(ctx, conv2_work, &ca);
+        conv3_arg ca = {c0, w1t, c1, sub0, T0, W0, sub1, T1, W1, sub1};
+        e2_parallel(ctx, conv3_work, &ca);
+        ln_arg la = {c1, T1, W1, sub1, m->aud_sub1_norm, c->audio_eps};
+        e2_parallel(ctx, ln_relu_work, &la);
     }
     uint8_t *m1 = e2_arena_alloc(&ctx->scratch, (size_t)T1);
     if (!m1) return e2_fail("oom");
     for (int t = 0; t < T1; t++) m1[t] = m0[t * 2];
     for (int t = 0; t < T1; t++)
-        if (!m1[t]) for (int ch = 0; ch < sub1; ch++)
-            for (int w = 0; w < W1; w++) c1[((size_t)ch * T1 + t) * W1 + w] = 0.0f;
-    /* layernorm over 32 channels + relu */
-    for (int t = 0; t < T1; t++)
-        for (int w = 0; w < W1; w++) {
-            float mean = 0, var = 0;
-            for (int ch = 0; ch < sub1; ch++) mean += c1[((size_t)ch * T1 + t) * W1 + w];
-            mean /= sub1;
-            for (int ch = 0; ch < sub1; ch++) {
-                float d = c1[((size_t)ch * T1 + t) * W1 + w] - mean;
-                var += d * d;
-            }
-            var /= sub1;
-            float inv = 1.0f / sqrtf(var + c->audio_eps);
-            for (int ch = 0; ch < sub1; ch++) {
-                float v = (c1[((size_t)ch * T1 + t) * W1 + w] - mean) * inv * m->aud_sub1_norm[ch];
-                c1[((size_t)ch * T1 + t) * W1 + w] = v > 0 ? v : 0;
-            }
-        }
-    /* flatten (t, w, ch) -> [T1, 32*32] and project */
+        if (!m1[t]) for (int i = 0; i < sub1 * W1; i++) c1[(size_t)t * sub1 * W1 + i] = 0.0f;
+    /* c1 is already [T1][W1][c], i.e. the flattened [T1, 32*32] input */
     float *x = e2_arena_alloc(&ctx->scratch, (size_t)T1 * H * sizeof(float));
-    float *flat = e2_arena_alloc(&ctx->scratch, (size_t)T1 * sub1 * W1 * sizeof(float));
-    if (!x || !flat) return e2_fail("oom");
-    for (int t = 0; t < T1; t++)
-        for (int w = 0; w < W1; w++)
-            for (int ch = 0; ch < sub1; ch++)
-                flat[((size_t)t * W1 + w) * sub1 + ch] = c1[((size_t)ch * T1 + t) * W1 + w];
+    if (!x) return e2_fail("oom");
     e2_linear linproj = {0}; linproj.w = m->aud_in_proj;
-    e2_linear_forward(ctx, x, flat, T1, &linproj);
+    e2_linear_forward(ctx, x, c1, T1, &linproj);
+
     double t_sub = e2_now_ms() - t_sub0;
     adump("aud_in", x, (size_t)T1 * H);
 
@@ -479,7 +573,15 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
                 aud_prof[0], aud_prof[1], aud_prof[2], aud_prof[3],
                 aud_prof[4], aud_prof[5], aud_prof[6], aud_prof[7], aud_prof[8],
                 e2_now_ms() - t_layers0 - t_layers, e2_now_ms() - now0);
+    if (prof)
+        fprintf(stderr, "audio detail: norms %.2f gemms %.2f silu+eps %.2f\n",
+                aud_prof[9], aud_prof[10], aud_prof[11]);
     free(feat);
     free(mask);
+    if (getenv("E2_ARENA_STAT")) {
+        long nb; size_t bytes;
+        e2_arena_stat(&ctx->scratch, &nb, &bytes);
+        fprintf(stderr, "arena: %ld blocks, %.1f MB\n", nb, bytes / 1e6);
+    }
     return 0;
 }

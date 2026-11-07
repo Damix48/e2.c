@@ -96,6 +96,7 @@ typedef struct e2_tok e2_tok;
 typedef struct {
     void *map;
     size_t size;
+    int mapped;          /* 1 = mmap, 0 = malloc'd copy (freed with free) */
     e2_tensor *tensors;
     int ntensors;
     e2_meta meta;
@@ -135,7 +136,7 @@ typedef struct {
 
 typedef struct e2_arena_block e2_arena_block;
 typedef struct {
-    e2_arena_block *head;
+    e2_arena_block *head, *cur;
     size_t used, cap;
 } e2_arena;
 
@@ -161,6 +162,7 @@ typedef void (*e2_work_fn)(void *arg, int tid, int nthreads);
 /* arena */
 void *e2_arena_alloc(e2_arena *a, size_t n);
 void  e2_arena_reset(e2_arena *a);
+void  e2_arena_stat(const e2_arena *a, long *blocks, size_t *bytes);
 void  e2_arena_free(e2_arena *a);
 
 /* pool */
@@ -222,6 +224,8 @@ void e2_gelu_tanh_p(e2_ctx *ctx, float *x, int n);
 void e2_l2norm_rows(e2_ctx *ctx, float *x, int rows, int dim);
 void e2_softmax(float *x, int n);
 float e2_span_max(const float *x, int n);
+void  e2_tanh_span(float *x, int n);
+void  e2_gated_silu(float *x, int rows, int dim);
 float e2_exp_sum(float *x, int n, float mx);
 void e2_rope_free(e2_ctx *ctx);
 void e2_vec_scale(float *x, int n, float k);

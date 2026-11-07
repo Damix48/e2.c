@@ -45,7 +45,8 @@ void e2_free(e2_ctx *ctx) {
     free(m->vl);
     free(m->al);
     free(m->tensors);
-    if (m->map) munmap(m->map, m->size);
+    if (m->map && m->mapped) munmap(m->map, m->size);
+    else free(m->map);
     free(ctx);
 }
 

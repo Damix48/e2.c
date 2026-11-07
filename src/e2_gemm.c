@@ -118,6 +118,11 @@ static void gemm_t1(float *y, int ns, const uint8_t *xq, const float *xs,
     }
 }
 
+/* Weight prefetch distance in packed 64-byte rows.  When m is small the GEMM
+ * is DRAM-latency bound on the weight stream, so the distance is the knob that
+ * matters; it costs nothing when the weights are cached. */
+static int g_pf = 48;
+
 /* Row block of the AVX-VNNI kernel: the f32 accumulator tile for RB rows of
  * 16 outputs stays in L1 (RB=32 -> 2 KB) and so does the activation slab
  * (RB x k bytes).  32 measured better than 64/128/256 once the accumulator
@@ -321,7 +326,7 @@ static void gemm_avxvnni(float *y, int ns, const uint8_t *xq, const float *xs,
                          * (m=8 cold: 0.105 -> 0.062 ms) and costs nothing when
                          * the weights are cached. */
                         const __m256i *wv = (const __m256i *)(wq + (size_t)kb * 64);
-                        __builtin_prefetch((const char *)wv + 48 * 64, 0, 3);
+                        __builtin_prefetch((const char *)wv + g_pf * 64, 0, 3);
                         int x0, x1, x2, x3;
                         memcpy(&x0, ap + (size_t)kb * 4, 4);
                         memcpy(&x1, ap + k + (size_t)kb * 4, 4);
@@ -664,6 +669,8 @@ double e2_gemm_calib(void) {
 void e2_gemm_init(void) {
     if (g_kernel) return;
     g_kernel = select_kernel();
+    const char *pf = getenv("E2_GEMM_PF");
+    if (pf) g_pf = atoi(pf);
     const char *rb = getenv("E2_GEMM_RB");
     if (rb) g_rb = atoi(rb);
     if (g_rb <= 0) g_rb = 1 << 28;

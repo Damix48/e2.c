@@ -87,6 +87,7 @@ struct e2_pool {
     _Alignas(64) _Atomic unsigned gen;
     _Alignas(64) _Atomic int done;
     _Alignas(64) _Atomic int stop;
+    _Alignas(64) _Atomic int ready;
     e2_work_fn fn;
     void *arg;
 };
@@ -101,38 +102,141 @@ static void cpu_relax(void) {
 #endif
 }
 
-/* Pin thread tid.  The first pass hands out one thread per physical core
- * (better than SMT sharing for these kernels), the second pass fills the SMT
- * siblings so that asking for more threads than cores still gives every thread
- * a home instead of leaving it to the scheduler. */
-static void pin_cpu(int tid) {
-    static int cpus[512], ncpu = -1;
-    if (ncpu < 0) {
-        ncpu = 0;
-        cpu_set_t all;
-        CPU_ZERO(&all);
-        if (sched_getaffinity(0, sizeof(all), &all) == 0) {
-            int nn = (int)sysconf(_SC_NPROCESSORS_ONLN);
-            /* primary hw threads first, then their siblings */
-            for (int pass = 0; pass < 2; pass++)
-                for (int c = 0; c < nn && ncpu < 512; c++) {
-                    if (!CPU_ISSET(c, &all)) continue;
-                    char path[160];
-                    int first = c;
-                    snprintf(path, sizeof(path),
-                             "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
-                    FILE *f = fopen(path, "r");
-                    if (f) { if (fscanf(f, "%d", &first) != 1) first = c; fclose(f); }
-                    if ((pass == 0) == (first == c)) cpus[ncpu++] = c;
-                }
-        }
-        if (ncpu <= 0) { ncpu = 0; return; }
+/* Cores a hybrid part marks as "low power" (Arrow Lake: the 2 LP-E cores,
+ * ~8x slower than a P-core for this code) are left out entirely: one straggler
+ * on a barrier costs more than the extra parallelism is worth. */
+static unsigned char g_skip[256];
+
+static void load_skip_list(void) {
+    FILE *f = fopen("/sys/devices/cpu_lowpower/cpus", "r");
+    if (!f) return;
+    char buf[512];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return; }
+    fclose(f);
+    char *p = buf;
+    while (*p) {
+        int a = (int)strtol(p, &p, 10), b = a;
+        if (*p == '-') { p++; b = (int)strtol(p, &p, 10); }
+        for (int c = a; c <= b && c < 256; c++) g_skip[c] = 1;
+        if (*p == ',') p++; else break;
     }
-    if (ncpu <= 0) return;
+}
+
+/* Usable CPUs, primary hardware thread of each core first (SMT siblings only
+ * add contention for these kernels), LP cores dropped. */
+static int g_cpus[512], g_ncpu = -1;
+
+static void build_cpu_list(void) {
+    if (g_ncpu >= 0) return;
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    if (sched_getaffinity(0, sizeof(all), &all) != 0) { g_ncpu = 0; return; }
+    load_skip_list();
+    int nn = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nn > 256) nn = 256;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int keep_skip = attempt == 0;
+        g_ncpu = 0;
+        for (int pass = 0; pass < 2; pass++)
+            for (int c = 0; c < nn && g_ncpu < 512; c++) {
+                if (!CPU_ISSET(c, &all)) continue;
+                if (keep_skip && g_skip[c]) continue;
+                char path[160];
+                int first = c;
+                snprintf(path, sizeof(path),
+                         "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+                FILE *f = fopen(path, "r");
+                if (f) { if (fscanf(f, "%d", &first) != 1) first = c; fclose(f); }
+                if ((pass == 0) == (first == c)) g_cpus[g_ncpu++] = c;
+            }
+        if (g_ncpu > 0) return;   /* else: every core was in the skip list */
+    }
+}
+
+/* Per-thread relative throughput, measured once when the thread is pinned.
+ * Hybrid cores differ by more than their clock (an E-core issues half the
+ * 256-bit VNNI work of a P-core), so clock alone is not a good weight. */
+static int g_tw[256];
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+__attribute__((target("avx2,fma")))
+static float calib_vec(void) {
+    __m256 x = _mm256_set1_ps(1.000001f), c = _mm256_set1_ps(1e-7f);
+    __m256 a0 = x, a1 = x, a2 = x, a3 = x, a4 = x, a5 = x, a6 = x, a7 = x;
+    for (int i = 0; i < 50000; i++) {
+        a0 = _mm256_fmadd_ps(a0, x, c); a1 = _mm256_fmadd_ps(a1, x, c);
+        a2 = _mm256_fmadd_ps(a2, x, c); a3 = _mm256_fmadd_ps(a3, x, c);
+        a4 = _mm256_fmadd_ps(a4, x, c); a5 = _mm256_fmadd_ps(a5, x, c);
+        a6 = _mm256_fmadd_ps(a6, x, c); a7 = _mm256_fmadd_ps(a7, x, c);
+    }
+    a0 = _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)),
+                       _mm256_add_ps(_mm256_add_ps(a4, a5), _mm256_add_ps(a6, a7)));
+    float out[8];
+    _mm256_storeu_ps(out, a0);
+    return out[0] + out[3] + out[7];
+#else
+static float calib_vec(void) { return 1.0f; }
+#endif
+}
+
+/* Calibrated one thread at a time: measuring while the other workers spin up
+ * makes the faster cores look slow and skews every later work split. */
+static _Atomic int g_calib_turn;
+
+static void measure_speed(int tid) {
+    if (tid < 0 || tid > 255 || g_tw[tid]) return;
+    while (atomic_load_explicit(&g_calib_turn, memory_order_acquire) != tid)
+        cpu_relax();
+    double best = 1e30;
+    for (int r = 0; r < 5; r++) {
+        double dt = e2_gemm_calib();
+        if (dt <= 0.0) break;
+        if (dt < best) best = dt;   /* a preempted run is not a slow core */
+    }
+    if (best >= 1e30) {
+        /* no packed kernel yet: fall back to the raw instruction rate */
+        best = 1e30;
+        for (int r = 0; r < 3; r++) {
+            double t0 = e2_now_ms();
+            volatile float v = calib_vec();
+            (void)v;
+            double dt = e2_now_ms() - t0;
+            if (dt < best) best = dt;
+        }
+    }
+    /* inverse time in micro-units; only the ratios between threads matter */
+    g_tw[tid] = best > 0.0 ? (int)(1e6 / best) : 1;
+    atomic_store_explicit(&g_calib_turn, tid + 1, memory_order_release);
+    if (getenv("E2_DEBUG_TW"))
+        fprintf(stderr, "tid %d -> cpu %d speed %d\n", tid,
+                g_ncpu > 0 ? g_cpus[tid % g_ncpu] : -1, g_tw[tid]);
+}
+
+static void pin_cpu(int tid) {
+    build_cpu_list();
+    if (g_ncpu <= 0) return;
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET(cpus[tid % ncpu], &set);
+    CPU_SET(g_cpus[tid % g_ncpu], &set);
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    measure_speed(tid);
+}
+
+/* Split [0,n) over nt workers in proportion to their measured speed; a barrier
+ * ends at the slowest worker, so equal shares on a hybrid CPU waste the fast
+ * ones. */
+void e2_split(int n, int tid, int nt, int *lo, int *hi) {
+    if (nt <= 1 || tid < 0 || tid >= nt) { *lo = 0; *hi = n; return; }
+    long tot = 0, start = 0;
+    for (int i = 0; i < nt; i++) {
+        int w = (i < 256 && g_tw[i] > 0) ? g_tw[i] : 1;
+        tot += w;
+        if (i < tid) start += w;
+    }
+    int w = (tid < 256 && g_tw[tid] > 0) ? g_tw[tid] : 1;
+    *lo = (int)((long)n * start / tot);
+    *hi = (int)((long)n * (start + w) / tot);
 }
 
 static void set_ftz_w(void) {
@@ -144,22 +248,36 @@ static void set_ftz_w(void) {
 #endif
 }
 
+/* Spins before the first nanosleep.  Tunable because the cost of a wakeup
+ * depends on the host (a loaded box needs the spin, a quiet one pays for it
+ * in power and shared-cache traffic). */
+static int g_spin = 20000;
+static void spin_init(void) {
+    const char *e = getenv("E2_POOL_SPIN");
+    if (e) g_spin = atoi(e);
+    if (g_spin < 0) g_spin = 0;
+}
+
 static void *worker(void *vp) {
     set_ftz_w();
     struct worker_arg *wa = vp;
     struct e2_pool *pool = wa->pool;
     int tid = wa->tid;
+    /* Pin and calibrate before the first dispatch, so every split sees the
+     * same weights on every call (a weight that appears after the first
+     * dispatch would change the row boundaries and the rounding with them). */
+    pin_cpu(tid);
+    atomic_fetch_add_explicit(&pool->ready, 1, memory_order_release);
     unsigned seen = 0;
     for (;;) {
         int spins = 0;
         while (atomic_load_explicit(&pool->gen, memory_order_acquire) == seen) {
             if (atomic_load_explicit(&pool->stop, memory_order_relaxed)) return NULL;
-            if (++spins < 20000) cpu_relax();
+            if (++spins < g_spin) cpu_relax();
             else { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); }
         }
         if (atomic_load_explicit(&pool->stop, memory_order_acquire)) return NULL;
         seen = atomic_load_explicit(&pool->gen, memory_order_relaxed);
-        if (seen == 1) pin_cpu(tid);
         e2_work_fn fn = pool->fn;
         void *arg = pool->arg;
         fn(arg, tid, pool->n);
@@ -170,26 +288,35 @@ static void *worker(void *vp) {
 int e2_cpu_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n <= 0) return 1;
-    if (n > 256) n = 1;
-    /* Count unique physical cores when sysfs is available: SMT siblings only
-     * add contention for these bandwidth-bound GEMMs. */
-    unsigned long long keys[256];
+    /* Unique physical cores, LP cores excluded: SMT siblings only add
+     * contention for these kernels and an LP core is a straggler. */
+    build_cpu_list();
     int cores = 0;
-    for (int i = 0; i < (int)n && cores < 256; i++) {
+    for (int i = 0; i < g_ncpu; i++) {
         char path[160];
         int core = -1, pkg = 0;
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", i);
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", g_cpus[i]);
         FILE *f = fopen(path, "r");
         if (!f) { cores = 0; break; }
         if (fscanf(f, "%d", &core) != 1) { fclose(f); cores = 0; break; }
         fclose(f);
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", i);
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", g_cpus[i]);
         f = fopen(path, "r");
         if (f) { if (fscanf(f, "%d", &pkg) != 1) pkg = 0; fclose(f); }
-        unsigned long long key = ((unsigned long long)(pkg + 1) << 32) | (unsigned)core;
         int dup = 0;
-        for (int k = 0; k < cores; k++) if (keys[k] == key) { dup = 1; break; }
-        if (!dup) keys[cores++] = key;
+        for (int k = 0; k < i && !dup; k++) {
+            int c2 = -1, p2 = 0;
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", g_cpus[k]);
+            f = fopen(path, "r");
+            if (f) { if (fscanf(f, "%d", &c2) != 1) c2 = -1; fclose(f); }
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", g_cpus[k]);
+            f = fopen(path, "r");
+            if (f) { if (fscanf(f, "%d", &p2) != 1) p2 = 0; fclose(f); }
+            if (c2 == core && p2 == pkg) dup = 1;
+        }
+        if (!dup) cores++;
     }
     if (cores > 0) return cores;
     return (int)n;
@@ -199,6 +326,7 @@ int e2_pool_init(e2_ctx *ctx, int n) {
     if (n < 1) n = 1;
     struct e2_pool *p = calloc(1, sizeof(*p));
     if (!p) return -1;
+    spin_init();
     p->n = n;
     p->th = calloc((size_t)n, sizeof(pthread_t));
     p->wa = calloc((size_t)n, sizeof(*p->wa));
@@ -209,6 +337,10 @@ int e2_pool_init(e2_ctx *ctx, int n) {
             p->n = i;
             break;
         }
+    }
+    while (atomic_load_explicit(&p->ready, memory_order_acquire) < p->n - 1) {
+        struct timespec ts = {0, 100000};
+        nanosleep(&ts, NULL);
     }
     ctx->pool = p;
     ctx->nthreads = p->n;

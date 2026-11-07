@@ -192,7 +192,7 @@ static int simd_pick(void) {
 #ifdef E2_X86OPS
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx512f")) return 2;
-    if (__builtin_cpu_supports("avx2")) return 1;
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) return 1;
 #endif
     return 0;
 }
@@ -222,6 +222,277 @@ static float exp_sum_v(float *x, int n, float mx) {
     float sum = _mm512_reduce_add_ps(vs);
     for (; i < n; i++) { x[i] = e2_fexp(x[i] - mx); sum += x[i]; }
     return sum;
+}
+#endif
+
+/* ------------------------------------------------------------------ */
+/* AVX2 + FMA twins of the kernels above.  Hosts without AVX-512       */
+/* (Arrow Lake, Alder Lake, Zen 2/3/4) get 8 lanes instead of 1.       */
+/* ------------------------------------------------------------------ */
+#if defined(E2_X86OPS)
+#define A2 __attribute__((target("avx2,fma")))
+A2 static void rot_a2(float *x, const float *c, const float *s, int half);
+A2 static void gelu_mul_a2(float *o, const float *x, const float *up, int n);
+
+A2 static inline float hsum8(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(_mm_add_ss(s, _mm_shuffle_ps(s, s, 1)));
+}
+
+A2 static inline float hmax8(__m256 v) {
+    __m128 s = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_max_ps(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(_mm_max_ss(s, _mm_shuffle_ps(s, s, 1)));
+}
+
+/* Same polynomial and clamping as vexp; 2^n comes from the exponent field. */
+A2 static inline __m256 vexp8(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.3f));
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.7f));
+    __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.4426950408889634f)),
+                               _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.6931471805599453f), x);
+    __m256 p = _mm256_set1_ps(1.0f / 120.0f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 24.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 6.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    __m256i e = _mm256_slli_epi32(
+        _mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(e));
+}
+
+A2 static inline __m256 vsigmoid8(__m256 x) {
+    __m256 d = _mm256_add_ps(_mm256_set1_ps(1.0f),
+                             vexp8(_mm256_sub_ps(_mm256_setzero_ps(), x)));
+    __m256 r = _mm256_rcp_ps(d);
+    return _mm256_mul_ps(r, _mm256_fnmadd_ps(d, r, _mm256_set1_ps(2.0f)));
+}
+
+A2 static void gelu_a2(float *x, int n) {
+    const __m256 k = _mm256_set1_ps(0.7978845608028654f);
+    const __m256 c = _mm256_set1_ps(0.044715f);
+    const __m256 big = _mm256_set1_ps(15.0f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 t = _mm256_mul_ps(k, _mm256_fmadd_ps(c, _mm256_mul_ps(v, _mm256_mul_ps(v, v)), v));
+        __m256 s = vsigmoid8(_mm256_mul_ps(_mm256_set1_ps(2.0f), _mm256_min_ps(t, big)));
+        __m256 r = _mm256_mul_ps(v, s);
+        _mm256_storeu_ps(x + i, _mm256_blendv_ps(r, v, _mm256_cmp_ps(t, big, _CMP_GT_OQ)));
+    }
+    for (; i < n; i++) x[i] = gelu1(x[i]);
+}
+
+A2 static void silu_a2(float *x, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(v, vsigmoid8(v)));
+    }
+    for (; i < n; i++) x[i] = x[i] / (1.0f + e2_fexp(-x[i]));
+}
+
+A2 static void tanh_a2(float *x, int n) {
+    const __m256 two = _mm256_set1_ps(2.0f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        _mm256_storeu_ps(x + i, _mm256_fmsub_ps(vsigmoid8(_mm256_mul_ps(v, two)), two,
+                                                _mm256_set1_ps(1.0f)));
+    }
+    for (; i < n; i++) x[i] = tanhf(x[i]);
+}
+
+A2 static void gated_silu_a2(float *x, int rows, int dim) {
+    for (int r = 0; r < rows; r++) {
+        float *a = x + (size_t)r * 2 * dim;
+        const float *b = a + dim;
+        int i = 0;
+        for (; i + 8 <= dim; i += 8)
+            _mm256_storeu_ps(a + i, _mm256_mul_ps(_mm256_loadu_ps(a + i),
+                                                  vsigmoid8(_mm256_loadu_ps(b + i))));
+        for (; i < dim; i++) a[i] *= 1.0f / (1.0f + e2_fexp(-b[i]));
+    }
+}
+
+A2 static void scale_a2(float *x, int n, float k) {
+    __m256 vk = _mm256_set1_ps(k);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vk));
+    for (; i < n; i++) x[i] *= k;
+}
+
+A2 static void add_a2(float *a, const float *b, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(a + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    for (; i < n; i++) a[i] += b[i];
+}
+
+A2 static float span_max_a2(const float *x, int n) {
+    int i = 0;
+    __m256 vm = _mm256_set1_ps(-INFINITY);
+    for (; i + 8 <= n; i += 8) vm = _mm256_max_ps(vm, _mm256_loadu_ps(x + i));
+    float mx = hmax8(vm);
+    for (; i < n; i++) if (x[i] > mx) mx = x[i];
+    return mx;
+}
+
+A2 static float exp_sum_a2(float *x, int n, float mx) {
+    int i = 0;
+    __m256 vmx = _mm256_set1_ps(mx), vs = _mm256_setzero_ps();
+    for (; i + 8 <= n; i += 8) {
+        __m256 e = vexp8(_mm256_sub_ps(_mm256_loadu_ps(x + i), vmx));
+        _mm256_storeu_ps(x + i, e);
+        vs = _mm256_add_ps(vs, e);
+    }
+    float sum = hsum8(vs);
+    for (; i < n; i++) { x[i] = e2_fexp(x[i] - mx); sum += x[i]; }
+    return sum;
+}
+
+A2 static void rmsnorm_a2(float *out, const float *x, const float *w, int rows,
+                          int dim, float eps) {
+    float inv_dim = 1.0f / (float)dim;
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int i = 0;
+        for (; i + 32 <= dim; i += 32) {
+            __m256 v0 = _mm256_loadu_ps(xp + i), v1 = _mm256_loadu_ps(xp + i + 8);
+            __m256 v2 = _mm256_loadu_ps(xp + i + 16), v3 = _mm256_loadu_ps(xp + i + 24);
+            a0 = _mm256_fmadd_ps(v0, v0, a0); a1 = _mm256_fmadd_ps(v1, v1, a1);
+            a2 = _mm256_fmadd_ps(v2, v2, a2); a3 = _mm256_fmadd_ps(v3, v3, a3);
+        }
+        for (; i + 8 <= dim; i += 8) {
+            __m256 v0 = _mm256_loadu_ps(xp + i);
+            a0 = _mm256_fmadd_ps(v0, v0, a0);
+        }
+        float sum = hsum8(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+        for (; i < dim; i++) sum += xp[i] * xp[i];
+        float sv = 1.0f / sqrtf(sum * inv_dim + eps);
+        __m256 vs = _mm256_set1_ps(sv);
+        i = 0;
+        if (w) {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(op + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xp + i), vs),
+                                                       _mm256_loadu_ps(w + i)));
+        } else {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(op + i, _mm256_mul_ps(_mm256_loadu_ps(xp + i), vs));
+        }
+        for (; i < dim; i++) op[i] = w ? xp[i] * (sv * w[i]) : xp[i] * sv;
+    }
+}
+
+A2 static void rmsnorm_pre_a2(float *out, const float *x, const float *w, int rows,
+                              int dim, float eps, float pre) {
+    float inv_dim = 1.0f / (float)dim;
+    __m256 vp = _mm256_set1_ps(pre);
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int i = 0;
+        for (; i + 32 <= dim; i += 32) {
+            __m256 v0 = _mm256_mul_ps(_mm256_loadu_ps(xp + i), vp);
+            __m256 v1 = _mm256_mul_ps(_mm256_loadu_ps(xp + i + 8), vp);
+            __m256 v2 = _mm256_mul_ps(_mm256_loadu_ps(xp + i + 16), vp);
+            __m256 v3 = _mm256_mul_ps(_mm256_loadu_ps(xp + i + 24), vp);
+            a0 = _mm256_fmadd_ps(v0, v0, a0); a1 = _mm256_fmadd_ps(v1, v1, a1);
+            a2 = _mm256_fmadd_ps(v2, v2, a2); a3 = _mm256_fmadd_ps(v3, v3, a3);
+        }
+        for (; i + 8 <= dim; i += 8) {
+            __m256 v0 = _mm256_mul_ps(_mm256_loadu_ps(xp + i), vp);
+            a0 = _mm256_fmadd_ps(v0, v0, a0);
+        }
+        float sum = hsum8(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+        for (; i < dim; i++) { float v = xp[i] * pre; sum += v * v; }
+        float sv = 1.0f / sqrtf(sum * inv_dim + eps);
+        __m256 vs = _mm256_set1_ps(sv);
+        i = 0;
+        if (w) {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(op + i,
+                    _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xp + i), vp), vs),
+                                  _mm256_loadu_ps(w + i)));
+        } else {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(op + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xp + i), vp), vs));
+        }
+        for (; i < dim; i++) {
+            float s = pre * sv;
+            op[i] = w ? xp[i] * s * w[i] : xp[i] * s;
+        }
+    }
+}
+
+A2 static void rmsnorm_add_a2(float *x, const float *src, const float *w, int rows,
+                              int dim, float eps) {
+    float inv_dim = 1.0f / (float)dim;
+    for (int r = 0; r < rows; r++) {
+        const float *sp = src + (size_t)r * dim;
+        float *xp = x + (size_t)r * dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int i = 0;
+        for (; i + 32 <= dim; i += 32) {
+            __m256 v0 = _mm256_loadu_ps(sp + i), v1 = _mm256_loadu_ps(sp + i + 8);
+            __m256 v2 = _mm256_loadu_ps(sp + i + 16), v3 = _mm256_loadu_ps(sp + i + 24);
+            a0 = _mm256_fmadd_ps(v0, v0, a0); a1 = _mm256_fmadd_ps(v1, v1, a1);
+            a2 = _mm256_fmadd_ps(v2, v2, a2); a3 = _mm256_fmadd_ps(v3, v3, a3);
+        }
+        for (; i + 8 <= dim; i += 8) {
+            __m256 v0 = _mm256_loadu_ps(sp + i);
+            a0 = _mm256_fmadd_ps(v0, v0, a0);
+        }
+        float sum = hsum8(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+        for (; i < dim; i++) sum += sp[i] * sp[i];
+        float sv = 1.0f / sqrtf(sum * inv_dim + eps);
+        __m256 vs = _mm256_set1_ps(sv);
+        i = 0;
+        if (w) {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(xp + i, _mm256_add_ps(
+                    _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(sp + i), vs),
+                                  _mm256_loadu_ps(w + i)),
+                    _mm256_loadu_ps(xp + i)));
+        } else {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(xp + i, _mm256_add_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(sp + i), vs), _mm256_loadu_ps(xp + i)));
+        }
+        for (; i < dim; i++) xp[i] += w ? sp[i] * (sv * w[i]) : sp[i] * sv;
+    }
+}
+
+A2 static void l2norm_a2(float *x, int rows, int dim) {
+    for (int r = 0; r < rows; r++) {
+        float *p = x + (size_t)r * dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int i = 0;
+        for (; i + 32 <= dim; i += 32) {
+            __m256 v0 = _mm256_loadu_ps(p + i), v1 = _mm256_loadu_ps(p + i + 8);
+            __m256 v2 = _mm256_loadu_ps(p + i + 16), v3 = _mm256_loadu_ps(p + i + 24);
+            a0 = _mm256_fmadd_ps(v0, v0, a0); a1 = _mm256_fmadd_ps(v1, v1, a1);
+            a2 = _mm256_fmadd_ps(v2, v2, a2); a3 = _mm256_fmadd_ps(v3, v3, a3);
+        }
+        for (; i + 8 <= dim; i += 8) {
+            __m256 v0 = _mm256_loadu_ps(p + i);
+            a0 = _mm256_fmadd_ps(v0, v0, a0);
+        }
+        float s = hsum8(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+        for (; i < dim; i++) s += p[i] * p[i];
+        float sv = 1.0f / sqrtf(s + 1e-12f);
+        __m256 vs = _mm256_set1_ps(sv);
+        for (i = 0; i + 8 <= dim; i += 8)
+            _mm256_storeu_ps(p + i, _mm256_mul_ps(_mm256_loadu_ps(p + i), vs));
+        for (; i < dim; i++) p[i] *= sv;
+    }
 }
 #endif
 
@@ -258,6 +529,7 @@ static void gated_silu_v(float *x, int rows, int dim) {
 void e2_tanh_span(float *x, int n) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { tanh_v(x, n); return; }
+    if (simd() == 1) { tanh_a2(x, n); return; }
 #endif
     for (int i = 0; i < n; i++) x[i] = tanhf(x[i]);
 }
@@ -265,6 +537,7 @@ void e2_tanh_span(float *x, int n) {
 void e2_gated_silu(float *x, int rows, int dim) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { gated_silu_v(x, rows, dim); return; }
+    if (simd() == 1) { gated_silu_a2(x, rows, dim); return; }
 #endif
     for (int r = 0; r < rows; r++) {
         float *a = x + (size_t)r * 2 * dim;
@@ -276,6 +549,7 @@ void e2_gated_silu(float *x, int rows, int dim) {
 float e2_span_max(const float *x, int n) {
 #ifdef E2_X86OPS
     if (simd() >= 2) return span_max_v(x, n);
+    if (simd() == 1) return span_max_a2(x, n);
 #endif
     float mx = -INFINITY;
     for (int i = 0; i < n; i++) if (x[i] > mx) mx = x[i];
@@ -285,6 +559,7 @@ float e2_span_max(const float *x, int n) {
 float e2_exp_sum(float *x, int n, float mx) {
 #ifdef E2_X86OPS
     if (simd() >= 2) return exp_sum_v(x, n, mx);
+    if (simd() == 1) return exp_sum_a2(x, n, mx);
 #endif
     float sum = 0.0f;
     for (int i = 0; i < n; i++) { x[i] = e2_fexp(x[i] - mx); sum += x[i]; }
@@ -294,6 +569,7 @@ float e2_exp_sum(float *x, int n, float mx) {
 void e2_gelu_tanh(float *x, int n) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { gelu_v(x, n); return; }
+    if (simd() == 1) { gelu_a2(x, n); return; }
 #endif
     gelu_s(x, n);
 }
@@ -305,6 +581,7 @@ void e2_gelu_tanh_ctx(e2_ctx *ctx, float *x, int n) {
 void e2_silu(float *x, int n) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { silu_v(x, n); return; }
+    if (simd() == 1) { silu_a2(x, n); return; }
 #endif
     silu_s(x, n);
 }
@@ -312,6 +589,7 @@ void e2_silu(float *x, int n) {
 void e2_vec_scale(float *x, int n, float k) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { scale_v(x, n, k); return; }
+    if (simd() == 1) { scale_a2(x, n, k); return; }
 #endif
     scale_s(x, n, k);
 }
@@ -319,6 +597,7 @@ void e2_vec_scale(float *x, int n, float k) {
 void e2_add_inplace(float *a, const float *b, int n) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { add_v(a, b, n); return; }
+    if (simd() == 1) { add_a2(a, b, n); return; }
 #endif
     for (int i = 0; i < n; i++) a[i] += b[i];
 }
@@ -424,19 +703,24 @@ static void gelu_mul_v3(float *o, const float *x, const float *up, int n) {
     for (; i < n; i++) o[i] = gelu1(x[i]) * up[i];
 }
 
-static void gelu_mul_v(float *x, const float *up, int n) { gelu_mul_v3(x, x, up, n); }
+static void gelu_mul_v(float *x, const float *up, int n)
+{
+    if (simd() >= 2) gelu_mul_v3(x, x, up, n);
+    else if (simd() == 1) gelu_mul_a2(x, x, up, n);
+}
 
 typedef struct { const float *x, *up; uint8_t *q; float *sc; int rows, k, blk; float *tmp; } gmq_arg;
 static void gelu_mul_q_work(void *vp, int tid, int nt) {
     gmq_arg *a = vp;
-    int r0 = (int)((long)a->rows * tid / nt);
-    int r1 = (int)((long)a->rows * (tid + 1) / nt);
+    int r0, r1;
+    e2_split(a->rows, tid, nt, &r0, &r1);
     int nblk = a->k / a->blk;
     float *t = a->tmp + (size_t)tid * a->k;
     for (int r = r0; r < r1; r++) {
         const float *xp = a->x + (size_t)r * a->k, *up = a->up + (size_t)r * a->k;
 #ifdef E2_X86OPS
         if (simd() >= 2) gelu_mul_v3(t, xp, up, a->k);
+        else if (simd() == 1) gelu_mul_a2(t, xp, up, a->k);
         else
 #endif
             for (int i = 0; i < a->k; i++) t[i] = gelu1(xp[i]) * up[i];
@@ -513,6 +797,9 @@ static inline void rot(float *x, const float *c, const float *s, int half);
 static void rmsnorm_rope_v(float *out, const float *x, const float *w, int rows,
                            int dim, float eps, const e2_rope_tab *tb,
                            int per_pos, const int *seq_off, int nseq, int r0);
+static void rmsnorm_rope_a2(float *out, const float *x, const float *w, int rows,
+                            int dim, float eps, const e2_rope_tab *tb,
+                            int per_pos, const int *seq_off, int nseq, int r0);
 
 /* position of row `r` inside its sequence */
 static int rope_pos(int r, int per_pos, const int *seq_off, int nseq) {
@@ -553,6 +840,11 @@ static void norm_rows(norm_arg *a, int r0, int r1) {
                            a->seq_off, a->nseq, r0);
             return;
         }
+        if (simd() == 1) {
+            rmsnorm_rope_a2(out, x, a->w, rows, dim, a->eps, a->tb, a->per_pos,
+                            a->seq_off, a->nseq, r0);
+            return;
+        }
 #endif
         rmsnorm_rope_span(out, x, a->w, rows, dim, a->eps, a->tb, a->per_pos,
                           a->seq_off, a->nseq, r0);
@@ -563,6 +855,12 @@ static void norm_rows(norm_arg *a, int r0, int r1) {
         if (a->mode == 1) { rmsnorm_pre_v(out, x, a->w, rows, dim, a->eps, a->pre); return; }
         if (a->mode == 2) { rmsnorm_add_v(out, src, a->w, rows, dim, a->eps); return; }
         rmsnorm_v(out, x, a->w, rows, dim, a->eps);
+        return;
+    }
+    if (simd() == 1) {
+        if (a->mode == 1) { rmsnorm_pre_a2(out, x, a->w, rows, dim, a->eps, a->pre); return; }
+        if (a->mode == 2) { rmsnorm_add_a2(out, src, a->w, rows, dim, a->eps); return; }
+        rmsnorm_a2(out, x, a->w, rows, dim, a->eps);
         return;
     }
 #endif
@@ -583,8 +881,8 @@ static void norm_rows(norm_arg *a, int r0, int r1) {
 
 static void norm_work(void *vp, int tid, int nt) {
     norm_arg *a = vp;
-    int r0 = (int)((long)a->rows * tid / nt);
-    int r1 = (int)((long)a->rows * (tid + 1) / nt);
+    int r0, r1;
+    e2_split(a->rows, tid, nt, &r0, &r1);
     if (r0 < r1) norm_rows(a, r0, r1);
 }
 
@@ -613,7 +911,8 @@ void e2_rmsnorm_add(e2_ctx *ctx, float *x, const float *src, const float *w,
 void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n) {
     if (!ctx || ctx->nthreads <= 1 || n < 65536) {
 #ifdef E2_X86OPS
-        if (simd() >= 2) { gelu_mul_v(x, up, n); return; }
+        if (simd() >= 2) { gelu_mul_v3(x, x, up, n); return; }
+        if (simd() == 1) { gelu_mul_a2(x, x, up, n); return; }
 #endif
         for (int i = 0; i < n; i++) x[i] = gelu1(x[i]) * up[i];
         return;
@@ -649,6 +948,7 @@ void e2_rmsnorm_noweight(e2_ctx *ctx, float *out, const float *x, int rows, int 
 static void l2norm_span(float *x, int rows, int dim) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { l2norm_v(x, rows, dim); return; }
+    if (simd() == 1) { l2norm_a2(x, rows, dim); return; }
 #endif
     for (int r = 0; r < rows; r++) {
         float *p = x + (size_t)r * dim;
@@ -661,8 +961,8 @@ static void l2norm_span(float *x, int rows, int dim) {
 
 static void l2norm_work(void *vp, int tid, int nt) {
     norm_arg *a = vp;
-    int r0 = (int)((long)a->rows * tid / nt);
-    int r1 = (int)((long)a->rows * (tid + 1) / nt);
+    int r0, r1;
+    e2_split(a->rows, tid, nt, &r0, &r1);
     if (r0 < r1) l2norm_span(a->out + (size_t)r0 * a->dim, r1 - r0, a->dim);
 }
 
@@ -723,7 +1023,7 @@ void e2_gelu_tanh_p(e2_ctx *ctx, float *x, int n) { ew_run(ctx, x, NULL, n, 3, 0
 
 void e2_softmax(float *x, int n) {
 #ifdef E2_X86OPS
-    if (simd() >= 2 && n >= 16) { softmax_exp_v(x, n); return; }
+    if (simd() >= 1 && n >= 8) { softmax_exp_v(x, n); return; }
 #endif
     float mx = x[0];
     for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
@@ -770,6 +1070,7 @@ static void rot_s(float *x, const float *c, const float *s, int half) {
 static inline void rot(float *x, const float *c, const float *s, int half) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { rot_v(x, c, s, half); return; }
+    if (simd() == 1) { rot_a2(x, c, s, half); return; }
 #endif
     rot_s(x, c, s, half);
 }
@@ -812,6 +1113,78 @@ static void rmsnorm_rope_v(float *out, const float *x, const float *w, int rows,
         int pos = rope_pos(r0 + r, per_pos, seq_off, nseq);
         rot_v(op, tb->c + (size_t)pos * half, tb->s + (size_t)pos * half, half);
     }
+}
+
+/* AVX2 RoPE rotate: same maths, 8 lanes. */
+A2 static void rot_a2(float *x, const float *c, const float *s, int half) {
+    int d = 0;
+    for (; d + 8 <= half; d += 8) {
+        __m256 c1 = _mm256_loadu_ps(c + d), s1 = _mm256_loadu_ps(s + d);
+        __m256 x1 = _mm256_loadu_ps(x + d), x2 = _mm256_loadu_ps(x + d + half);
+        _mm256_storeu_ps(x + d, _mm256_fmsub_ps(x1, c1, _mm256_mul_ps(x2, s1)));
+        _mm256_storeu_ps(x + d + half, _mm256_fmadd_ps(x2, c1, _mm256_mul_ps(x1, s1)));
+    }
+    for (; d < half; d++) {
+        float x1 = x[d], x2 = x[d + half];
+        x[d] = x1 * c[d] - x2 * s[d];
+        x[d + half] = x2 * c[d] + x1 * s[d];
+    }
+}
+
+/* AVX2 RMSNorm + RoPE in one pass over the row. */
+A2 static void rmsnorm_rope_a2(float *out, const float *x, const float *w, int rows,
+                               int dim, float eps, const e2_rope_tab *tb,
+                               int per_pos, const int *seq_off, int nseq, int r0) {
+    int half = dim / 2;
+    float inv_dim = 1.0f / (float)dim;
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0;
+        int i = 0;
+        for (; i + 16 <= dim; i += 16) {
+            __m256 v0 = _mm256_loadu_ps(xp + i), v1 = _mm256_loadu_ps(xp + i + 8);
+            a0 = _mm256_fmadd_ps(v0, v0, a0);
+            a1 = _mm256_fmadd_ps(v1, v1, a1);
+        }
+        for (; i + 8 <= dim; i += 8) {
+            __m256 v0 = _mm256_loadu_ps(xp + i);
+            a0 = _mm256_fmadd_ps(v0, v0, a0);
+        }
+        float sum = hsum8(_mm256_add_ps(a0, a1));
+        for (; i < dim; i++) sum += xp[i] * xp[i];
+        float sv = 1.0f / sqrtf(sum * inv_dim + eps);
+        __m256 vs = _mm256_set1_ps(sv);
+        i = 0;
+        if (w) {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(op + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xp + i), vs),
+                                                       _mm256_loadu_ps(w + i)));
+        } else {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(op + i, _mm256_mul_ps(_mm256_loadu_ps(xp + i), vs));
+        }
+        for (; i < dim; i++) op[i] = w ? xp[i] * (sv * w[i]) : xp[i] * sv;
+        int pos = rope_pos(r0 + r, per_pos, seq_off, nseq);
+        rot_a2(op, tb->c + (size_t)pos * half, tb->s + (size_t)pos * half, half);
+    }
+}
+
+/* AVX2 gelu(x) * up, and the in-place form. */
+A2 static void gelu_mul_a2(float *o, const float *x, const float *up, int n) {
+    const __m256 k = _mm256_set1_ps(0.7978845608028654f);
+    const __m256 c = _mm256_set1_ps(0.044715f);
+    const __m256 big = _mm256_set1_ps(15.0f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 t = _mm256_mul_ps(k, _mm256_fmadd_ps(c, _mm256_mul_ps(v, _mm256_mul_ps(v, v)), v));
+        __m256 s = vsigmoid8(_mm256_mul_ps(_mm256_set1_ps(2.0f), _mm256_min_ps(t, big)));
+        __m256 r = _mm256_mul_ps(v, s);
+        r = _mm256_blendv_ps(r, v, _mm256_cmp_ps(t, big, _CMP_GT_OQ));
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(r, _mm256_loadu_ps(up + i)));
+    }
+    for (; i < n; i++) o[i] = gelu1(x[i]) * up[i];
 }
 
 /* Build/extend a table covering positions [0,need) for `theta`. */
@@ -1003,7 +1376,9 @@ static void kt_work(void *vp, int tid, int nt) {
     kt_arg *a = vp;
     int dim = a->dim, t = a->t, tpad = a->tpad;
     long total = (long)a->kv * ((dim + 15) / 16) * ((t + 15) / 16);
-    long w0 = total * tid / nt, w1 = total * (tid + 1) / nt;
+    int i0, i1;
+    e2_split((int)total, tid, nt, &i0, &i1);
+    long w0 = i0, w1 = i1;
     int nt_t = (t + 15) / 16, nt_d = (dim + 15) / 16;
     for (long w = w0; w < w1; w++) {
         int kh = (int)(w / (nt_t * nt_d));
@@ -1089,7 +1464,9 @@ static void attn_work(void *vp, int tid, int nt) {
     size_t kv_stride = (size_t)a->kv_heads * head_dim;
 
     long total = (long)nblk * a->kv_heads;
-    long w0 = total * tid / nt, w1 = total * (tid + 1) / nt;
+    int i0, i1;
+    e2_split((int)total, tid, nt, &i0, &i1);
+    long w0 = i0, w1 = i1;
 
     /* head-major: each thread stays on one K/V head so its transposed K and V
      * stay in L2 instead of thrashing L3. */

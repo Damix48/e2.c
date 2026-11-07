@@ -168,6 +168,9 @@ int  e2_pool_init(e2_ctx *ctx, int nthreads);
 void e2_pool_free(e2_ctx *ctx);
 void e2_parallel(e2_ctx *ctx, e2_work_fn fn, void *arg);
 int  e2_cpu_count(void);
+/* Range of n items for worker tid of nt, weighted by that core's measured
+ * throughput (a hybrid barrier ends at the slowest core). */
+void e2_split(int n, int tid, int nt, int *lo, int *hi);
 
 /* model */
 const e2_tensor *e2_find(const e2_model *m, const char *name);
@@ -188,6 +191,7 @@ int  e2_pack_mat_ctx(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
                      int8_t **q, float **scale, int32_t **wsum, int *blk_out);
 void e2_pack_free(int8_t *q, float *scale, int32_t *wsum);
 void e2_gemm_init(void);
+double e2_gemm_calib(void);
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
 void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
                              const e2_linear *const *ls, float *const *ys, int n);

@@ -244,6 +244,68 @@ static void bench_attn(int t, int heads, int kvh, int hd, int window, int nt) {
     e2_pool_free(&ctx);
 }
 
+/* Reference scalar quantiser (copy of quant_rows_s) and a bit-exactness
+ * check plus bandwidth bench for the dispatched e2_quant_rows_blk. */
+static void ref_quant(const float *x, int m, int k, uint8_t *q, float *scale, int blk) {
+    int nblk = k / blk;
+    for (int r = 0; r < m; r++) {
+        const float *xp = x + (size_t)r * k;
+        uint8_t *qp = q + (size_t)r * k;
+        float *sp = scale + (size_t)r * nblk;
+        for (int b = 0; b < nblk; b++) {
+            const float *xb = xp + b * blk;
+            float mx = 0.0f;
+            for (int i = 0; i < blk; i++) { float a = fabsf(xb[i]); if (a > mx) mx = a; }
+            float s = mx / 127.0f;
+            if (s < 1e-12f) s = 1e-12f;
+            float inv = 1.0f / s;
+            for (int i = 0; i < blk; i++) {
+                long v = lrintf(xb[i] * inv) + 128;
+                if (v < 0) v = 0;
+                if (v > 255) v = 255;
+                qp[b * blk + i] = (uint8_t)v;
+            }
+            sp[b] = s;
+        }
+    }
+}
+
+static void bench_quant(int m, int k, int blk) {
+    int nblk = k / blk;
+    float *x = malloc((size_t)m * k * sizeof(float));
+    uint8_t *q0 = malloc((size_t)m * k), *q1 = malloc((size_t)m * k);
+    float *s0 = malloc((size_t)m * nblk * sizeof(float));
+    float *s1 = malloc((size_t)m * nblk * sizeof(float));
+    int bad = 0, ncase = 0;
+    for (int c = 0; c < 4; c++) {
+        for (long i = 0; i < (long)m * k; i++) {
+            float v = (float)((int)(i * 37 % 1999) - 999) * 0.013f;
+            if (c == 1) v = (i % 97 == 0) ? 8.0f * v : v;          /* outliers */
+            if (c == 2) v *= 1e-14f;                               /* tiny -> floor */
+            if (c == 3) v = (i % 3 == 0) ? 0.0f : v * 1e-3f;
+            x[i] = v;
+        }
+        ref_quant(x, m, k, q0, s0, blk);
+        e2_quant_rows_blk(x, m, k, q1, s1, blk);
+        for (long i = 0; i < (long)m * k; i++) if (q0[i] != q1[i]) bad++;
+        for (int i = 0; i < m * nblk; i++) if (memcmp(&s0[i], &s1[i], 4)) bad++;
+        ncase++;
+    }
+    printf("quant k=%d blk=%d m=%d: %d mismatching bytes over %d patterns %s\n",
+           k, blk, m, bad, ncase, bad ? "MISMATCH" : "bit-exact");
+    double ts[5];
+    for (int i = 0; i < 5; i++) {
+        double t0 = now();
+        for (int r = 0; r < 4; r++) e2_quant_rows_blk(x, m, k, q1, s1, blk);
+        ts[i] = (now() - t0) / 4;
+    }
+    qsort(ts, 5, sizeof(double), cmp);
+    double t = ts[2];
+    printf("   %.3f ms  %.1f GB/s (%.2f ns/row)\n", t,
+           (double)m * k * 5 / (t / 1e3) / 1e9, t * 1e6 / m);
+    free(x); free(q0); free(q1); free(s0); free(s1);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { printf("usage: mb gemm m k n [nt] | mb peak | mb row k [nt]\n"); return 1; }
     e2_gemm_init();
@@ -275,6 +337,11 @@ int main(int argc, char **argv) {
             printf("vnni nt=%2d %.2f GMAC/s | fma %.2f GMAC/s\n", nt,
                    peak_vnni(nt), peak_fma(nt));
 #endif
+    } else if (!strcmp(argv[1], "quant")) {
+        int m = argc > 2 ? atoi(argv[2]) : 256;
+        int k = argc > 3 ? atoi(argv[3]) : 2048;
+        int blk = argc > 4 ? atoi(argv[4]) : 128;
+        bench_quant(m, k, blk);
     } else if (!strcmp(argv[1], "row") && argc >= 3) {
         int k = atoi(argv[2]);
         int nt = argc > 3 ? atoi(argv[3]) : 16;

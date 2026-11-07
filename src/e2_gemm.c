@@ -10,9 +10,8 @@
  * output per block.  The weight sum used for the zero-point correction is
  * precomputed per block.
  *
- * Primary kernel: AVX-512 VNNI (vpdpbusd).  One instruction computes 16
- * output channels from 4 k values; the weight vector is loaded once and
- * reused across 8 input rows.
+ * Primary kernels: AVX-512 VNNI and AVX-VNNI (vpdpbusd).  One instruction
+ * computes 16 (AVX-512) or 8 (AVX-VNNI) output channels from 4 k values.
  */
 #include "e2_internal.h"
 
@@ -297,9 +296,14 @@ static void gemm_avxvnni(float *y, int ns, const uint8_t *xq, const float *xs,
                 __m256i a0l = base0, a0h = base1, a1l = base0, a1h = base1;
                 __m256i a2l = base0, a2h = base1, a3l = base0, a3h = base1;
                 for (int kb = 0; kb < blk / 4; kb++) {
-                    const int8_t *wv = wq + (size_t)kb * 64;
-                    __m256i wl = _mm256_loadu_si256((const __m256i *)wv);
-                    __m256i wh = _mm256_loadu_si256((const __m256i *)(wv + 32));
+                    /* letting dpbusd read the weight from memory (gcc still
+                     * CSEs the two uses) measures ~3% faster than explicit
+                     * locals.  The 3 KB run-ahead covers DRAM latency when m
+                     * is small enough that the weight stream is the limit
+                     * (m=8 cold: 0.105 -> 0.062 ms) and costs nothing when the
+                     * weights are cached. */
+                    const __m256i *wv = (const __m256i *)(wq + (size_t)kb * 64);
+                    __builtin_prefetch((const char *)wv + 48 * 64, 0, 3);
                     int x0, x1, x2, x3;
                     memcpy(&x0, ap + (size_t)kb * 4, 4);
                     memcpy(&x1, ap + k + (size_t)kb * 4, 4);
@@ -307,17 +311,17 @@ static void gemm_avxvnni(float *y, int ns, const uint8_t *xq, const float *xs,
                     memcpy(&x3, ap + 3 * k + (size_t)kb * 4, 4);
                     __m256i v;
                     v = _mm256_set1_epi32(x0);
-                    a0l = _mm256_dpbusd_epi32(a0l, v, wl);
-                    a0h = _mm256_dpbusd_epi32(a0h, v, wh);
+                    a0l = _mm256_dpbusd_epi32(a0l, v, _mm256_loadu_si256(wv));
+                    a0h = _mm256_dpbusd_epi32(a0h, v, _mm256_loadu_si256(wv + 1));
                     v = _mm256_set1_epi32(x1);
-                    a1l = _mm256_dpbusd_epi32(a1l, v, wl);
-                    a1h = _mm256_dpbusd_epi32(a1h, v, wh);
+                    a1l = _mm256_dpbusd_epi32(a1l, v, _mm256_loadu_si256(wv));
+                    a1h = _mm256_dpbusd_epi32(a1h, v, _mm256_loadu_si256(wv + 1));
                     v = _mm256_set1_epi32(x2);
-                    a2l = _mm256_dpbusd_epi32(a2l, v, wl);
-                    a2h = _mm256_dpbusd_epi32(a2h, v, wh);
+                    a2l = _mm256_dpbusd_epi32(a2l, v, _mm256_loadu_si256(wv));
+                    a2h = _mm256_dpbusd_epi32(a2h, v, _mm256_loadu_si256(wv + 1));
                     v = _mm256_set1_epi32(x3);
-                    a3l = _mm256_dpbusd_epi32(a3l, v, wl);
-                    a3h = _mm256_dpbusd_epi32(a3h, v, wh);
+                    a3l = _mm256_dpbusd_epi32(a3l, v, _mm256_loadu_si256(wv));
+                    a3h = _mm256_dpbusd_epi32(a3h, v, _mm256_loadu_si256(wv + 1));
                 }
                 __m256i R[4][2] = {{a0l, a0h}, {a1l, a1h}, {a2l, a2h}, {a3l, a3h}};
                 for (int i = 0; i < mm; i++) {
@@ -475,16 +479,76 @@ static void quant_rows_avx512(const float *x, int m, int k, uint8_t *q, float *s
 }
 #endif
 
-void e2_quant_rows_blk(const float *x, int m, int k, uint8_t *q, float *scale, int blk) {
-    if (!blk) blk = BLK;
-    if (blk == 128 || (blk % 16) == 0) {
+/* AVX2 twin of quant_rows_s: same block max, same scale, same round
+ * (vcvtps2dq = nearest-even) and the same 0..255 clamp via pack saturation.
+ * The 128 offset is added in the integer domain so no float rounding edge is
+ * introduced.  Used on hosts without AVX-512 (Arrow Lake / Zen 5). */
 #ifdef E2_X86
-        __builtin_cpu_init();
-        if ((k % blk) == 0 && __builtin_cpu_supports("avx512bw")) {
-            quant_rows_avx512(x, m, k, q, scale, blk);
-            return;
+__attribute__((target("avx2")))
+static void quant_rows_avx2(const float *x, int m, int k, uint8_t *q, float *scale, int blk) {
+    int nblk = k / blk;
+    const __m256i sign = _mm256_set1_epi32((int)0x80000000u);
+    const __m256i off = _mm256_set1_epi16(128);
+    for (int r = 0; r < m; r++) {
+        const float *xp = x + (size_t)r * k;
+        uint8_t *qp = q + (size_t)r * k;
+        float *sp = scale + (size_t)r * nblk;
+        for (int b = 0; b < nblk; b++) {
+            const float *xb = xp + b * blk;
+            uint8_t *qb = qp + b * blk;
+            __m256 mx0 = _mm256_setzero_ps(), mx1 = mx0;
+            for (int i = 0; i < blk; i += 16) {
+                /* max(v, mx) so a NaN lane keeps mx, like the scalar `a > mx` */
+                mx0 = _mm256_max_ps(_mm256_castsi256_ps(_mm256_andnot_si256(
+                    sign, _mm256_castps_si256(_mm256_loadu_ps(xb + i)))), mx0);
+                mx1 = _mm256_max_ps(_mm256_castsi256_ps(_mm256_andnot_si256(
+                    sign, _mm256_castps_si256(_mm256_loadu_ps(xb + i + 8)))), mx1);
+            }
+            __m256 mx = _mm256_max_ps(mx0, mx1);
+            __m128 h = _mm_max_ps(_mm256_castps256_ps128(mx), _mm256_extractf128_ps(mx, 1));
+            h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+            h = _mm_max_ss(h, _mm_movehdup_ps(h));
+            float s = _mm_cvtss_f32(h) / 127.0f;
+            if (s < 1e-12f) s = 1e-12f;
+            __m256 vinv = _mm256_set1_ps(1.0f / s);
+            for (int i = 0; i < blk; i += 16) {
+                __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + i), vinv));
+                __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + i + 8), vinv));
+                __m256i p = _mm256_add_epi16(_mm256_packs_epi32(i0, i1), off);
+                p = _mm256_permute4x64_epi64(p, 0xd8);
+                _mm_storeu_si128((__m128i *)(qb + i),
+                                 _mm_packus_epi16(_mm256_castsi256_si128(p),
+                                                  _mm256_extracti128_si256(p, 1)));
+            }
+            sp[b] = s;
         }
+    }
+}
 #endif
+
+typedef void (*quant_kernel)(const float *, int, int, uint8_t *, float *, int);
+
+static quant_kernel quant_select(void) {
+    const char *force = getenv("E2_QUANT");
+    if (force && !strcmp(force, "scalar")) return quant_rows_s;
+#ifdef E2_X86
+    __builtin_cpu_init();
+    if (force && !strcmp(force, "avx2")) return quant_rows_avx2;
+    if (__builtin_cpu_supports("avx512bw")) return quant_rows_avx512;
+    if (force && !strcmp(force, "avx512")) return quant_rows_avx512;
+    if (__builtin_cpu_supports("avx2")) return quant_rows_avx2;
+#endif
+    return quant_rows_s;
+}
+
+void e2_quant_rows_blk(const float *x, int m, int k, uint8_t *q, float *scale, int blk) {
+    static quant_kernel kern;
+    if (!blk) blk = BLK;
+    if (!kern) kern = quant_select();
+    /* blk % 16 so the vector loops stay in bounds; k % blk so no tail */
+    if ((blk % 16) == 0 && (k % blk) == 0) {
+        kern(x, m, k, q, scale, blk);
+        return;
     }
     quant_rows_s(x, m, k, q, scale, blk);
 }
@@ -499,7 +563,7 @@ typedef struct {
 
 static void quant_work(void *vp, int tid, int nt) {
     quant_arg *a = vp;
-    int r0 = (int)((long)a->m * tid / nt), r1 = (int)((long)a->m * (tid + 1) / nt);
+    int r0, r1; e2_split(a->m, tid, nt, &r0, &r1);
     if (r0 < r1)
         e2_quant_rows_blk(a->x + (size_t)r0 * a->k, r1 - r0, a->k,
                           a->q + (size_t)r0 * a->k,
@@ -526,17 +590,50 @@ static void gemm_work(void *vp, int tid, int nt) {
         /* Disjoint 4-row-aligned row ranges.  Rounding only the start made
          * adjacent threads overlap, and the b==0 store raced with the other
          * thread's b>0 accumulate. */
-        int r0 = (int)((long)a->m * tid / nt) & ~3;
-        int r1 = (tid == nt - 1) ? a->m
-                                 : (int)((long)a->m * (tid + 1) / nt) & ~3;
+        int r0, r1;
+        e2_split(a->m, tid, nt, &r0, &r1);
+        r0 &= ~3;
+        if (tid != nt - 1) r1 &= ~3; else r1 = a->m;
         if (r0 < r1)
             a->kern(a->y + (size_t)r0 * a->ns, a->ns, a->xq + (size_t)r0 * a->k,
                     a->xs + (size_t)r0 * a->xss, a->xss, r1 - r0, a->k, a->w, 0, nblk);
         return;
     }
-    int nb0 = (int)((long)nblk * tid / nt);
-    int nb1 = (int)((long)nblk * (tid + 1) / nt);
+    int nb0, nb1;
+    e2_split(nblk, tid, nt, &nb0, &nb1);
     if (nb0 < nb1) a->kern(a->y, a->ns, a->xq, a->xs, a->xss, a->m, a->k, a->w, nb0, nb1);
+}
+
+/* Single-threaded micro-GEMM used to rank the cores of a hybrid part when the
+ * pool pins itself.  Clock alone is a bad proxy: an E-core runs vpdpbusd at a
+ * different rate and has less load bandwidth, so calibrate on the real kernel.
+ * Returns milliseconds for 20 passes over m=8 k=512 n=64. */
+double e2_gemm_calib(void) {
+    enum { N = 64, K = 512, M = 8 };
+    static uint8_t xq[M * K];
+    static float xs[M * (K / 128)];
+    static int8_t wq[(N / 16) * (K / 4) * 64];
+    static float wsc[N];
+    static int32_t wsum[N * (K / 128)];
+    static float y[M * N];
+    static int ready;
+    e2_gemm_init();
+    if (!g_kernel) return 0.0;
+    if (!ready) {
+        memset(xq, 128, sizeof(xq));
+        for (int i = 0; i < M * (K / 128); i++) xs[i] = 1e-3f;
+        for (size_t i = 0; i < sizeof(wq); i++) wq[i] = (int8_t)(i * 37u);
+        for (int i = 0; i < N; i++) wsc[i] = 1e-4f;
+        ready = 1;
+    }
+    e2_qmat w;
+    memset(&w, 0, sizeof(w));
+    w.q = wq; w.scale = wsc; w.wsum = wsum;
+    w.n = N; w.k = K; w.blk = BLK; w.packed = 1;
+    double t0 = e2_now_ms();
+    for (int r = 0; r < 20; r++)
+        g_kernel(y, N, xq, xs, K / 128, M, K, &w, 0, N / 16);
+    return e2_now_ms() - t0;
 }
 
 void e2_gemm_init(void) {
@@ -932,8 +1029,8 @@ static int pack_fast_ok(void) {
 
 static void pack_work(void *vp, int tid, int nt) {
     pack_job *j = vp;
-    int r0 = (int)((long)j->rows * tid / nt);
-    int r1 = (int)((long)j->rows * (tid + 1) / nt);
+    int r0, r1;
+    e2_split(j->rows, tid, nt, &r0, &r1);
 #ifdef E2_X86
     if (j->fast) { pack_rows_avx512(j->a, r0, r1, j->rowbuf + (size_t)tid * j->a->k); return; }
 #endif

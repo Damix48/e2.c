@@ -11,3 +11,4 @@ __pycache__/
 core.*
 /tests/e2_bench_full
 /mb
+/dist

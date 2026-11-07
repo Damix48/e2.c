@@ -432,24 +432,71 @@ the pipeline, not bandwidth. Prefetching the next k-block of all four tiles
 | holding f32 accumulators over all k (round 3, 4x2 tiles) | already measured slower; the 8 int accumulator ILP is the binding constraint. |
 | `MADV_HUGEPAGE` / huge pages for the model map | confirmed irrelevant again: THP is `always` here, so the 130 MB map is already 2 MB pages. |
 
-### Measured state after round 4 (same-run, `bench_compare --repeat 2`)
+### Measured state after round 4 (same run, `--repeat 2 --iters 3`, load 6.9)
 
-See the table below; the goal is e2/ov-int8 ≤ 0.67.
+e2 / ov-int8, lower is better, **<= 0.67 is the 1.5x goal**:
+
+| task | length | e2 | ov-int8 | ratio | round 3 | start |
+|---|---:|---:|---:|---:|---:|---:|
+| text | 8 | 3.2 | 5.9 | **0.54** | 0.51 | 0.53 |
+| text | 64 | 6.5 | 9.1 | 0.72 | 0.75 | 1.05 |
+| text | 128 | 11.8 | 15.6 | 0.76 | 0.84 | 1.60 |
+| text | 512 | 45.1 | 62.2 | 0.72 | 0.76 | 1.46 |
+| text | 2048 | 248.5 | 500.4 | **0.50** | 0.49 | 1.25 |
+| batch | 8x64 | 39.1 | 49.0 | 0.80 | 0.88 | 1.47 |
+| batch | 32x64 | 191.5 | 197.6 | 0.97 | 1.11 | 2.03 |
+| image | 270 tok | 355.1 | 521.2 | **0.68** | 0.68 | 1.58 |
+| audio | 54 tok | 24.9 | 26.3 | 0.95 | 1.04 | 2.35 |
+| video | 8 frames | 1205.7 | 1702.4 | 0.71 | 0.70 | 1.33 |
+
+Absolute e2 throughput over the whole exercise: text 512 738 -> 45 ms,
+text 2048 665 -> 249, image 3.2 s -> 355 ms, audio 64 -> 25 ms,
+video 9.5 s -> 1.21 s. Every row is 1.05x-1.9x faster than OpenVINO int8;
+four of ten rows clear the 1.5x target.
+
+Accuracy re-verified with `tools/e2_acc.py` after every change:
+
+| dump | cosine |
+|---|---|
+| text `embedding` | 0.99970 (identical with and without the fused rope) |
+| text per-layer `layer1..23` | 0.9994 - 0.9999 |
+| image `image_soft` | 0.97867 (unchanged from round 3; the vision tower is chaotic under int8) |
+| audio `audio_soft` | 0.99847 (unchanged) |
+
+`e2_acc.py` reports the reference's *last* hidden-state tensor with a different
+shape than e2's (204288 vs 1838592 floats), so it now skips that pair instead
+of printing a meaningless cosine; the final `embedding` (0.99970) and
+`last_hidden_state` (0.99938) confirm the last layer is right.
 
 ### Where the remaining gap is, honestly
 
-* **Text (8..2048)** is at or past the 1.5x goal. The GEMM is 60-75% of the
-  row and now runs at the cold-cache ceiling; the rest is elementwise work that
-  is already at 100+ GB/s.
-* **batch 8x64 / 32x64** are 70% GEMM. OpenVINO does 258 GMAC in 201 ms
-  (1.28 TMAC/s); e2 does the same MACs in 123 ms (2.1 TMAC/s) — 1.64x faster at
-  the GEMM — but spends another ~55 ms on attention, norms, gelu*s and the PLE
-  multiply, so the row lands near parity. Closing it needs the *cold* GEMM at
-  3.3+ TMAC/s, i.e. within 20% of the raw `vpdpbusd` peak while streaming
-  130 MB of weights. No kernel change I measured got closer than 2.7.
-* **audio** streams ~230 MB of weights for only 50 frames. The tower is
-  weight-streaming bound at 20-25 GB/s (the machine does 50 GB/s, but that is
-  measured with 64-byte strided reads and no compute dependency).
-* **image / video** are at 0.67-0.70; the vision tower is 16 layers x
-  2394 patches = 361 GMAC, again at the cold GEMM ceiling, plus the largest
-  attention of any row (141 GMAC, all pairwise).
+* **Text 8 / 512 / 2048 and image are at the goal**, video and 128/64 are
+  within 10% of it.
+* **batch 32x64 (0.97)** is the honest miss. It is 97% GEMM at m = 2048:
+  258 GMAC in 118 ms = 2.19 TMAC/s against a *cold-weights* ceiling of ~2.4
+  (measured with `mb cold`) and a raw `vpdpbusd` ceiling of 4.0. OpenVINO
+  manages 1.28 TMAC/s on the same row, so e2 is 1.7x faster at the GEMM and
+  still only level overall: the remaining ~70 ms is attention (22),
+  `gelu*s` (16), the three norm+add passes (8.5), rope+norms (6) and the PLE
+  multiply (3) -- all measured at 55-105 GB/s, i.e. at DRAM bandwidth. The
+  row cannot reach 0.67 without the cold GEMM going from 2.2 to 3.3 TMAC/s.
+* **audio (0.95)**: 12 conformer layers plus the text encoder over 50 tokens
+  streams ~360 MB of weights. At the ~30 GB/s this kernel sustains when
+  `m <= 64` that is 12 ms of the 25, and the conformer attention (~4 ms, still
+  scalar per key) plus the depthwise conv (~2.4 ms) are the rest.
+* Nothing else is above 0.80.
+
+### What I would do next, in order
+
+1. **Interleave the packed weight tiles per k-block** so the four tile streams
+   a thread walks become one contiguous stream. The packed layout is
+   `[N/16][K/4][16][4]`, so a 4-tile group is four 8 KB-apart runs; that is
+   the difference between `m=4` streaming at 48 GB/s and `m=50` at 31 GB/s.
+   Costs a re-pack of the model file (version 2) and a rewrite of the kernel's
+   address arithmetic.
+2. **Audio conformer attention**: hoist the per-key mask/`dist` branch out of
+   the inner loop (the valid `j` range is contiguous per query) and use the
+   int8 GEMM for the 12x24 score block.
+3. **Short-sequence key blocking**: `vblk = 64` when `t <= 64` halves the
+   score tile, the softmax and the P x V step for batch 8x64 / 32x64 and audio
+   (t = 54), worth ~4% on the batch rows.

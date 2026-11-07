@@ -777,3 +777,95 @@ not by the kernel (the same shapes measure 1.3 TMAC/s in `mb cold`). The
 conformer attention is f32 by design (logit soft-cap + relative position keys)
 and its 4.7 ms is 21% of the tower; the fix would be routing it through the
 int8 attention core, which is not worth the risk at a 0.59 ratio.
+
+### GPU (Level Zero) — Intel Arc 140T
+
+Goal: run the packed-int8 GEMM on the iGPU through Level Zero. Shipped as an
+**opt-in device** (`E2_DEVICE=gpu`, or `e2_set_device(ctx, E2_DEVICE_GPU)`);
+CPU stays the default and the reference. No build dependency: `libze_loader.so.1`
+is dlopen'd and the SPIR-V module is a checked-in generated header
+(`src/e2_gpu_spv.h`, rebuilt with `make spv` from `tools/gpu/*.cl`).
+
+Files: `src/e2_gpu.c` (device/queue/weight cache/GEMM dispatch),
+`src/e2_gpu_l0.{c,h}` (dlopen loader, ~35 entry points, no `<level_zero/ze_api.h>`),
+`src/e2_gpu_spv.h` (generated), `tools/gpu/e2_gemm.cl` (kernels),
+`tools/gpu_probe.c` (`make gpu-probe`: kernel sweep, bandwidth, submission
+latency, correctness vs the CPU kernel).
+
+Correctness: GPU vs CPU embedding cosine 1.000000 (text, 32 tokens),
+0.999913 (image), 0.998829 (audio); the packed-int8 GEMM itself is exact
+(`maxerr` 1.4e-06 vs the CPU kernel, i.e. f32 epilogue rounding only).
+`make test` passes with and without `E2_DEVICE=gpu`.
+
+| probe shape | GPU 4x4 kernel | CPU 1 thread |
+|---|---:|---:|
+| m=512 k=512 n=2048 | 1.35 TMAC/s | 0.24 |
+| m=2048 k=2048 n=512 | 1.41 | 0.23 |
+| m=1024 k=768 n=768 | 1.39 | 0.24 |
+| m=266 k=768 n=768 | 1.29 | 0.24 |
+| streaming read | 80 GB/s | |
+
+Device: 128 EUs, 1024 threads, 2.35 GHz, 30.6 GB shared DDR.
+
+**The GPU path is slower than the CPU and does not ship enabled.** Measured
+e2@GPU vs e2@CPU (same run, 8 threads): text 64 71 vs 11 ms, text 512 177 vs 84,
+text 2048 653 vs 424, image 901 vs 590. The reasons are measured, not guessed:
+
+1. **Per-submission cost is 0.19 ms, and the wait is another ~0.4 ms.**
+   `gpu-probe latency` submits the same kernel 1/2/4/8 times per submission:
+   0.60 / 0.49 / 0.45 / 0.41 ms per launch. So the kernel is ~0.41 ms and each
+   *submission* adds ~0.19 ms. In situ (`E2_GPU_PROF=1`) the split per call is
+   upload 0.09 + submit 0.06 + sync 0.82 + copy 0.24 ms. The text tower makes
+   ~192 GEMM calls per forward, so dispatch alone costs 150+ ms.
+2. **The kernel is issue-bound at ~1 instruction/lane/cycle** (1.35 TMAC/s =
+   0.58 MAC/lane/cycle). It does 4 `imad` per 4-byte dot product. With `idot4`
+   it would be 4x faster, but `dot()` from `cl_khr_integer_dot_product` is
+   unusable on this stack: clang 23 lowers `dot()` to SPIR-V `OpDot` with
+   integer operands and IGC fails to build the module
+   (`undefined reference to _Z11__spirv_DotDv4_cS_`), and the signed/unsigned
+   variants that do compile compute unsigned x unsigned. A pure-ALU probe
+   kernel with `dot()` cannot even be linked, so the ceiling could not be
+   measured through OpenCL C.
+3. OpenVINO *does* reach 7.7 ms for text 128 on the same iGPU (6x its own CPU
+   number) because it compiles the whole graph and submits once per inference.
+   That is the gap: e2's CPU-driven "one submission per GEMM" cannot compete,
+   no matter how good the kernel is.
+
+What would make the GPU worth enabling (in order of value):
+* run the **whole tower** on the device (one submission per layer, or one per
+  forward) so dispatch is amortized, and keep activations resident in USM
+  (today every GEMM uploads the activation and copies the output back);
+* get `idot4` into the kernel (emit `OpSDot`/`OpUDot` directly, or a newer
+  IGC that links `__spirv_Dot`) for a 3-4x kernel speedup;
+* only then consider tuning tile shapes: `gemm_4x4` (4 rows x 4 cols per
+  work-item) beat `gemm_1x4`, `gemm_2x8`, `gemm_sg` (sub-group block read) and
+  `gemm_sg4` on every shape by 1.6-3x, so the tile is not the bottleneck.
+
+Bugs found while wiring it up (both would have shipped silently):
+* `wc_grow()` rehashed into the *old* table because `wc_slot()` closed over
+  `g->wct.tab`; heap corruption as soon as the 192nd matrix was uploaded.
+* The single-entry weight cache re-copied ~90 MB per forward; it is now an
+  open-addressing table keyed by the packed matrix pointer.
+
+### GPU benchmark (Level Zero vs OpenVINO GPU)
+
+`python tools/bench_compare.py --sources e2,ov-int8-gpu --e2-device gpu`:
+
+| task | length | e2@GPU ms | ov-int8@GPU ms | ratio |
+|---|---:|---:|---:|---:|
+| text | 8 | 4.2 (CPU path, m<32) | 5.6 | 0.75 |
+| text | 64 | 71.3 | 6.4 | 11.1 |
+| text | 128 | 79.0 | 7.7 | 10.3 |
+| text | 512 | 176.0 | 18.4 | 9.6 |
+| text | 2048 | 653.4 | 128.5 | 5.1 |
+| batch | 8x64 | 154.9 | 15.8 | 9.8 |
+| batch | 32x64 | 492.5 | 67.9 | 7.3 |
+| image | 270 tok | 900.9 | 254.5 | 3.5 |
+| audio | 54 tok | 134.9 | 22.5 | 6.0 |
+| video | 8 frames | 3174.1 | 788.5 | 4.0 |
+
+For reference, the same rows on the CPU in the same session: e2 2.7 / 11.3 /
+21 / 84 / 424 / 70 / 290 / 590 / 32 / 2015 ms and ov-int8 7.1 / 25 / 48 / 201 /
+1381 / 154 / 625 / 1478 / 57 / 5200 ms. So the iGPU is genuinely ~6x the CPU
+for OpenVINO, and e2 leaves that on the table because of the pipeline shape,
+not because of the hardware.

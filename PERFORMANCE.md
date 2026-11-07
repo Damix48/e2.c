@@ -350,3 +350,12 @@ Accuracy against the float32 HF reference (`tools/e2_acc.py`):
    (with a precomputed mask), so e2 is doing strictly more work there.
 4. `pack_vt_dims` is still scalar in the quantise step (a 4x16 byte transpose
    would give ~3x), which costs 0.6 ms/layer on the 32x64 batch row.
+
+### The pool spin count is not a knob to turn down
+
+Dropping the worker spin from 20 000 `pause` iterations to 4 000/1 000/200 makes
+text 512 go 49.5 → 127 / 130 / 117 ms (load average 6). Each dispatch that finds
+the workers asleep pays the full `nanosleep(50 us)` plus timer slack, ~1 ms on a
+loaded box, and a forward has ~50-100 dispatches. Going the other way (2 M spins)
+costs the *serial* phases instead (mel 4 → 21 ms). 20 000 is the sweet spot and
+should only be replaced by a futex wake, not a smaller number.

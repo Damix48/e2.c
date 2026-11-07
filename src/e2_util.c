@@ -56,12 +56,6 @@ void *e2_arena_alloc(e2_arena *a, size_t n) {
     return b->data;
 }
 
-void e2_arena_stat(const e2_arena *a, long *blocks, size_t *bytes) {
-    long n = 0; size_t b = 0;
-    for (e2_arena_block *x = a->head; x; x = x->next) { n++; b += x->size; }
-    *blocks = n; *bytes = b;
-}
-
 void e2_arena_reset(e2_arena *a) {
     for (e2_arena_block *b = a->head; b; b = b->next) b->used = 0;
     a->cur = a->head;
@@ -107,28 +101,38 @@ static void cpu_relax(void) {
 #endif
 }
 
-/* Pin thread tid to a physical core: one thread per core beats SMT sharing
- * for these throughput-bound kernels. */
+/* Pin thread tid.  The first pass hands out one thread per physical core
+ * (better than SMT sharing for these kernels), the second pass fills the SMT
+ * siblings so that asking for more threads than cores still gives every thread
+ * a home instead of leaving it to the scheduler. */
 static void pin_cpu(int tid) {
+    static int cpus[512], ncpu = -1;
+    if (ncpu < 0) {
+        ncpu = 0;
+        cpu_set_t all;
+        CPU_ZERO(&all);
+        if (sched_getaffinity(0, sizeof(all), &all) == 0) {
+            int nn = (int)sysconf(_SC_NPROCESSORS_ONLN);
+            /* primary hw threads first, then their siblings */
+            for (int pass = 0; pass < 2; pass++)
+                for (int c = 0; c < nn && ncpu < 512; c++) {
+                    if (!CPU_ISSET(c, &all)) continue;
+                    char path[160];
+                    int first = c;
+                    snprintf(path, sizeof(path),
+                             "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+                    FILE *f = fopen(path, "r");
+                    if (f) { if (fscanf(f, "%d", &first) != 1) first = c; fclose(f); }
+                    if ((pass == 0) == (first == c)) cpus[ncpu++] = c;
+                }
+        }
+        if (ncpu <= 0) { ncpu = 0; return; }
+    }
+    if (ncpu <= 0) return;
     cpu_set_t set;
     CPU_ZERO(&set);
-    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpu < 1) return;
-    /* CPU ids of the first thread of each core, in order */
-    int want = tid, placed = 0;
-    for (int c = 0; c < ncpu && placed <= want; c++) {
-        char path[160];
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
-        FILE *f = fopen(path, "r");
-        if (!f) return;
-        int first = -1;
-        if (fscanf(f, "%d", &first) != 1) first = c;
-        fclose(f);
-        if (first == c) {
-            if (placed == want) { CPU_SET(c, &set); pthread_setaffinity_np(pthread_self(), sizeof(set), &set); return; }
-            placed++;
-        }
-    }
+    CPU_SET(cpus[tid % ncpu], &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
 static void set_ftz_w(void) {

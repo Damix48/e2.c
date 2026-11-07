@@ -47,7 +47,7 @@ static void fft512(const float *in, float *mag) {
 
 /* Features: [T,128] float, mask [T] (1 valid), zeroed for invalid frames. */
 
-static double aud_prof[12];
+static double aud_prof[9];
 
 /* 3x3 stride-2 conv, channel-last in/out, vectorised over output channels.
  * wT is [3][3][c_in][c_out_pad] so 16 output channels are one 64-byte load.
@@ -199,19 +199,13 @@ static void audio_ff(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     const float *post = which == 0 ? L->ff1_post_norm : L->ff2_post_norm;
     /* residual + clamp, norm, two linears with SiLU */
     float *res = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
-    double _q = e2_now_ms();
     memcpy(res, x, (size_t)T * H * sizeof(float));
     e2_rmsnorm(ctx, h, x, pre, T, H, c->audio_eps);
-    double _n1 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_linear_forward(ctx, up, h, T, a);
-    double _g1 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_silu_ctx(ctx, up, T * I);
-    double _s1 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_linear_forward(ctx, h, up, T, b);
-    double _g2 = e2_now_ms() - _q; _q = e2_now_ms();
     e2_rmsnorm(ctx, h, h, post, T, H, c->audio_eps);
     for (size_t i = 0; i < (size_t)T * H; i++) x[i] = res[i] + h[i] * c->audio_residual;
-    aud_prof[9] += _n1; aud_prof[10] += _g1 + _g2; aud_prof[11] += _s1 + e2_now_ms() - _q;
 }
 
 static float softplus(float v) {
@@ -573,15 +567,7 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
                 aud_prof[0], aud_prof[1], aud_prof[2], aud_prof[3],
                 aud_prof[4], aud_prof[5], aud_prof[6], aud_prof[7], aud_prof[8],
                 e2_now_ms() - t_layers0 - t_layers, e2_now_ms() - now0);
-    if (prof)
-        fprintf(stderr, "audio detail: norms %.2f gemms %.2f silu+eps %.2f\n",
-                aud_prof[9], aud_prof[10], aud_prof[11]);
     free(feat);
     free(mask);
-    if (getenv("E2_ARENA_STAT")) {
-        long nb; size_t bytes;
-        e2_arena_stat(&ctx->scratch, &nb, &bytes);
-        fprintf(stderr, "arena: %ld blocks, %.1f MB\n", nb, bytes / 1e6);
-    }
     return 0;
 }

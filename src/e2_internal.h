@@ -96,7 +96,6 @@ typedef struct e2_tok e2_tok;
 typedef struct {
     void *map;
     size_t size;
-    int mapped;          /* 1 = mmap, 0 = malloc'd copy (freed with free) */
     e2_tensor *tensors;
     int ntensors;
     e2_meta meta;
@@ -162,7 +161,6 @@ typedef void (*e2_work_fn)(void *arg, int tid, int nthreads);
 /* arena */
 void *e2_arena_alloc(e2_arena *a, size_t n);
 void  e2_arena_reset(e2_arena *a);
-void  e2_arena_stat(const e2_arena *a, long *blocks, size_t *bytes);
 void  e2_arena_free(e2_arena *a);
 
 /* pool */

@@ -247,28 +247,106 @@ Useful debug switches: `E2_ATTN_F32=1` (f32 attention), `E2_ATTN_FUSED_SQ=1`
 
 ## Round 3 — the non-GEMM half of the forward
 
-The GEMMs are at the hardware limit (measured: a packed-int8 linear sustains
-2.5-3.3 TMAC/s on 8 cores; the raw `vpdpbusd` ceiling is ~340 GMAC/s per core).
-So every remaining win is in the 50-60% of the forward that is not a GEMM:
-attention, norms, softmax, packing and pool overhead.
+Where the ceiling is: a packed-int8 linear sustains **2.5-3.3 TMAC/s** on the 8
+cores (3.6 warm / 2.0-2.8 with cold weights); `mb peak` puts the raw
+`vpdpbusd` ceiling at ~340 GMAC/s per core, and a 300 MB read at 46 GB/s
+single-threaded / 53 GB/s with 8 threads.  A short text streams the whole
+130 MB of int8 weights per forward, so the text rows are memory-bound, not
+compute-bound, and the medium/long rows are 50-60% non-GEMM work.  Both are
+addressed below.
 
-### Wins kept (measured on the text encoder, `E2_PROFILE=1`)
+### Wins kept (measured)
 
 | change | effect |
 |---|---|
-| **all norms / l2norm / scale / add / silu / gelu run on the pool** | text 2048 "other" 75 → 43 ms, qkv-norms 16.5 → 5.0, ple_scale 6.8 → 3.7. Pool dispatch is 0.25 us, so splitting rows is always worth it above 64k elements. |
-| **PLE per-token multiply parallelised over rows** | 7.2 → 3.2 ms at 2048 |
-| **int8 attention rewritten** (`e2_attn.c`): (a) score only the key band a query block can see, (b) score tile sized to stay in L2, (c) one work item per (seq, kv head, query head, query block) with single-threaded GEMMs inside, so a layer is one dispatch instead of one per (head, block), (d) K/V packed once per (seq, kv head) into caller-owned scratch (no per-head malloc) | text 2048 attn 203 → 90 ms, total 374 → 262; text 512 attn 19 → 10, total 63 → 49; **image 583 → 362** (vision attn 294 → 99), video similar |
-| **vectorised `e2_exp_sum`/`e2_span_max`** for the attention softmax | the softmax+quantise pass was 6x the QK GEMM: 1 M scalar `fexp`/layer. Now ~1x. |
-| **`e2_pack_mat_into`** (pack into caller buffers) and a 16-row-granular pack task list | pack phase 0.23 → 0.04 ms/layer |
+| **all norms / l2norm / scale / add / silu / gelu on the pool** (dispatch costs 0.25 us) | text 2048 "other" 75 → 43 ms, qkv-norms 16.5 → 5.0, ple_scale 6.8 → 3.7; norm parallel threshold 16k elements |
+| **PLE per-token multiply parallelised** | 7.2 → 3.2 ms at 2048 |
+| **int8 attention rewritten** (`src/e2_attn.c`): score only the key band a query block can see; score tile sized to stay in L2; one item per (seq, kv head, query head, query block) with single-threaded GEMMs inside, so a layer costs 2 dispatches instead of 2 per (head, block); K/V packed once per (seq, kv head) into caller-owned scratch (no per-head malloc) | text 2048 attn 203 → 90 ms, total 374 → 250; text 512 attn 19 → 10; **image 583 → 373** (vision attn 294 → 99); video 1868 → 1163 |
+| **vectorised `e2_exp_sum`/`e2_span_max`** for the attention softmax | the softmax+quantise pass was 6x the QK GEMM (1 M scalar `fexp` per layer); now ~1x |
+| **`e2_pack_mat_into`** (pack into caller buffers) + 16-row-granular pack tasks | attention pack phase 0.23 → 0.04 ms/layer |
+| **arena reuse fix** (blocks were only ever appended, never refilled) | bounded to 82 MB for audio (was growing 40 MB per forward) |
+| **audio: parallel mel** (199 frames on the pool) | 3.9 → 0.6 ms |
+| **audio: channel-last subsample conv**, vectorised over output channels, weights transposed once, layernorm+relu over the channel axis parallelised over pixels | sub 8.3 → 1.0 ms |
+| **audio: vectorised conformer attention** (dot/axpy over D, vector tanh for the logit soft cap, item per (chunk, head)) | loop 2.6 → 0.44 ms |
+| **audio: vectorised depthwise conv + `e2_gated_silu`** | lconv 6.9 → 2.5 ms |
+| **audio total** | 42.4 → 24.9 ms (ratio 1.61 → 1.00) |
 
-### Bugs found (worth remembering)
+### Tried, measured, reverted or not kept
+
+| try | outcome |
+|---|---|
+| **f32 accumulators held across k-blocks** (4 rows x 2 tiles, 8 int + 8 f32) to remove the per-k-block output read-modify-write | **slower**: 0.67 → 0.81 ms warm, 0.93 → 1.32 cold at m=2048 k=2048 n=512. The 17% extra issue slots (1.75 vs 1.5 uops per dpbusd) cost more than the saved output traffic; the 4x4 kernel's uop ratio is the binding constraint, not the epilogue. |
+| explicit weight prefetch (`E2_GEMM_PF=4/8/16/24`) | 0-7%, inside the noise of a shared box |
+| RB 16/32/64/128 for the short-text rows | 32 marginally best (7.0 vs 7.5 ms at text 64), within noise |
+| loading the model with `malloc`+`pread`+`MADV_HUGEPAGE` instead of a file mapping (to get huge-page TLB coverage) | identical: audio 41.9 vs 41.9 ms. Bandwidth was not TLB-limited. |
+| spinning pool workers 2 M times instead of 20 k before sleeping | **much worse** for the serial phases (mel 4 → 21 ms): idle workers steal issue slots from the one doing the work even with 1:1 pinning |
+| more pool threads than physical cores (16 on 8) | 2.5x slower on AVX-512 (SMT shares the vector unit). The old pool also livelocked at 1352 ms when threads > cores because `pin_cpu` silently gave up; it now fills the SMT siblings in a second pass (32 ms). |
+
+### Bugs found while validating (all would have shipped silently)
 
 * `gemm_avx512` recomputed the tile stride from `k` instead of using
-  `w->tstride`, so every GEMM on a k-subrange (the new PV step) read the wrong
-  weight tiles. Invisible at full width.
+  `w->tstride`, so every GEMM on a k-subrange (the attention PV step) read the
+  wrong weight tiles. Invisible at full width.
 * `pack_vt_dims` had `float inv[16]` indexed to 63: the stack smash silently
-  skipped three of the four V^T dim tiles. It made only the first 16 head dims
-  correct -- the kind of bug a cosine on the *pooled* output hides.
-* The score band's right edge must be clipped to `t`, not to the padded width,
-  or the 38 padding keys of t=2394 leak into the softmax.
+  skipped three of the four V^T dim tiles, so only the first 16 head dims were
+  correct. The pooled cosine still looked fine (0.98) — only comparing each
+  layer's attention output against the f32 reference caught it.
+* the packed V^T columns past `t` were never written and the zero-point
+  correction assumes zero weights there, so a previous call's scratch leaked
+  into the result. Text after a vision tower produced NaNs.
+* the softmax upper bound for a windowed layer was clipped to the padded band
+  width instead of `t`, so the 6-124 padding keys entered the softmax whenever
+  `t % 128 != 0`. Text at 256 tokens: 0.9996, at 260: 0.55.
+
+### Measured state (same-run ratios, `bench_compare --repeat 1 --iters 3`)
+
+e2 / ov-int8, lower is better, **≤ 0.67 is the 1.5x goal**:
+
+| task | length | e2 ms | ov-int8 ms | ratio | round 2 ratio |
+|---|---:|---:|---:|---:|---:|
+| text | 8 | 3.7 | 5.8 | **0.64** | 0.60 |
+| text | 64 | 6.9 | 10.4 | **0.66** | 0.91 |
+| text | 128 | 12.9 | 15.8 | 0.82 | 1.00 |
+| text | 512 | 49.5 | 60.5 | 0.82 | 1.07 |
+| text | 2048 | 248.8 | 509.8 | **0.49** | 0.84 |
+| batch | 8x64 | 41.7 | 49.1 | 0.85 | 1.03 |
+| batch | 32x64 | 213.5 | 197.1 | 1.08 | 1.38 |
+| image | 270 tok | 372.7 | 499.0 | 0.75 | 1.22 |
+| audio | 54 tok | 24.9 | 24.9 | 1.00 | 1.66 |
+| video | 8 frames | 1162.9 | 1629.0 | 0.71 | 1.11 |
+
+The box was at load average 4.5 for this run; e2 loses ~25% under load where
+OpenVINO loses ~5% (see the note at the top), so these are pessimistic.  Run
+in the same session, e2's absolute times moved 5-15% between repetitions.
+
+Accuracy against the float32 HF reference (`tools/e2_acc.py`):
+
+| dump | cosine |
+|---|---|
+| text `embedding` at 8 / 64 / 128 / 256 / 260 / 300 / 512 tokens | 0.9997 / 0.9997 / 0.9995 / 0.9996 / 0.9996 / 0.9995 / 0.9995 |
+| text `last_hidden_state` | 0.9994 |
+| image + text embedding (end-to-end) | 0.9920 |
+| image `image_soft` | 0.9785 (unchanged; the vision tower is chaotic under int8) |
+| audio `audio_soft` | 0.9985 |
+| batch vs single text | 0.0 (bit identical) |
+
+### Where the remaining gap is
+
+1. **The short/medium text rows (0.66-0.82) are weight-streaming bound.** 130 MB
+   per forward at 7-13 ms = 10-17 GB/s, against 46-53 GB/s of DRAM. The kernel
+   is limited by memory-level parallelism: 4 weight lines in flight per thread.
+   Depth-4 prefetch recovers ~7%. The real fix is a kernel that double-buffers
+   the weight loads (8 zmm) with 2 output tiles, or 16 threads on the
+   memory-bound rows only — both measured neutral-to-worse as implemented.
+2. **batch 32x64 (1.08)** is 63% GEMM (126 ms for 258 GMAC = 2.05 TMAC/s, cold
+   weights cap at ~2.8) plus 47 ms of elementwise (rope 11, gated-mul 16,
+   qkv-norms 5). Fusing RoPE into the attention gather and the gated-mul into
+   the down-projection quantiser would remove ~16 ms of that, i.e. ~0.85.
+3. **audio (1.00)** still has 9.5 ms of ff GEMMs (10 GMAC at ~1 TMAC/s: the
+   tensors are [50, 1024/4096] so each weight is used only 50 times, and it is
+   DRAM-bound), 2.5 ms of lconv, 2.1 ms qkv. Note the comparison basis: e2's
+   audio row includes the mel front-end and the text encoder over the audio
+   tokens; the OpenVINO row is the tower's subsample + layer stack only
+   (with a precomputed mask), so e2 is doing strictly more work there.
+4. `pack_vt_dims` is still scalar in the quantise step (a 4x16 byte transpose
+   would give ~3x), which costs 0.6 ms/layer on the 32x64 batch row.

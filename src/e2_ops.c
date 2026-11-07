@@ -1020,29 +1020,10 @@ static void attn_work(void *vp, int tid, int nt) {
 }
 
 typedef struct attn_ws attn_ws;
-static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
-                     const float *v, int t, int heads, int kv_heads, int head_dim,
-                     int window, attn_ws *ws, int qstride, int kstride, int ostride);
 
-void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
-                       const float *v, int t, int heads, int kv_heads, int head_dim,
-                       int window) {
-    if (t <= 0 || heads <= 0) return;
-    static int noint8 = -1;
-    if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
-    if (!noint8 && simd() >= 2 && t >= 32) {
-        if (getenv("E2_ATTN_OLD")) {
-            if (attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window,
-                          NULL, heads * head_dim, kv_heads * head_dim,
-                          heads * head_dim) == 0)
-                return;
-        } else {
-            int off = 0;
-            if (e2_attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim,
-                             window, 1, &off) == 0)
-                return;
-        }
-    }
+static void attention_f32(e2_ctx *ctx, float *out, const float *q, const float *k,
+                          const float *v, int t, int heads, int kv_heads,
+                          int head_dim, int window) {
     int groups = heads / kv_heads;
     if (groups < 1) groups = 1;
     if (groups > 4) groups = 4;
@@ -1067,6 +1048,21 @@ void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
     else e2_parallel(ctx, attn_work, &a);
 }
 
+void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
+                       const float *v, int t, int heads, int kv_heads, int head_dim,
+                       int window) {
+    if (t <= 0 || heads <= 0) return;
+    static int noint8 = -1;
+    if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
+    if (!noint8 && simd() >= 2 && t >= 32) {
+        int off = 0;
+        if (e2_attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window,
+                         1, &off) == 0)
+            return;
+    }
+    attention_f32(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window);
+}
+
 void e2_attention_vision(e2_ctx *ctx, float *out, const float *q, const float *k,
                          const float *v, int t, int heads, int head_dim) {
     e2_attention_text(ctx, out, q, k, v, t, heads, heads, head_dim, 0);
@@ -1077,261 +1073,12 @@ void e2_attention_full(e2_ctx *ctx, float *out, const float *q, const float *k,
     e2_attention_text(ctx, out, q, k, v, t, heads, heads, head_dim, 0);
 }
 
-/* ------------------------------------------------------------------ */
-/* int8 attention: scores = Q x K^T and out = P x V^T, both through    */
-/* the packed-int8 GEMM (4x the f32 MAC rate, 1.6 dpbusd/cycle).       */
-/* ------------------------------------------------------------------ */
-
-#define ATTN_MAXR 512
-
-typedef struct {
-    int t, tpad, head_dim, heads, kv_heads, window, ablk, rows;
-    const float *q, *k, *v;
-    float *out;
-    e2_qmat kq, vq;           /* per kv head, repacked inside */
-    int8_t *kp; float *ks; int32_t *kw;
-    int8_t *vp; float *vs; int32_t *vw;
-    float *sc;                /* rows x tpad scores */
-    float *qg;                /* rows x head_dim gather buffer */
-    float *ob;                /* rows x head_dim output buffer */
-} attn8;
-
-/* mask + softmax one score row over [lo,hi), tpad-wide buffer */
-static void attn8_softmax(float *sr, int tpad, int lo, int hi) {
-    for (int j = 0; j < lo; j++) sr[j] = -INFINITY;
-    for (int j = hi; j < tpad; j++) sr[j] = -INFINITY;
-#ifdef E2_X86OPS
-    if (simd() >= 2) { softmax_exp_v(sr, tpad); return; }
-#endif
-    e2_softmax(sr, tpad);
-}
-
-#ifdef E2_X86OPS
-__attribute__((target("avx512f")))
-static inline __m512 attn8_exp16(const float *sr, int j0, __m512 vmx,
-                                 int lo, int hi) {
-    __m512i idx = _mm512_add_epi32(_mm512_set1_epi32(j0),
-                                   _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15));
-    __mmask16 m = _mm512_cmp_epi32_mask(idx, _mm512_set1_epi32(lo), _MM_CMPINT_GE) &
-                  _mm512_cmp_epi32_mask(idx, _mm512_set1_epi32(hi), _MM_CMPINT_LT);
-    __m512 e = vexp(_mm512_sub_ps(_mm512_loadu_ps(sr + j0), vmx));
-    return _mm512_maskz_mov_ps(m, e);
-}
-#endif
-
-/* Fused softmax + u8 quantisation of the PV activations: unnormalised
- * exp(x-max) with per-128-block scales, 1/sum applied after the PV GEMM.
- * Two f32 reads and one u8 write instead of five f32 passes. */
-__attribute__((target("avx512f")))
-static void attn8_sq(const float *sr, int tpad, int lo, int hi,
-                     uint8_t *q, float *xs, float *invsum) {
-#ifdef E2_X86OPS
-    if (simd() >= 2) {
-        int j = lo;
-        __m512 vm = _mm512_set1_ps(-INFINITY);
-        for (; j + 16 <= hi; j += 16) vm = _mm512_max_ps(vm, _mm512_loadu_ps(sr + j));
-        float mxf = _mm512_reduce_max_ps(vm);
-        for (; j < hi; j++) if (sr[j] > mxf) mxf = sr[j];
-        __m512 vmx = _mm512_set1_ps(mxf);
-        float sum = 0.0f;
-        int nblk = tpad / 128;
-        for (int b = 0; b < nblk; b++) {
-            int b0 = b * 128;
-            __m512 e[8];
-            __m512 bmax = _mm512_setzero_ps();
-            for (int k = 0; k < 8; k++) {
-                e[k] = attn8_exp16(sr, b0 + k * 16, vmx, lo, hi);
-                bmax = _mm512_max_ps(bmax, e[k]);
-            }
-            float emax = _mm512_reduce_max_ps(bmax);
-            float scale = emax / 127.0f;
-            if (scale < 1e-12f) scale = 1e-12f;
-            xs[b] = scale;
-            __m512 vinv = _mm512_set1_ps(1.0f / scale);
-            __m512 v128 = _mm512_set1_ps(128.0f);
-            __m512 ssum = _mm512_setzero_ps();
-            for (int k = 0; k < 8; k++) {
-                ssum = _mm512_add_ps(ssum, e[k]);
-                __m512i iv = _mm512_cvtps_epi32(_mm512_fmadd_ps(e[k], vinv, v128));
-                _mm_storeu_si128((__m128i *)(q + b0 + k * 16),
-                                 _mm512_cvtusepi32_epi8(iv));
-            }
-            sum += _mm512_reduce_add_ps(ssum);
-        }
-        *invsum = sum > 0.0f ? 1.0f / sum : 0.0f;
-        return;
-    }
-#endif
-    float mx = -INFINITY;
-    for (int j = lo; j < hi; j++) if (sr[j] > mx) mx = sr[j];
-    float sum = 0.0f;
-    int nblk = tpad / 128;
-    for (int b = 0; b < nblk; b++) {
-        int b0 = b * 128;
-        float e[128], emax = 0.0f;
-        for (int i = 0; i < 128; i++) {
-            int j = b0 + i;
-            e[i] = (j >= lo && j < hi) ? e2_fexp(sr[j] - mx) : 0.0f;
-            if (e[i] > emax) emax = e[i];
-        }
-        float scale = emax / 127.0f;
-        if (scale < 1e-12f) scale = 1e-12f;
-        xs[b] = scale;
-        float inv = 1.0f / scale;
-        for (int i = 0; i < 128; i++) {
-            long v = lrintf(e[i] * inv) + 128;
-            if (v < 0) v = 0;
-            if (v > 255) v = 255;
-            q[b0 + i] = (uint8_t)v;
-            sum += e[i];
-        }
-    }
-    *invsum = sum > 0.0f ? 1.0f / sum : 0.0f;
-}
-
-struct attn_ws {
-    float *kt;        /* kv_heads * head_dim * tpad */
-    uint8_t *xq;      /* max(t*head_dim, t*tpad) */
-    float *xs;        /* activation scales */
-    float *tmp;       /* clip scratch */
-};
-
-static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
-                     const float *v, int t, int heads, int kv_heads, int head_dim,
-                     int window, attn_ws *ws, int qstride, int kstride, int ostride) {
-    int groups = heads / kv_heads;
-    int ablk = (head_dim % 128 == 0) ? 128 : ((head_dim % 64 == 0) ? 64 : 0);
-    if (!ablk) return -1;
-    int tpad = (t + 127) & ~127;
-    int rows = t < ATTN_MAXR ? t : ATTN_MAXR;
-    if (rows < 1) return -1;
-    size_t sbytes = (size_t)rows * tpad;
-    size_t sz = sbytes * sizeof(float) + sbytes + (size_t)rows * (tpad / 128 + 1) * 4
-                + (size_t)rows * head_dim * 8 + (size_t)rows * head_dim * 4;
-    char *base = malloc(sz);
-    if (!base) return -1;
-    float *sc = (float *)base;
-    float *qf = sc + sbytes;
-    float *ob = qf + (size_t)rows * head_dim;
-    int nblk = tpad / 128;
-    int sq = 0;
-#ifdef E2_X86OPS
-    sq = simd() >= 2 && getenv("E2_ATTN_FUSED_SQ");
-#endif
-    size_t sqsz = sq ? (size_t)rows * tpad + (size_t)rows * nblk * 4
-                       + (size_t)rows * 4 : 0;
-    uint8_t *xqs = sq ? malloc(sqsz) : NULL;
-    uint8_t *sxq = xqs;
-    float *sxs = sq ? (float *)(xqs + (size_t)rows * tpad) : NULL;
-    float *sinv = sq ? sxs + (size_t)rows * nblk : NULL;
-    if (sq && !xqs) sq = 0;
-
-    /* V^T via the blocked transpose so the packer walks contiguous rows */
-    size_t ktn = (size_t)kv_heads * head_dim * tpad;
-    float *kt;
-    if (ws) {
-        kt = ws->kt;
-    } else {
-        if (ctx->ktcap < ktn) {
-            free(ctx->ktbuf);
-            ctx->ktbuf = malloc(ktn * sizeof(float));
-            ctx->ktcap = ctx->ktbuf ? ktn : 0;
-        }
-        if (!ctx->ktbuf) { free(base); return -1; }
-        kt = ctx->ktbuf;
-    }
-    memset(kt, 0, ktn * sizeof(float));
-    kt_arg ka = {v, kt, t, tpad, kv_heads, head_dim, kstride};
-    if (ws || (long)kv_heads * ((head_dim + 15) / 16) * ((t + 15) / 16) < 512)
-        kt_work(&ka, 0, 1);
-    else
-        e2_parallel(ctx, kt_work, &ka);
-
-    e2_qmat kq = {0}, vq = {0};
-    kq.n = tpad; kq.k = head_dim; kq.blk = ablk; kq.packed = 1;
-    vq.n = head_dim; vq.k = tpad; vq.blk = 128; vq.packed = 1;
-
-    for (int kh = 0; kh < kv_heads; kh++) {
-        int8_t *kq_p = NULL, *vq_p = NULL;
-        float *ksc = NULL, *vsc = NULL;
-        int32_t *kwm = NULL, *vwm = NULL;
-        int kb = ablk, vb = 128;
-        if ((ws ? e2_pack_mat(k + (size_t)kh * head_dim, t, head_dim,
-                              kstride, 1, &kq_p, &ksc, &kwm, &kb)
-                : e2_pack_mat_ctx(ctx, k + (size_t)kh * head_dim, t, head_dim,
-                                  kstride, 1, &kq_p, &ksc, &kwm, &kb))) {
-            free(base); return -1;
-        }
-        int vrc = ws ? e2_pack_mat(kt + (size_t)kh * head_dim * tpad, head_dim,
-                                   tpad, tpad, 1, &vq_p, &vsc, &vwm, &vb)
-                     : e2_pack_mat_ctx(ctx, kt + (size_t)kh * head_dim * tpad,
-                                       head_dim, tpad, tpad, 1, &vq_p, &vsc,
-                                       &vwm, &vb);
-        if (vrc) {
-            e2_pack_free(kq_p, ksc, kwm); free(base); return -1;
-        }
-        kq.q = kq_p; kq.scale = ksc; kq.wsum = kwm;
-        vq.q = vq_p; vq.scale = vsc; vq.wsum = vwm;
-        e2_linear kql = {0}, vql = {0};
-        kql.w = kq; vql.w = vq;
-        for (int g = 0; g < groups; g++) {
-            int h = kh * groups + g;
-            for (int i0 = 0; i0 < t; i0 += rows) {
-                int nq = t - i0; if (nq > rows) nq = rows;
-                /* gather q rows for this head */
-                for (int r = 0; r < nq; r++)
-                    memcpy(qf + (size_t)r * head_dim,
-                           q + (size_t)(i0 + r) * qstride + (size_t)h * head_dim,
-                           (size_t)head_dim * sizeof(float));
-                if (ws) e2_linear_forward_st(sc, qf, nq, &kql, ws->xq, ws->xs, ws->tmp);
-                else e2_linear_forward(ctx, sc, qf, nq, &kql);
-                if (sq) {
-                    for (int r = 0; r < nq; r++) {
-                        int lo_r = 0, hi_r = t;
-                        if (window > 0) {
-                            lo_r = i0 + r - window; if (lo_r < 0) lo_r = 0;
-                            hi_r = i0 + r + window + 1; if (hi_r > t) hi_r = t;
-                        }
-                        attn8_sq(sc + (size_t)r * tpad, tpad, lo_r, hi_r,
-                                 sxq + (size_t)r * tpad, sxs + (size_t)r * nblk,
-                                 sinv + r);
-                    }
-                } else {
-                    for (int r = 0; r < nq; r++) {
-                        int32_t lo_r = 0, hi_r = t;
-                        if (window > 0) {
-                            lo_r = i0 + r - window; if (lo_r < 0) lo_r = 0;
-                            hi_r = i0 + r + window + 1; if (hi_r > t) hi_r = t;
-                        }
-                        attn8_softmax(sc + (size_t)r * tpad, tpad, lo_r, hi_r);
-                    }
-                }
-                if (sq) {
-                    e2_linear_forward_pq(ws ? NULL : ctx, ob, sxq, sxs, nq, &vql);
-                    for (int r = 0; r < nq; r++) {
-                        float iv = sinv[r];
-                        float *op = ob + (size_t)r * head_dim;
-                        for (int d = 0; d < head_dim; d++) op[d] *= iv;
-                    }
-                } else if (ws) {
-                    e2_linear_forward_st(ob, sc, nq, &vql, ws->xq, ws->xs, ws->tmp);
-                } else {
-                    e2_linear_forward(ctx, ob, sc, nq, &vql);
-                }
-                for (int r = 0; r < nq; r++)
-                    memcpy(out + (size_t)(i0 + r) * ostride + (size_t)h * head_dim,
-                           ob + (size_t)r * head_dim, (size_t)head_dim * sizeof(float));
-            }
-        }
-        e2_pack_free(kq_p, ksc, kwm);
-        e2_pack_free(vq_p, vsc, vwm);
-    }
-    free(base);
-    free(xqs);
-    return 0;
-}
 
 
+
+
+/* Batched attention over `nseq` equal-length sequences: one item list covers
+ * every sequence, so a layer is still two dispatches (pack + items). */
 void e2_attention_text_multi(e2_ctx *ctx, float *out, const float *q, const float *k,
                              const float *v, int t, const int *seq_off, int nseq,
                              int heads, int kv_heads, int head_dim, int window) {
@@ -1348,4 +1095,3 @@ void e2_attention_text_multi(e2_ctx *ctx, float *out, const float *q, const floa
                           v + off * ks, t, heads, kv_heads, head_dim, window);
     }
 }
-

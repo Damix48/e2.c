@@ -91,7 +91,7 @@ def main():
             manifest["image_soft"] = save(args.out, "image_soft", soft)
             manifest["num_image_tokens"] = int(soft.shape[0])
 
-    if args.cmd in ("audio", "embed"):
+    if args.audio and args.cmd in ("audio", "embed"):
         import soundfile as sf
         from transformers import AutoProcessor
         proc = AutoProcessor.from_pretrained(args.model, local_files_only=True)

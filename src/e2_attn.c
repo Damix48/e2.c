@@ -107,6 +107,16 @@ static void pack_vt_dims(attn_job *j, const float *v, int rs, int8_t *qw,
             }
         }
     }
+    /* Columns [t, tpad) are never written, but the P x V step still contracts
+     * them (their activations are the zero point).  Left stale they add
+     * 128 * w_old * scale, i.e. whatever the previous call's scratch held, so
+     * the tail must be zeroed to make the zero-point correction exact. */
+    int j4 = (t + 3) >> 2;
+    if (j4 < tpad / 4) {
+        size_t nb = (size_t)(tpad / 4 - j4) * 64;
+        for (int dt = d0; dt < d1; dt += 16)
+            memset(qw + (size_t)(dt / 16) * ts + (size_t)j4 * 64, 0, nb);
+    }
 }
 
 static void pack_work(void *vp, int tid, int nt) {
@@ -241,7 +251,10 @@ static void attn_item(attn_job *j, attn_ws *ws, long it) {
         if (hr > width) hr = width;
         if (j->window > 0) {
             lr = pos - j->window - lo; if (lr < 0) lr = 0;
-            hr = pos + j->window + 1 - lo; if (hr > width) hr = width;
+            hr = pos + j->window + 1 - lo;
+            /* the band may be padding past t: those keys have no score */
+            if (hr > t - lo) hr = t - lo;
+            if (hr > width) hr = width;
         }
         float inv;
         band_softmax(ws->sc + (size_t)r * width, width, lr, hr, &inv);
@@ -283,6 +296,8 @@ static void item_work(void *vp, int tid, int nt) {
 int e2_attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
                  const float *v, int t, int heads, int kv_heads, int head_dim,
                  int window, int nseq, const int *seq_off) {
+    static int aprof_c = -1;
+    if (aprof_c < 0) { g_aprof = getenv("E2_ATTN_PROF") != NULL; aprof_c = g_aprof; }
     if (t <= 0 || heads <= 0 || kv_heads <= 0) return -1;
     if ((head_dim % 64) || head_dim > 512 || kv_heads > heads || (heads % kv_heads)
         || t > 8192)
@@ -379,7 +394,6 @@ int e2_attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
         ia.ws[i].uq = (uint8_t *)(base + off_uq) + (size_t)i * scstride;
     }
 
-    g_aprof = getenv("E2_ATTN_PROF") != NULL;
     int aprof = g_aprof;
     double t0 = e2_now_ms();
     if (nt > 1) e2_parallel(ctx, pack_work, j);

@@ -452,12 +452,17 @@ void e2_gelu_mul_q(e2_ctx *ctx, const float *x, const float *up, int rows, int k
     if (!blk) blk = 128;
     int nt = ctx && ctx->nthreads > 1 && (long)rows * k >= 65536 ? ctx->nthreads : 1;
     if (nt > rows) nt = rows;
-    float *tmp = malloc((size_t)nt * k * sizeof(float));
+    size_t tneed = (size_t)nt * k;
+    if (ctx && ctx->tcap < tneed * sizeof(float)) {
+        free(ctx->tbuf);
+        ctx->tbuf = malloc(tneed * sizeof(float));
+        ctx->tcap = ctx->tbuf ? tneed * sizeof(float) : 0;
+    }
+    float *tmp = ctx ? ctx->tbuf : NULL;
     if (!tmp) return;
     gmq_arg a = {x, up, q, sc, rows, k, blk, tmp};
     if (nt > 1) e2_parallel(ctx, gelu_mul_q_work, &a);
     else gelu_mul_q_work(&a, 0, 1);
-    free(tmp);
 }
 
 typedef struct { float *x; const float *up; int n, chunk; } mul_arg;

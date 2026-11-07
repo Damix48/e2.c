@@ -47,7 +47,6 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
                           const int *seq_off, const int *seq_len, int nseq,
                           float *out) {
     int prof_on = getenv("E2_PROFILE") != NULL;
-    int dump = getenv("E2_DUMP") != NULL;
     double prof[16] = {0};
     double p2[10] = {0};
     double _q = 0;
@@ -104,7 +103,9 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
         int tmax = seq_len[0];
         for (int sq = 1; sq < nseq; sq++) if (seq_len[sq] > tmax) tmax = seq_len[sq];
         float theta = ly->is_full ? c->text_rope_theta_full : c->text_rope_theta_sliding;
-        e2_rope_tab *rt = dump ? NULL : e2_rope_get(ctx, theta, hd / 2, tmax);
+        /* E2_NOFUSE=1 keeps the old norm-then-rope passes (debug aid: the
+         * l0_qpre/l0_kpre dumps only exist on that path). */
+        e2_rope_tab *rt = getenv("E2_NOFUSE") ? NULL : e2_rope_get(ctx, theta, hd / 2, tmax);
         _q = e2_now_ms();
         if (rt) {
             e2_rmsnorm_rope(ctx, q, ly->q_norm, n * c->text_heads, hd, c->text_eps,

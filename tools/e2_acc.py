@@ -102,6 +102,11 @@ def main():
         if not (os.path.exists(rp) and os.path.exists(cp)):
             continue
         a, b = load(rp), load(cp)
+        if len(a) != len(b):
+            # the reference's last hidden_states entry is a differently shaped
+            # tensor for this checkpoint, so a cosine would be meaningless
+            print(f"  {r:<22} shape {len(a)} vs {len(b)} -- skipped")
+            continue
         v = cos(a, b)
         print(f"  {r:<22} {v:.5f}" + ("   <-- LOW" if v < args.floor else ""))
         if r in ("embedding", "image_soft", "audio_soft", "vis_pool"):

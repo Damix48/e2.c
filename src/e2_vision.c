@@ -69,9 +69,11 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
         e2_vision_layer *L = &m->vl[li];
         double _tq = e2_now_ms();
         e2_rmsnorm(ctx, hb, x, L->in_norm, P, H, c->vision_eps);
-        e2_linear_forward(ctx, q, hb, P, &L->q);
-        e2_linear_forward(ctx, k, hb, P, &L->k);
-        e2_linear_forward(ctx, v, hb, P, &L->v);
+        {
+            const e2_linear *ls[3] = {&L->q, &L->k, &L->v};
+            float *ys[3] = {q, k, v};
+            e2_linear_forward_multi(ctx, hb, P, ls, ys, 3);
+        }
         e2_rmsnorm(ctx, q, q, L->q_norm, P * heads, D, c->vision_eps);
         e2_rmsnorm(ctx, k, k, L->k_norm, P * heads, D, c->vision_eps);
         e2_rmsnorm(ctx, v, v, NULL, P * heads, D, c->vision_eps);
@@ -86,10 +88,22 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
         e2_rmsnorm_add(ctx, x, tmp, L->post_attn_norm, P, H, c->vision_eps);
 
         e2_rmsnorm(ctx, hb, x, L->pre_ff_norm, P, H, c->vision_eps);
-        e2_linear_forward(ctx, tmp, hb, P, &L->gate);
-        e2_linear_forward(ctx, up, hb, P, &L->up);
-        e2_gelu_mul(ctx, tmp, up, P * I);
-        e2_linear_forward(ctx, hb, tmp, P, &L->down);
+        {
+            const e2_linear *ls[2] = {&L->gate, &L->up};
+            float *ys[2] = {tmp, up};
+            e2_linear_forward_multi(ctx, hb, P, ls, ys, 2);
+        }
+        {
+            float *gs = NULL;
+            uint8_t *gq = e2_quant_scratch(ctx, P, I, &gs);
+            if (gq) {
+                e2_gelu_mul_q(ctx, tmp, up, P, I, gq, gs, 128);
+                e2_linear_forward_pq(ctx, hb, gq, gs, P, &L->down);
+            } else {
+                e2_gelu_mul(ctx, tmp, up, P * I);
+                e2_linear_forward(ctx, hb, tmp, P, &L->down);
+            }
+        }
         e2_rmsnorm_add(ctx, x, hb, L->post_ff_norm, P, H, c->vision_eps);
         if (prof) tp[1] += e2_now_ms() - _t0;
         {

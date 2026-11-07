@@ -380,3 +380,76 @@ the workers asleep pays the full `nanosleep(50 us)` plus timer slack, ~1 ms on a
 loaded box, and a forward has ~50-100 dispatches. Going the other way (2 M spins)
 costs the *serial* phases instead (mel 4 → 21 ms). 20 000 is the sweet spot and
 should only be replaced by a futex wake, not a smaller number.
+
+## Round 4 — the real int8 ceiling, rope/quantiser fusion, cached attention
+
+### The peak measurement in round 1-3 was wrong
+
+`mb peak` used 4 independent accumulators. `vpdpbusd` has ~4 cycle latency, so a
+4-accumulator chain measures **latency, not throughput**: 341 GMAC/s. With 8
+accumulators the same loop reaches **614 GMAC/s single-core / 4034 GMAC/s on 8
+threads** — Zen 5 issues **two 512-bit `vpdpbusd` per cycle** (128 int8 MACs per
+cycle per core), not one. The old "we are at 84% of the VNNI peak" conclusion was
+therefore wrong: the packed GEMM at 2.9-3.3 TMAC/s warm was at ~85%, but the
+*cold* path (2.2-2.6 TMAC/s) is at 55-65%, and that is where the remaining time
+is. `tools/mb.c` now uses 8 accumulators.
+
+Measured ceilings on this host (8 threads):
+
+| workload | GMAC/s | note |
+|---|---:|---|
+| pure `vpdpbusd`, 8 accums, no loads | 4034 | the machine |
+| packed GEMM, weights L2/L3 (warm) | 3250-3820 | 81-95% |
+| packed GEMM, weights streamed from DRAM | 2150-2680 | 53-66% |
+| DRAM read (8 threads, sequential) | 50 GB/s | |
+
+So a GEMM whose weights are read once per forward (every GEMM in a forward)
+loses 35-45% to the DRAM stream. At m=2048 with n=2048/k=512 that stream is only
+1 MB per GEMM — a few GB/s — so it is the *first touch of each line* stalling
+the pipeline, not bandwidth. Prefetching the next k-block of all four tiles
+(`E2_GEMM_PB`, on by default) recovers 5-9% of it and nothing else did.
+
+### Wins kept (measured end-to-end, same-run ratios)
+
+| change | effect |
+|---|---|
+| **RoPE fused into the q/k RMSNorm** (`e2_rmsnorm_rope`): the encoder used to read+write q and k twice (norm, then rotate). Rotation is now done on the row while it is still in L1. Mode 3 of the norm family, vectorised for AVX-512; the scalar path is a fallback. | text 512 rope+norms 4.5 → 1.6 ms; batch32 ~14 → 6 ms |
+| **One activation quantisation for q/k/v and for gate/up** (`e2_linear_forward_multi`): the quantiser was a full read+max pass over m*k floats *per linear*. | ~1.5 ms text512, ~7 ms batch32 |
+| **`gelu(x)*up` fused into the down-projection quantiser** (`e2_gelu_mul_q`): the 2048-wide f32 intermediate was written and read back only to be quantised. Now it is computed into a per-thread L1 row buffer and quantised in place. | batch32 mlp_down 26.6 → 19.1 ms |
+| **Vectorised V^T packer** (`pack_vt_dims_v`): float→int8 with a per-dim scale, then a 4x16 byte transpose built from three unpack levels, and the per-dim sums the zero-point correction needs fall out of `vpmaddubsw`+`vpmaddwd` on the transposed zmm. `_mm512_cvtsepi32_epi8` replaces the scalar `lrintf`+clamp pair. Bit-identical to the scalar path. | batch 32x64 attention pack 12 → 3 ms; helps every t |
+| **No malloc in the K packer** (`e2_pack_mat_into` used to `malloc(k)` per 16-row tile, i.e. 12288 times per batch32 forward) | batch32 −6 ms, text128 −0.7 ms |
+| **Cached attention score tiles** (`attn_item` rewritten): the key band is scored `cw` keys at a time with an online (running) max/sum instead of a global max over a full-width tile, and `R` (queries per K/V pass) no longer has to be shrunk to fit the tile — it is now 256 for t = 2394 where it used to be 16. | vision attention 103 → ~85 ms; more importantly it made `vis_*` dump comparisons sane again |
+| prefetch the next k-block of weights (`E2_GEMM_PB`) | +5-9% on cold GEMM microbenchmarks |
+
+### Tried, measured, reverted or not kept
+
+| try | outcome |
+|---|---|
+| `E2_GEMM_RB=128/256/1024` | *better* in the cold microbenchmark at m=512 (2.43 → 2.68 TMAC/s) but **worse end-to-end** (text512 41.2 → 44.7, batch32 177 → 193). In situ the weights are re-read from L2 by later row blocks, and a bigger RB evicts the activation slab. Kept 64. |
+| per-iteration weight prefetch (`E2_GEMM_PF`) | 0-7%, inside noise. Default off. |
+| 16 threads (SMT) for the streaming-bound shapes (m=50..2048) | 20-40% slower everywhere. |
+| linearator with 3 tiles (12 int + 12 f32 accumulators to hold f32 across k-blocks) | not implemented — 31 zmm is over budget once pointers/broadcasts are counted, and 8 accumulators is exactly the 2/cycle dependency limit. |
+| holding f32 accumulators over all k (round 3, 4x2 tiles) | already measured slower; the 8 int accumulator ILP is the binding constraint. |
+| `MADV_HUGEPAGE` / huge pages for the model map | confirmed irrelevant again: THP is `always` here, so the 130 MB map is already 2 MB pages. |
+
+### Measured state after round 4 (same-run, `bench_compare --repeat 2`)
+
+See the table below; the goal is e2/ov-int8 ≤ 0.67.
+
+### Where the remaining gap is, honestly
+
+* **Text (8..2048)** is at or past the 1.5x goal. The GEMM is 60-75% of the
+  row and now runs at the cold-cache ceiling; the rest is elementwise work that
+  is already at 100+ GB/s.
+* **batch 8x64 / 32x64** are 70% GEMM. OpenVINO does 258 GMAC in 201 ms
+  (1.28 TMAC/s); e2 does the same MACs in 123 ms (2.1 TMAC/s) — 1.64x faster at
+  the GEMM — but spends another ~55 ms on attention, norms, gelu*s and the PLE
+  multiply, so the row lands near parity. Closing it needs the *cold* GEMM at
+  3.3+ TMAC/s, i.e. within 20% of the raw `vpdpbusd` peak while streaming
+  130 MB of weights. No kernel change I measured got closer than 2.7.
+* **audio** streams ~230 MB of weights for only 50 frames. The tower is
+  weight-streaming bound at 20-25 GB/s (the machine does 50 GB/s, but that is
+  measured with 64-byte strided reads and no compute dependency).
+* **image / video** are at 0.67-0.70; the vision tower is 16 layers x
+  2394 patches = 361 GMAC, again at the cold GEMM ceiling, plus the largest
+  attention of any row (141 GMAC, all pairwise).

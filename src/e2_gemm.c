@@ -119,7 +119,7 @@ static void gemm_t1(float *y, int ns, const uint8_t *xq, const float *xs,
     }
 }
 
-static int g_rb = 64, g_pf = 0;
+static int g_rb = 64, g_pf = 0, g_pb = 0;
 
 /* Fast path: 4 rows x 4 output tiles (64 columns).  24 uops per 16 vpdpbusd,
  * the minimum for a 16-accumulator budget. */
@@ -154,6 +154,19 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
                                             _mm512_mullo_epi32(v, k128));
             }
             size_t kboff = (size_t)b * (blk / 4) * 64;
+            /* The first row block of a GEMM streams the weights from DRAM and
+             * stalls on the first touch of every line; issuing the next
+             * k-block's lines up front gives them a full block of work
+             * (thousands of cycles) to arrive. */
+            if (g_pb && b + 1 < nblk) {
+                const int8_t *nb0 = wp + kboff + (size_t)(blk / 4) * 64;
+                for (int q = 0; q < blk * 16; q += 64) {
+                    _mm_prefetch((const char *)nb0 + q, _MM_HINT_T0);
+                    _mm_prefetch((const char *)(nb0 + ts) + q, _MM_HINT_T0);
+                    _mm_prefetch((const char *)(nb0 + 2 * ts) + q, _MM_HINT_T0);
+                    _mm_prefetch((const char *)(nb0 + 3 * ts) + q, _MM_HINT_T0);
+                }
+            }
             /* tile stride comes from the packed matrix: attention runs this
              * kernel on a k sub-range (the key band), so k4*64 is wrong. */
             const int8_t *wq0 = wp + kboff;
@@ -484,6 +497,8 @@ void e2_gemm_init(void) {
     if (g_rb <= 0) g_rb = 1 << 28;
     const char *pf = getenv("E2_GEMM_PF");
     if (pf) g_pf = atoi(pf);
+    const char *pb = getenv("E2_GEMM_PB");
+    if (pb) g_pb = atoi(pb);
 }
 
 /* One linear, including the input-clip path the shared-quantiser version

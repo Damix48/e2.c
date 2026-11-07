@@ -152,6 +152,8 @@ struct e2_ctx {
     e2_rope_tab ropev[2];
     int nthreads;
     e2_pool *pool;
+    int device;                 /* E2_DEVICE_CPU / E2_DEVICE_GPU */
+    void *gpu;                  /* e2_gpu state, or NULL */
     double last_ms;
     char info[256];
 };

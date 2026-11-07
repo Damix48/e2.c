@@ -1,5 +1,6 @@
 /* e2.c - public API. */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -26,11 +27,16 @@ e2_ctx *e2_load(const char *model_path, const char *tokenizer_path) {
         e2_free(ctx);
         return NULL;
     }
+    ctx->device = E2_DEVICE_CPU;
+    const char *dev = getenv("E2_DEVICE");
+    if (dev && !strcmp(dev, "gpu") && e2_gpu_init(ctx) == 0)
+        ctx->device = E2_DEVICE_GPU;
     return ctx;
 }
 
 void e2_free(e2_ctx *ctx) {
     if (!ctx) return;
+    e2_gpu_free(ctx);
     e2_pool_free(ctx);
     e2_arena_free(&ctx->scratch);
     free(ctx->qbuf);
@@ -59,6 +65,20 @@ void e2_set_threads(e2_ctx *ctx, int n) {
 }
 
 int e2_threads(const e2_ctx *ctx) { return ctx ? ctx->nthreads : 0; }
+
+int e2_set_device(e2_ctx *ctx, int device) {
+    if (!ctx) return -1;
+    if (device == E2_DEVICE_GPU) {
+        if (ctx->device == E2_DEVICE_GPU && ctx->gpu) return 0;
+        if (e2_gpu_init(ctx) != 0) return -1;
+        ctx->device = E2_DEVICE_GPU;
+        return 0;
+    }
+    ctx->device = E2_DEVICE_CPU;
+    return 0;
+}
+
+int e2_device(const e2_ctx *ctx) { return ctx ? ctx->device : E2_DEVICE_CPU; }
 
 const char *e2_model_info(const e2_ctx *ctx) { return ctx ? ctx->info : ""; }
 double e2_last_ms(const e2_ctx *ctx) { return ctx ? ctx->last_ms : 0.0; }

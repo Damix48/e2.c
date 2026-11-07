@@ -118,7 +118,11 @@ static void gemm_t1(float *y, int ns, const uint8_t *xq, const float *xs,
     }
 }
 
-static int g_rb = 64;
+/* Row block of the AVX-VNNI kernel: the f32 accumulator tile for RB rows of
+ * 16 outputs stays in L1 (RB=32 -> 2 KB) and so does the activation slab
+ * (RB x k bytes).  32 measured better than 64/128/256 once the accumulator
+ * moved out of the output buffer. */
+static int g_rb = 32;
 
 /* Fast path: 4 rows x 4 output tiles (64 columns).  24 uops per 16 vpdpbusd,
  * the minimum for a 16-accumulator budget. */

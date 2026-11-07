@@ -119,7 +119,7 @@ static void gemm_t1(float *y, int ns, const uint8_t *xq, const float *xs,
     }
 }
 
-static int g_rb = 64, g_pf = 0, g_pb = 0;
+static int g_rb = 64;
 
 /* Fast path: 4 rows x 4 output tiles (64 columns).  24 uops per 16 vpdpbusd,
  * the minimum for a 16-accumulator budget. */
@@ -154,21 +154,6 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
                                             _mm512_mullo_epi32(v, k128));
             }
             size_t kboff = (size_t)b * (blk / 4) * 64;
-            /* The first row block of a GEMM streams the weights from DRAM and
-             * stalls on the first touch of every line; issuing the next
-             * k-block's lines up front gives them a full block of work
-             * (thousands of cycles) to arrive. */
-            if (g_pb && b + 1 < nblk) {
-                const int8_t *nb0 = wp + kboff + (size_t)(blk / 4) * 64;
-                for (int q = 0; q < blk * 16; q += 64) {
-                    _mm_prefetch((const char *)nb0 + q, _MM_HINT_T0);
-                    _mm_prefetch((const char *)(nb0 + ts) + q, _MM_HINT_T0);
-                    _mm_prefetch((const char *)(nb0 + 2 * ts) + q, _MM_HINT_T0);
-                    _mm_prefetch((const char *)(nb0 + 3 * ts) + q, _MM_HINT_T0);
-                }
-            }
-            /* tile stride comes from the packed matrix: attention runs this
-             * kernel on a k sub-range (the key band), so k4*64 is wrong. */
             const int8_t *wq0 = wp + kboff;
             const int8_t *wq1 = wq0 + ts;
             const int8_t *wq2 = wq1 + ts;
@@ -181,15 +166,6 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
                 __m512i p20 = base[2], p21 = base[2], p22 = base[2], p23 = base[2];
                 __m512i p30 = base[3], p31 = base[3], p32 = base[3], p33 = base[3];
                 for (int kb = 0; kb < blk / 4; kb++) {
-                    if (g_pf) {
-                        int p = kb + g_pf;
-                        if (p < blk / 4) {
-                            _mm_prefetch((const char *)(wq0 + (size_t)p * 64), _MM_HINT_T0);
-                            _mm_prefetch((const char *)(wq1 + (size_t)p * 64), _MM_HINT_T0);
-                            _mm_prefetch((const char *)(wq2 + (size_t)p * 64), _MM_HINT_T0);
-                            _mm_prefetch((const char *)(wq3 + (size_t)p * 64), _MM_HINT_T0);
-                        }
-                    }
                     const uint8_t *a = ap + kb * 4;
                     __m512i a0 = _mm512_set1_epi32(*(const int *)(a));
                     __m512i a1 = _mm512_set1_epi32(*(const int *)(a + k));
@@ -495,10 +471,6 @@ void e2_gemm_init(void) {
     const char *rb = getenv("E2_GEMM_RB");
     if (rb) g_rb = atoi(rb);
     if (g_rb <= 0) g_rb = 1 << 28;
-    const char *pf = getenv("E2_GEMM_PF");
-    if (pf) g_pf = atoi(pf);
-    const char *pb = getenv("E2_GEMM_PB");
-    if (pb) g_pb = atoi(pb);
 }
 
 /* One linear, including the input-clip path the shared-quantiser version

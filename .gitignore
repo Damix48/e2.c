@@ -1,0 +1,10 @@
+.venv/
+models/
+__pycache__/
+*.o
+*.a
+/tests/e2_test
+/tests/e2_bench
+/e2cli
+*.bin
+!models/.gitkeep

@@ -68,13 +68,13 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
         double _t0 = e2_now_ms();
         e2_vision_layer *L = &m->vl[li];
         double _tq = e2_now_ms();
-        e2_rmsnorm(hb, x, L->in_norm, P, H, c->vision_eps);
+        e2_rmsnorm(ctx, hb, x, L->in_norm, P, H, c->vision_eps);
         e2_linear_forward(ctx, q, hb, P, &L->q);
         e2_linear_forward(ctx, k, hb, P, &L->k);
         e2_linear_forward(ctx, v, hb, P, &L->v);
-        e2_rmsnorm(q, q, L->q_norm, P * heads, D, c->vision_eps);
-        e2_rmsnorm(k, k, L->k_norm, P * heads, D, c->vision_eps);
-        e2_rmsnorm(v, v, NULL, P * heads, D, c->vision_eps);
+        e2_rmsnorm(ctx, q, q, L->q_norm, P * heads, D, c->vision_eps);
+        e2_rmsnorm(ctx, k, k, L->k_norm, P * heads, D, c->vision_eps);
+        e2_rmsnorm(ctx, v, v, NULL, P * heads, D, c->vision_eps);
         if (prof) tp[2] += e2_now_ms() - _tq;
         double _ta = e2_now_ms();
         e2_rope_vision(ctx, q, k, P, heads, D, pos, c->vision_rope_theta);
@@ -83,14 +83,14 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
         if (prof) tp[0] += e2_now_ms() - _t0;
 
         e2_linear_forward(ctx, tmp, att, P, &L->o);
-        e2_rmsnorm_add(x, tmp, L->post_attn_norm, P, H, c->vision_eps);
+        e2_rmsnorm_add(ctx, x, tmp, L->post_attn_norm, P, H, c->vision_eps);
 
-        e2_rmsnorm(hb, x, L->pre_ff_norm, P, H, c->vision_eps);
+        e2_rmsnorm(ctx, hb, x, L->pre_ff_norm, P, H, c->vision_eps);
         e2_linear_forward(ctx, tmp, hb, P, &L->gate);
         e2_linear_forward(ctx, up, hb, P, &L->up);
         e2_gelu_mul(ctx, tmp, up, P * I);
         e2_linear_forward(ctx, hb, tmp, P, &L->down);
-        e2_rmsnorm_add(x, hb, L->post_ff_norm, P, H, c->vision_eps);
+        e2_rmsnorm_add(ctx, x, hb, L->post_ff_norm, P, H, c->vision_eps);
         if (prof) tp[1] += e2_now_ms() - _t0;
         {
             char nm[32]; snprintf(nm, sizeof(nm), "vis_l%d", li + 1);
@@ -125,11 +125,12 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
 
     vdump("vis_pool", pooled, (size_t)nt * H);
     /* project to text space */
-    e2_rmsnorm(pooled, pooled, NULL, nt, H, c->vision_eps);
+    e2_rmsnorm(ctx, pooled, pooled, NULL, nt, H, c->vision_eps);
     float *soft = malloc((size_t)nt * c->text_hidden * sizeof(float));
     if (!soft) { free(pooled); free(pos); return e2_fail("oom"); }
     e2_linear le = {0}; le.w = m->vis_embed;
     e2_linear_forward(ctx, soft, pooled, nt, &le);
+    vdump("image_soft", soft, (size_t)nt * c->text_hidden);
     memcpy(out, soft, (size_t)nt * c->text_hidden * sizeof(float));
     free(soft);
     free(pooled);

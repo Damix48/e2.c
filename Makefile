@@ -75,6 +75,10 @@ tests/e2_bench: tests/e2_bench.c libe2.a $(HDR)
 tests/e2_bench_full: tests/e2_bench_full.c libe2.a $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< libe2.a $(LDFLAGS)
 
+# dev-only kernel microbenchmark (not shipped)
+mb: tools/mb.c libe2.a $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< libe2.a $(LDFLAGS)
+
 test: tests/e2_test
 	./tests/e2_test models
 
@@ -97,4 +101,4 @@ pack:
 	python tools/e2_pack.py --modalities text,image,audio,video --out models/e2-text+image+audio+video.bin --tokenizer-out models/e2-tokenizer.bin
 
 clean:
-	rm -f $(OBJ) libe2.a e2cli tests/e2_test tests/e2_bench tests/e2_bench_full
+	rm -f $(OBJ) libe2.a e2cli tests/e2_test tests/e2_bench tests/e2_bench_full mb

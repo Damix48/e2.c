@@ -384,21 +384,69 @@ static void rmsnorm_add_s(float *x, const float *src, const float *w, int rows,
     }
 }
 
-void e2_rmsnorm_pre(float *out, const float *x, const float *w, int rows, int dim,
-                    float eps, float pre) {
-    if (pre == 1.0f) { e2_rmsnorm(out, x, w, rows, dim, eps); return; }
+/* Row-split driver for the norm family.  Norms are pure streaming work, so
+ * splitting rows is enough to use every core; the dispatch costs 0.25 us. */
+typedef struct {
+    float *out; const float *x, *src, *w;
+    int rows, dim; float eps, pre; int mode;   /* 0 norm, 1 pre, 2 add */
+} norm_arg;
+
+static void norm_rows(norm_arg *a, int r0, int r1) {
+    int dim = a->dim;
+    float *out = a->out + (size_t)r0 * dim;
+    const float *x = a->x + (size_t)r0 * dim;
+    const float *src = a->src ? a->src + (size_t)r0 * dim : NULL;
+    int rows = r1 - r0;
 #ifdef E2_X86OPS
-    if (simd() >= 2) { rmsnorm_pre_v(out, x, w, rows, dim, eps, pre); return; }
+    if (simd() >= 2) {
+        if (a->mode == 1) { rmsnorm_pre_v(out, x, a->w, rows, dim, a->eps, a->pre); return; }
+        if (a->mode == 2) { rmsnorm_add_v(out, src, a->w, rows, dim, a->eps); return; }
+        rmsnorm_v(out, x, a->w, rows, dim, a->eps);
+        return;
+    }
 #endif
-    rmsnorm_pre_s(out, x, w, rows, dim, eps, pre);
+    if (a->mode == 1) { rmsnorm_pre_s(out, x, a->w, rows, dim, a->eps, a->pre); return; }
+    if (a->mode == 2) { rmsnorm_add_s(out, src, a->w, rows, dim, a->eps); return; }
+    for (int r = 0; r < rows; r++) {
+        const float *xp = x + (size_t)r * dim;
+        float *op = out + (size_t)r * dim;
+        float sum = 0.0f;
+        for (int i = 0; i < dim; i++) sum += xp[i] * xp[i];
+        float s = 1.0f / sqrtf(sum / (float)dim + a->eps);
+        if (a->w)
+            for (int i = 0; i < dim; i++) op[i] = xp[i] * s * a->w[i];
+        else
+            for (int i = 0; i < dim; i++) op[i] = xp[i] * s;
+    }
 }
 
-void e2_rmsnorm_add(float *x, const float *src, const float *w, int rows, int dim,
-                    float eps) {
-#ifdef E2_X86OPS
-    if (simd() >= 2) { rmsnorm_add_v(x, src, w, rows, dim, eps); return; }
-#endif
-    rmsnorm_add_s(x, src, w, rows, dim, eps);
+static void norm_work(void *vp, int tid, int nt) {
+    norm_arg *a = vp;
+    int r0 = (int)((long)a->rows * tid / nt);
+    int r1 = (int)((long)a->rows * (tid + 1) / nt);
+    if (r0 < r1) norm_rows(a, r0, r1);
+}
+
+static void norm_run(e2_ctx *ctx, norm_arg *a) {
+    if (!ctx || ctx->nthreads <= 1 || (long)a->rows * a->dim < 65536) {
+        norm_rows(a, 0, a->rows);
+        return;
+    }
+    int nt = ctx->nthreads;
+    if (a->rows < nt) nt = a->rows;
+    e2_parallel(ctx, norm_work, a);
+}
+
+void e2_rmsnorm_pre(e2_ctx *ctx, float *out, const float *x, const float *w,
+                    int rows, int dim, float eps, float pre) {
+    norm_arg a = {out, x, NULL, w, rows, dim, eps, pre, 1};
+    norm_run(ctx, &a);
+}
+
+void e2_rmsnorm_add(e2_ctx *ctx, float *x, const float *src, const float *w,
+                    int rows, int dim, float eps) {
+    norm_arg a = {x, x, src, w, rows, dim, eps, 1.0f, 2};
+    norm_run(ctx, &a);
 }
 
 void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n) {
@@ -418,28 +466,18 @@ void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n) {
     e2_parallel(ctx, gelu_mul_work, &a);
 }
 
-void e2_rmsnorm(float *out, const float *x, const float *w, int rows, int dim, float eps) {
-#ifdef E2_X86OPS
-    if (simd() >= 2) { rmsnorm_v(out, x, w, rows, dim, eps); return; }
-#endif
-    for (int r = 0; r < rows; r++) {
-        const float *xp = x + (size_t)r * dim;
-        float *op = out + (size_t)r * dim;
-        float sum = 0.0f;
-        for (int i = 0; i < dim; i++) sum += xp[i] * xp[i];
-        float s = 1.0f / sqrtf(sum / (float)dim + eps);
-        if (w)
-            for (int i = 0; i < dim; i++) op[i] = xp[i] * s * w[i];
-        else
-            for (int i = 0; i < dim; i++) op[i] = xp[i] * s;
-    }
+void e2_rmsnorm(e2_ctx *ctx, float *out, const float *x, const float *w, int rows,
+                int dim, float eps) {
+    norm_arg a = {out, x, NULL, w, rows, dim, eps, 1.0f, 0};
+    norm_run(ctx, &a);
 }
 
-void e2_rmsnorm_noweight(float *out, const float *x, int rows, int dim, float eps) {
-    e2_rmsnorm(out, x, NULL, rows, dim, eps);
+void e2_rmsnorm_noweight(e2_ctx *ctx, float *out, const float *x, int rows, int dim,
+                         float eps) {
+    e2_rmsnorm(ctx, out, x, NULL, rows, dim, eps);
 }
 
-void e2_l2norm_rows(float *x, int rows, int dim) {
+static void l2norm_span(float *x, int rows, int dim) {
 #ifdef E2_X86OPS
     if (simd() >= 2) { l2norm_v(x, rows, dim); return; }
 #endif
@@ -451,6 +489,68 @@ void e2_l2norm_rows(float *x, int rows, int dim) {
         for (int i = 0; i < dim; i++) p[i] *= s;
     }
 }
+
+static void l2norm_work(void *vp, int tid, int nt) {
+    norm_arg *a = vp;
+    int r0 = (int)((long)a->rows * tid / nt);
+    int r1 = (int)((long)a->rows * (tid + 1) / nt);
+    if (r0 < r1) l2norm_span(a->out + (size_t)r0 * a->dim, r1 - r0, a->dim);
+}
+
+void e2_l2norm_rows(e2_ctx *ctx, float *x, int rows, int dim) {
+    norm_arg a = {x, x, NULL, NULL, rows, dim, 0, 1.0f, 0};
+    if (!ctx || ctx->nthreads <= 1 || (long)rows * dim < 65536) {
+        l2norm_span(x, rows, dim);
+        return;
+    }
+    int nt = ctx->nthreads;
+    if (rows < nt) nt = rows;
+    e2_parallel(ctx, l2norm_work, &a);
+}
+
+/* --- parallel unary/binary elementwise ---------------------------- */
+
+typedef struct {
+    float *a; const float *b; int n, chunk, op; float k;
+} ew_arg;
+
+static void ew_span(float *a, const float *b, int n, int op, float k) {
+    switch (op) {
+    case 0: e2_add_inplace(a, b, n); break;
+    case 1: e2_vec_scale(a, n, k); break;
+    case 2: e2_silu(a, n); break;
+    default: e2_gelu_tanh(a, n); break;
+    }
+}
+
+static void ew_work(void *vp, int tid, int nt) {
+    ew_arg *e = vp;
+    int lo = tid * e->chunk;
+    if (lo >= e->n) return;
+    int hi = lo + e->chunk;
+    if (hi > e->n) hi = e->n;
+    ew_span(e->a + lo, e->b ? e->b + lo : NULL, hi - lo, e->op, e->k);
+}
+
+static void ew_run(e2_ctx *ctx, float *a, const float *b, int n, int op, float k) {
+    if (!ctx || ctx->nthreads <= 1 || n < 65536) { ew_span(a, b, n, op, k); return; }
+    int nt = ctx->nthreads;
+    if (n / 32768 < nt) nt = n / 32768;
+    if (nt < 1) nt = 1;
+    int chunk = (int)(((long)n + nt - 1) / nt);
+    chunk = (chunk + 63) & ~63;
+    ew_arg e = {a, b, n, chunk, op, k};
+    e2_parallel(ctx, ew_work, &e);
+}
+
+void e2_add_inplace_ctx(e2_ctx *ctx, float *a, const float *b, int n) {
+    ew_run(ctx, a, b, n, 0, 0.0f);
+}
+void e2_vec_scale_ctx(e2_ctx *ctx, float *x, int n, float k) {
+    ew_run(ctx, x, NULL, n, 1, k);
+}
+void e2_silu_ctx(e2_ctx *ctx, float *x, int n) { ew_run(ctx, x, NULL, n, 2, 0.0f); }
+void e2_gelu_tanh_p(e2_ctx *ctx, float *x, int n) { ew_run(ctx, x, NULL, n, 3, 0.0f); }
 
 void e2_softmax(float *x, int n) {
 #ifdef E2_X86OPS

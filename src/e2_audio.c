@@ -157,11 +157,11 @@ static void audio_ff(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     /* residual + clamp, norm, two linears with SiLU */
     float *res = e2_arena_alloc(&ctx->scratch, (size_t)T * H * sizeof(float));
     memcpy(res, x, (size_t)T * H * sizeof(float));
-    e2_rmsnorm(h, x, pre, T, H, c->audio_eps);
+    e2_rmsnorm(ctx, h, x, pre, T, H, c->audio_eps);
     e2_linear_forward(ctx, up, h, T, a);
-    e2_silu(up, T * I);
+    e2_silu_ctx(ctx, up, T * I);
     e2_linear_forward(ctx, h, up, T, b);
-    e2_rmsnorm(h, h, post, T, H, c->audio_eps);
+    e2_rmsnorm(ctx, h, h, post, T, H, c->audio_eps);
     for (size_t i = 0; i < (size_t)T * H; i++) x[i] = res[i] + h[i] * c->audio_residual;
 }
 
@@ -277,7 +277,7 @@ static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
     e2_meta *c = &ctx->m.meta;
     float *h = e2_arena_alloc(&ctx->scratch, (size_t)T * 2 * H * sizeof(float));
     if (!h) return;
-    e2_rmsnorm(h, x, L->lc_pre_norm, T, H, c->audio_eps);
+    e2_rmsnorm(ctx, h, x, L->lc_pre_norm, T, H, c->audio_eps);
     e2_linear_forward(ctx, h, h, T, &L->lc_start);   /* [T, 2H] */
     for (int t = 0; t < T; t++) {
         float *p = h + (size_t)t * 2 * H;
@@ -296,10 +296,10 @@ static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
             conv[(size_t)t * H + ch] = s;
         }
     }
-    e2_rmsnorm(conv, conv, L->lc_conv_norm, T, H, c->audio_eps);
-    e2_silu(conv, T * H);
+    e2_rmsnorm(ctx, conv, conv, L->lc_conv_norm, T, H, c->audio_eps);
+    e2_silu_ctx(ctx, conv, T * H);
     e2_linear_forward(ctx, h, conv, T, &L->lc_end);
-    e2_add_inplace(x, h, T * H);
+    e2_add_inplace_ctx(ctx, x, h, T * H);
 }
 
 /* ------------------------------------------------------------------ */
@@ -433,12 +433,12 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
         float *res = e2_arena_alloc(&ctx->scratch, (size_t)T1 * H * sizeof(float));
         float *hn = e2_arena_alloc(&ctx->scratch, (size_t)T1 * H * sizeof(float));
         memcpy(res, x, (size_t)T1 * H * sizeof(float));
-        e2_rmsnorm(hn, x, L->pre_attn_norm, T1, H, c->audio_eps);
+        e2_rmsnorm(ctx, hn, x, L->pre_attn_norm, T1, H, c->audio_eps);
         _l0 = e2_now_ms();
         audio_attention(ctx, L, hn, T1, m1, H, heads, D, pe, pos_len);
         aud_prof[1] += e2_now_ms() - _l0;
-        e2_rmsnorm(hn, hn, L->post_attn_norm, T1, H, c->audio_eps);
-        e2_add_inplace(res, hn, T1 * H);
+        e2_rmsnorm(ctx, hn, hn, L->post_attn_norm, T1, H, c->audio_eps);
+        e2_add_inplace_ctx(ctx, res, hn, T1 * H);
         memcpy(x, res, (size_t)T1 * H * sizeof(float));
         _l0 = e2_now_ms();
         audio_lconv(ctx, L, x, T1, H, K);
@@ -446,7 +446,7 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
         _l0 = e2_now_ms();
         audio_ff(ctx, L, x, T1, 1, H, I);
         aud_prof[3] += e2_now_ms() - _l0;
-        e2_rmsnorm(x, x, L->norm_out, T1, H, c->audio_eps);
+        e2_rmsnorm(ctx, x, x, L->norm_out, T1, H, c->audio_eps);
         char nm[32]; snprintf(nm, sizeof(nm), "aud_l%d", li + 1);
         adump(nm, x, (size_t)T1 * H);
     }
@@ -459,9 +459,10 @@ int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *
     e2_linear lout = {0}; lout.w = m->aud_out_proj;
     e2_linear_forward(ctx, aout, x, T1, &lout);
     adump("aud_out", aout, (size_t)T1 * c->audio_output_dim);
-    e2_rmsnorm(aout, aout, NULL, T1, c->audio_output_dim, c->audio_eps);
+    e2_rmsnorm(ctx, aout, aout, NULL, T1, c->audio_output_dim, c->audio_eps);
     e2_linear lemb = {0}; lemb.w = m->aud_embed;
     e2_linear_forward(ctx, soft, aout, T1, &lemb);
+    adump("aud_soft", soft, (size_t)T1 * c->text_hidden);
 
     int cnt = 0;
     for (int t = 0; t < T1; t++)

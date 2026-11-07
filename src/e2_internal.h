@@ -197,18 +197,24 @@ void e2_gemm_nt_f32(float *y, const float *x, const float *w, int m, int k, int 
 void e2_dequant_row(const e2_qmat *w, int row, float *out);
 
 /* ops */
-void e2_rmsnorm(float *out, const float *x, const float *w, int rows, int dim, float eps);
-void e2_rmsnorm_pre(float *out, const float *x, const float *w, int rows, int dim,
-                    float eps, float pre);
-void e2_rmsnorm_add(float *x, const float *src, const float *w, int rows, int dim,
-                    float eps);
+void e2_rmsnorm(e2_ctx *ctx, float *out, const float *x, const float *w, int rows,
+                int dim, float eps);
+void e2_rmsnorm_pre(e2_ctx *ctx, float *out, const float *x, const float *w, int rows,
+                    int dim, float eps, float pre);
+void e2_rmsnorm_add(e2_ctx *ctx, float *x, const float *src, const float *w, int rows,
+                    int dim, float eps);
 void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n);
-void e2_rmsnorm_noweight(float *out, const float *x, int rows, int dim, float eps);
+void e2_rmsnorm_noweight(e2_ctx *ctx, float *out, const float *x, int rows, int dim,
+                         float eps);
 void e2_gelu_tanh(float *x, int n);
 void e2_gelu_tanh_ctx(e2_ctx *ctx, float *x, int n);
 void e2_silu(float *x, int n);
 void e2_add_inplace(float *a, const float *b, int n);
-void e2_l2norm_rows(float *x, int rows, int dim);
+void e2_add_inplace_ctx(e2_ctx *ctx, float *a, const float *b, int n);
+void e2_vec_scale_ctx(e2_ctx *ctx, float *x, int n, float k);
+void e2_silu_ctx(e2_ctx *ctx, float *x, int n);
+void e2_gelu_tanh_p(e2_ctx *ctx, float *x, int n);
+void e2_l2norm_rows(e2_ctx *ctx, float *x, int rows, int dim);
 void e2_softmax(float *x, int n);
 void e2_rope_free(e2_ctx *ctx);
 void e2_vec_scale(float *x, int n, float k);

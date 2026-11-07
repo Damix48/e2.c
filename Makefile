@@ -39,8 +39,8 @@ LDFLAGS += $(shell pkg-config --libs sndfile)
 endif
 
 SRC := src/e2.c src/e2_model.c src/e2_util.c src/e2_gemm.c src/e2_ops.c \
-       src/e2_text.c src/e2_tokenizer.c src/e2_image.c src/e2_vision.c \
-       src/e2_audio.c src/e2_audio_file.c src/e2_multimodal.c
+       src/e2_attn.c src/e2_text.c src/e2_tokenizer.c src/e2_image.c \
+       src/e2_vision.c src/e2_audio.c src/e2_audio_file.c src/e2_multimodal.c
 OBJ := $(SRC:.c=.o)
 HDR := e2.h src/e2_internal.h
 

@@ -244,3 +244,31 @@ python tools/bench_compare.py --sources e2,ov-int8 --repeat 2 --json /tmp/bench.
 Useful debug switches: `E2_ATTN_F32=1` (f32 attention), `E2_ATTN_FUSED_SQ=1`
 (fused softmax+quant experiment), `E2_GEMM_RB=N`, `E2_GEMM_PF=N`,
 `E2_PACK_SCALAR=1`, `E2_KERNEL=scalar|avx2|avx512`, `E2_PROFILE=1`.
+
+## Round 3 — the non-GEMM half of the forward
+
+The GEMMs are at the hardware limit (measured: a packed-int8 linear sustains
+2.5-3.3 TMAC/s on 8 cores; the raw `vpdpbusd` ceiling is ~340 GMAC/s per core).
+So every remaining win is in the 50-60% of the forward that is not a GEMM:
+attention, norms, softmax, packing and pool overhead.
+
+### Wins kept (measured on the text encoder, `E2_PROFILE=1`)
+
+| change | effect |
+|---|---|
+| **all norms / l2norm / scale / add / silu / gelu run on the pool** | text 2048 "other" 75 → 43 ms, qkv-norms 16.5 → 5.0, ple_scale 6.8 → 3.7. Pool dispatch is 0.25 us, so splitting rows is always worth it above 64k elements. |
+| **PLE per-token multiply parallelised over rows** | 7.2 → 3.2 ms at 2048 |
+| **int8 attention rewritten** (`e2_attn.c`): (a) score only the key band a query block can see, (b) score tile sized to stay in L2, (c) one work item per (seq, kv head, query head, query block) with single-threaded GEMMs inside, so a layer is one dispatch instead of one per (head, block), (d) K/V packed once per (seq, kv head) into caller-owned scratch (no per-head malloc) | text 2048 attn 203 → 90 ms, total 374 → 262; text 512 attn 19 → 10, total 63 → 49; **image 583 → 362** (vision attn 294 → 99), video similar |
+| **vectorised `e2_exp_sum`/`e2_span_max`** for the attention softmax | the softmax+quantise pass was 6x the QK GEMM: 1 M scalar `fexp`/layer. Now ~1x. |
+| **`e2_pack_mat_into`** (pack into caller buffers) and a 16-row-granular pack task list | pack phase 0.23 → 0.04 ms/layer |
+
+### Bugs found (worth remembering)
+
+* `gemm_avx512` recomputed the tile stride from `k` instead of using
+  `w->tstride`, so every GEMM on a k-subrange (the new PV step) read the wrong
+  weight tiles. Invisible at full width.
+* `pack_vt_dims` had `float inv[16]` indexed to 63: the stack smash silently
+  skipped three of the four V^T dim tiles. It made only the first 16 head dims
+  correct -- the kind of bug a cosine on the *pooled* output hides.
+* The score band's right edge must be clipped to `t`, not to the padded width,
+  or the 38 padding keys of t=2394 leak into the softmax.

@@ -154,11 +154,12 @@ static void gemm_avx512(float *y, int ns, const uint8_t *xq, const float *xs,
                                             _mm512_mullo_epi32(v, k128));
             }
             size_t kboff = (size_t)b * (blk / 4) * 64;
-            size_t tstride = (size_t)k4 * 64;
+            /* tile stride comes from the packed matrix: attention runs this
+             * kernel on a k sub-range (the key band), so k4*64 is wrong. */
             const int8_t *wq0 = wp + kboff;
-            const int8_t *wq1 = wq0 + tstride;
-            const int8_t *wq2 = wq1 + tstride;
-            const int8_t *wq3 = wq2 + tstride;
+            const int8_t *wq1 = wq0 + ts;
+            const int8_t *wq2 = wq1 + ts;
+            const int8_t *wq3 = wq2 + ts;
             for (int r0 = rb; r0 < rend; r0 += 4) {
                 int mm = rend - r0; if (mm > 4) mm = 4;
                 const uint8_t *ap = xq + (size_t)r0 * k + (size_t)b * blk;
@@ -616,6 +617,19 @@ void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
         e2_parallel(ctx, gemm_work, &a);
 }
 
+/* Single-threaded GEMM over an output-tile range [nb0, nb1).  Attention uses
+ * this to score only the key band a query block can see, and to contract only
+ * that band in the P x V step.  Tile nb0 lands on column 0, so the caller's
+ * buffer describes just the band. */
+void e2_gemm_range(float *y, int ns, const uint8_t *xq, const float *xs, int xss,
+                   int m, int k, const e2_qmat *w, int nb0, int nb1) {
+    e2_gemm_init();
+    if (nb0 < 0) nb0 = 0;
+    if (nb1 > (w->n + 15) / 16) nb1 = (w->n + 15) / 16;
+    if (nb0 >= nb1 || m <= 0) return;
+    g_kernel(y - (size_t)nb0 * 16, ns, xq, xs, xss, m, k, w, nb0, nb1);
+}
+
 /* f32 helpers (debug) */
 void e2_gemm_nt_f32(float *y, const float *x, const float *w, int m, int k, int n) {
     for (int r = 0; r < m; r++)
@@ -741,6 +755,29 @@ static void pack_work(void *vp, int tid, int nt) {
     pack_rows_s(j->a, r0, r1);
 }
 
+/* Pack into caller-owned buffers (qw zeroed for the tile padding by the
+ * caller, or by a previous call -- the padding rows are multiplied by a
+ * masked-zero activation, so their contents never reach the output). */
+int e2_pack_mat_into(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
+                     int8_t *qw, float *sc, int32_t *ws, int *blk_out) {
+    int blk = *blk_out ? *blk_out : BLK;
+    if ((k % blk) || (k % 4)) return -1;
+    int nbuf = (ctx && ctx->nthreads > 1 && (long)n * k >= 65536) ? ctx->nthreads : 1;
+    int8_t *rowbuf = malloc((size_t)k * nbuf);
+    if (!rowbuf) return -1;
+    pack_arg a = {w, n, k, rs, cs, blk, qw, sc, ws};
+    int fast = (cs == 1 && (k % 16) == 0 && (blk % 16) == 0 && !getenv("E2_PACK_SCALAR"));
+    int ntile = (n + 15) / 16;
+    pack_job j = {&a, fast, ntile * 16, rowbuf};
+    if (nbuf > 1)
+        e2_parallel(ctx, pack_work, &j);
+    else
+        pack_work(&j, 0, 1);
+    free(rowbuf);
+    *blk_out = blk;
+    return 0;
+}
+
 static int pack_mat(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
                     int8_t **q, float **scale, int32_t **wsum, int *blk_out) {
     int blk = *blk_out ? *blk_out : BLK;
@@ -749,20 +786,10 @@ static int pack_mat(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
     int8_t *qw = calloc((size_t)ntile * k4 * 64 + 64, 1);
     float *sc = malloc((size_t)ntile * 16 * sizeof(float));
     int32_t *ws = calloc((size_t)ntile * 16 * nblk, sizeof(int32_t));
-    int nbuf = (ctx && ctx->nthreads > 1 && (long)n * k >= 65536) ? ctx->nthreads : 1;
-    int8_t *rowbuf = malloc((size_t)k * nbuf);
-    if (!qw || !sc || !ws || !rowbuf) {
-        free(qw); free(sc); free(ws); free(rowbuf); return -1;
+    if (!qw || !sc || !ws ||
+        e2_pack_mat_into(ctx, w, n, k, rs, cs, qw, sc, ws, &blk) != 0) {
+        free(qw); free(sc); free(ws); return -1;
     }
-    pack_arg a = {w, n, k, rs, cs, blk, qw, sc, ws};
-    int fast = (cs == 1 && (k % 16) == 0 && (blk % 16) == 0 && !getenv("E2_PACK_SCALAR"));
-    pack_job j = {&a, fast, ntile * 16, rowbuf};
-    long work = (long)n * k;
-    if (ctx && ctx->nthreads > 1 && work >= 65536)
-        e2_parallel(ctx, pack_work, &j);
-    else
-        pack_work(&j, 0, 1);
-    free(rowbuf);
     free(*q); free(*scale); free(*wsum);
     *q = qw; *scale = sc; *wsum = ws;
     *blk_out = blk;

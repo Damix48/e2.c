@@ -147,6 +147,7 @@ struct e2_ctx {
     float *sbuf; size_t scap;
     float *tbuf; size_t tcap;
     float *ktbuf; size_t ktcap;   /* transposed K for attention */
+    void *abuf; size_t acap;      /* int8 attention scratch */
     e2_rope_tab rope[2];
     e2_rope_tab ropev[2];
     int nthreads;
@@ -192,6 +193,10 @@ void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
                           uint8_t *xq, float *xs, float *tmp);
 void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
                           const float *xs, int m, const e2_linear *l);
+void e2_gemm_range(float *y, int ns, const uint8_t *xq, const float *xs, int xss,
+                   int m, int k, const e2_qmat *w, int nb0, int nb1);
+int  e2_pack_mat_into(e2_ctx *ctx, const float *w, int n, int k, int rs, int cs,
+                      int8_t *q, float *scale, int32_t *wsum, int *blk_out);
 void e2_gemm_f32(float *y, const float *x, const float *w, int m, int k, int n);
 void e2_gemm_nt_f32(float *y, const float *x, const float *w, int m, int k, int n);
 void e2_dequant_row(const e2_qmat *w, int row, float *out);
@@ -216,6 +221,8 @@ void e2_silu_ctx(e2_ctx *ctx, float *x, int n);
 void e2_gelu_tanh_p(e2_ctx *ctx, float *x, int n);
 void e2_l2norm_rows(e2_ctx *ctx, float *x, int rows, int dim);
 void e2_softmax(float *x, int n);
+float e2_span_max(const float *x, int n);
+float e2_exp_sum(float *x, int n, float mx);
 void e2_rope_free(e2_ctx *ctx);
 void e2_vec_scale(float *x, int n, float k);
 void e2_rope_text(e2_ctx *ctx, float *q, float *k, int t, int heads, int kv_heads,
@@ -232,6 +239,11 @@ void e2_attention_vision(e2_ctx *ctx, float *out, const float *q, const float *k
                          const float *v, int t, int heads, int head_dim);
 void e2_attention_full(e2_ctx *ctx, float *out, const float *q, const float *k,
                        const float *v, int t, int heads, int head_dim);
+/* int8 attention core (e2_attn.c): returns nonzero if it cannot handle the
+ * shape, in which case the caller falls back to the f32 kernel. */
+int  e2_attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
+                  const float *v, int t, int heads, int kv_heads, int head_dim,
+                  int window, int nseq, const int *seq_off);
 int  e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *out_tokens);
 int  e2_text_forward(e2_ctx *ctx, const int *ids, int n, float *last768);
 int  e2_text_forward_embeds(e2_ctx *ctx, const float *emb, int n, float *last768);

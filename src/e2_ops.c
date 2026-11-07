@@ -180,27 +180,11 @@ static void add_v(float *a, const float *b, int n) {
 }
 
 /* Softmax over n scores: exp + normalise, vectorised. */
-__attribute__((target("avx512f")))
 static void softmax_exp_v(float *sc, int n) {
-    float mx = -INFINITY;
-    int i = 0;
-    __m512 vm = _mm512_set1_ps(-INFINITY);
-    for (; i + 16 <= n; i += 16) vm = _mm512_max_ps(vm, _mm512_loadu_ps(sc + i));
-    mx = _mm512_reduce_max_ps(vm);
-    for (; i < n; i++) if (sc[i] > mx) mx = sc[i];
-    __m512 vmx = _mm512_set1_ps(mx);
-    __m512 vs = _mm512_setzero_ps();
-    for (i = 0; i + 16 <= n; i += 16) {
-        __m512 e = vexp(_mm512_sub_ps(_mm512_loadu_ps(sc + i), vmx));
-        _mm512_storeu_ps(sc + i, e);
-        vs = _mm512_add_ps(vs, e);
-    }
-    float sum = _mm512_reduce_add_ps(vs);
-    for (; i < n; i++) { sc[i] = e2_fexp(sc[i] - mx); sum += sc[i]; }
-    __m512 vinv = _mm512_set1_ps(1.0f / sum);
-    for (i = 0; i + 16 <= n; i += 16)
-        _mm512_storeu_ps(sc + i, _mm512_mul_ps(_mm512_loadu_ps(sc + i), vinv));
-    for (; i < n; i++) sc[i] = sc[i] / sum;
+    float mx = e2_span_max(sc, n);
+    float sum = e2_exp_sum(sc, n, mx);
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) sc[i] *= inv;
 }
 #endif
 
@@ -214,6 +198,52 @@ static int simd_pick(void) {
 }
 static int g_simd = -1;
 static inline int simd(void) { if (g_simd < 0) g_simd = simd_pick(); return g_simd; }
+
+#ifdef E2_X86OPS
+__attribute__((target("avx512f")))
+static float span_max_v(const float *x, int n) {
+    int i = 0;
+    __m512 vm = _mm512_set1_ps(-INFINITY);
+    for (; i + 16 <= n; i += 16) vm = _mm512_max_ps(vm, _mm512_loadu_ps(x + i));
+    float mx = _mm512_reduce_max_ps(vm);
+    for (; i < n; i++) if (x[i] > mx) mx = x[i];
+    return mx;
+}
+
+__attribute__((target("avx512f")))
+static float exp_sum_v(float *x, int n, float mx) {
+    int i = 0;
+    __m512 vmx = _mm512_set1_ps(mx), vs = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m512 e = vexp(_mm512_sub_ps(_mm512_loadu_ps(x + i), vmx));
+        _mm512_storeu_ps(x + i, e);
+        vs = _mm512_add_ps(vs, e);
+    }
+    float sum = _mm512_reduce_add_ps(vs);
+    for (; i < n; i++) { x[i] = e2_fexp(x[i] - mx); sum += x[i]; }
+    return sum;
+}
+#endif
+
+/* max and exp(x-mx) over a span; the attention softmax needs both without the
+ * normalisation (it folds 1/sum into the P x V epilogue). */
+float e2_span_max(const float *x, int n) {
+#ifdef E2_X86OPS
+    if (simd() >= 2) return span_max_v(x, n);
+#endif
+    float mx = -INFINITY;
+    for (int i = 0; i < n; i++) if (x[i] > mx) mx = x[i];
+    return mx;
+}
+
+float e2_exp_sum(float *x, int n, float mx) {
+#ifdef E2_X86OPS
+    if (simd() >= 2) return exp_sum_v(x, n, mx);
+#endif
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = e2_fexp(x[i] - mx); sum += x[i]; }
+    return sum;
+}
 
 void e2_gelu_tanh(float *x, int n) {
 #ifdef E2_X86OPS
@@ -952,16 +982,21 @@ void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
                        const float *v, int t, int heads, int kv_heads, int head_dim,
                        int window) {
     if (t <= 0 || heads <= 0) return;
-#ifdef E2_X86OPS
-    if (simd() >= 2 && t >= 32) {
-        static int noint8 = -1;
-        if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
-        if (!noint8 && attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim,
-                                 window, NULL, heads * head_dim, kv_heads * head_dim,
-                                 heads * head_dim) == 0)
-            return;
+    static int noint8 = -1;
+    if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
+    if (!noint8 && simd() >= 2 && t >= 32) {
+        if (getenv("E2_ATTN_OLD")) {
+            if (attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window,
+                          NULL, heads * head_dim, kv_heads * head_dim,
+                          heads * head_dim) == 0)
+                return;
+        } else {
+            int off = 0;
+            if (e2_attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim,
+                             window, 1, &off) == 0)
+                return;
+        }
     }
-#endif
     int groups = heads / kv_heads;
     if (groups < 1) groups = 1;
     if (groups > 4) groups = 4;
@@ -1251,85 +1286,20 @@ static int attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
 }
 
 
-/* Batched short-sequence int8 attention: one work item per sequence.  A
- * separate e2_parallel per (head, group, block) costs more than the actual
- * 64-token attention, so the batch path runs each sequence on one worker. */
-typedef struct {
-    float *out; const float *q, *k, *v;
-    int t, heads, kv_heads, head_dim, window, nseq;
-    const int *seq_off;
-    attn_ws *ws;
-    int err;
-} attn_multi_arg;
-
-static void attn_multi_work(void *vp, int tid, int nt) {
-    attn_multi_arg *a = vp;
-    size_t qs = (size_t)a->heads * a->head_dim;
-    size_t ks = (size_t)a->kv_heads * a->head_dim;
-    for (int s = tid; s < a->nseq; s += nt) {
-        size_t off = (size_t)a->seq_off[s];
-        if (attn_int8(NULL, a->out + off * qs, a->q + off * qs, a->k + off * ks,
-                      a->v + off * ks, a->t, a->heads, a->kv_heads, a->head_dim,
-                      a->window, &a->ws[tid], (int)qs, (int)ks, (int)qs) != 0) {
-            a->err = 1;
-            return;
-        }
-    }
-}
-
 void e2_attention_text_multi(e2_ctx *ctx, float *out, const float *q, const float *k,
                              const float *v, int t, const int *seq_off, int nseq,
                              int heads, int kv_heads, int head_dim, int window) {
     size_t qs = (size_t)heads * head_dim, ks = (size_t)kv_heads * head_dim;
     static int noint8 = -1;
     if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
-    if (nseq <= 1 || t < 32 || t > 256 || noint8 || simd() < 2 ||
-        (head_dim % 64) != 0) {
-        for (int s = 0; s < nseq; s++) {
-            size_t off = (size_t)seq_off[s];
-            e2_attention_text(ctx, out + off * qs, q + off * qs, k + off * ks,
-                              v + off * ks, t, heads, kv_heads, head_dim, window);
-        }
+    if (!noint8 && nseq > 1 && t >= 16 && simd() >= 2 &&
+        e2_attn_int8(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window,
+                     nseq, seq_off) == 0)
         return;
+    for (int s = 0; s < nseq; s++) {
+        size_t off = (size_t)seq_off[s];
+        e2_attention_text(ctx, out + off * qs, q + off * qs, k + off * ks,
+                          v + off * ks, t, heads, kv_heads, head_dim, window);
     }
-    int nt = ctx->nthreads;
-    int tpad = (t + 127) & ~127;
-    int ablk = (head_dim % 128 == 0) ? 128 : 64;
-    size_t ktn = (size_t)kv_heads * head_dim * tpad;
-    size_t qcap = (size_t)t * (head_dim > tpad ? head_dim : tpad);
-    size_t sblk = (size_t)(head_dim / ablk);
-    size_t pblk = (size_t)(tpad / 128);
-    size_t scap = (size_t)t * (sblk > pblk ? sblk : pblk);
-    attn_ws *ws = calloc((size_t)nt, sizeof(*ws));
-    float *kt = malloc(ktn * sizeof(float) * nt);
-    uint8_t *xq = malloc(qcap * nt);
-    float *xs = malloc(scap * sizeof(float) * nt);
-    float *tmp = malloc(qcap * sizeof(float) * nt);
-    if (!ws || !kt || !xq || !xs || !tmp) {
-        free(ws); free(kt); free(xq); free(xs); free(tmp);
-        for (int s = 0; s < nseq; s++) {
-            size_t off = (size_t)seq_off[s];
-            e2_attention_text(ctx, out + off * qs, q + off * qs, k + off * ks,
-                              v + off * ks, t, heads, kv_heads, head_dim, window);
-        }
-        return;
-    }
-    for (int i = 0; i < nt; i++) {
-        ws[i].kt = kt + ktn * i;
-        ws[i].xq = xq + qcap * i;
-        ws[i].xs = xs + scap * i;
-        ws[i].tmp = tmp + qcap * i;
-    }
-    attn_multi_arg a = {out, q, k, v, t, heads, kv_heads, head_dim, window, nseq,
-                        seq_off, ws, 0};
-    e2_parallel(ctx, attn_multi_work, &a);
-    if (a.err) {
-        for (int s = 0; s < nseq; s++) {
-            size_t off = (size_t)seq_off[s];
-            e2_attention_text(ctx, out + off * qs, q + off * qs, k + off * ks,
-                              v + off * ks, t, heads, kv_heads, head_dim, window);
-        }
-    }
-    free(ws); free(kt); free(xq); free(xs); free(tmp);
 }
 

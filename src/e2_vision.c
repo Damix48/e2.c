@@ -78,7 +78,14 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
         if (prof) tp[2] += e2_now_ms() - _tq;
         double _ta = e2_now_ms();
         e2_rope_vision(ctx, q, k, P, heads, D, pos, c->vision_rope_theta);
+        if (li == 0 && getenv("E2_DUMP_ATT")) {
+            vdump("vatt_q", q, (size_t)P * heads * D);
+            vdump("vatt_k", k, (size_t)P * heads * D);
+            vdump("vatt_v", v, (size_t)P * heads * D);
+        }
         e2_attention_vision(ctx, att, q, k, v, P, heads, D);
+        if (li == 0 && getenv("E2_DUMP_ATT")) vdump("vatt_out", att, (size_t)P * heads * D);
+        vdump("vis_att", att, (size_t)P * heads * D);
         if (prof) tp[3] += e2_now_ms() - _ta;
         if (prof) tp[0] += e2_now_ms() - _t0;
 

@@ -37,6 +37,7 @@ void e2_free(e2_ctx *ctx) {
     free(ctx->sbuf);
     free(ctx->tbuf);
     free(ctx->ktbuf);
+    free(ctx->abuf);
     e2_rope_free(ctx);
     e2_model *m = &ctx->m;
     e2_tok_free(m->tok);

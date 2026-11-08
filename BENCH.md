@@ -56,7 +56,7 @@ per-128-block activation scales, so each tensor matches the CPU int8 kernel
 | text | 64 | 20.3 | 35.3 | 7.0 |
 | text | 128 | 33.0 | 61.5 | 9.2 |
 | text | 512 | 118.2 | 534.6 | 20.4 |
-| text | 2048 | 574.1 | 6662.5 | 140.4 |
+| text | 2048 | 1082 | 14800 | 140.4 |
 | image | 270 tok | 640.8 | 2998.1 | 258 |
 | audio | 54 tok | 32.7 | 69.3 | 23.0 |
 | video | 8 frames | 2202.8 | 7635.2 | 792 |

@@ -1152,7 +1152,8 @@ Every attempt, kept or reverted, with the number that decided it.
 | 11 | `k_gemm_dpas_blk`: per-128-block scales, RB=2 x CT=2, int+float8 accumulators | **cos 1.0000000, maxerr 9.5e-07** vs `e2_gemm_range`. 32+32 registers, no spill | **kept** (accuracy path, now the default) |
 | 12 | `E2_GPU_NOBARRIER`, `E2_GPU_TS`, `E2_GPU_SKIP`, `E2_GPU_PROF` knobs | they turned three guesses into measurements; `E2_GPU_TS` writes a device timestamp before every kernel | **kept** (debug only) |
 | 13 | audio tower on the device | its convolutions and attention are still inline CPU code, so deferred buffers were read half-written (cos 0.00). Now explicitly CPU-only (`e2_gpu_no_dev`) | reverted |
-| 14 | vision tower on the device | works, exact per tensor (vis_in cos 1.0000000) but the known chaotic amplification of the vision tower turns the f32-vs-int8 attention difference into 0.988 by layer 16 | kept, accuracy documented |
+| 14 | replace `sub_group_reduce_add` with 5 explicit `sub_group_shuffle_xor` steps in attention | 14.69 s vs 14.74 s at 2048 tokens: the collective is *not* what is slow (it does make IGC retry the compilation, so the kernel still compiles both ways) | no |
+| 15 | vision tower on the device | works, exact per tensor (vis_in cos 1.0000000) but the known chaotic amplification of the vision tower turns the f32-vs-int8 attention difference into 0.988 by layer 16 | kept, accuracy documented |
 
 ## Where the device time actually goes
 
@@ -1173,7 +1174,14 @@ per-kernel time summed over one forward:
 
 Three conclusions, all measured rather than guessed:
 
-1. **Attention is 73% of the forward** and it is the only O(n^2) kernel. A per-lane
+1. **Attention is 73% of the forward** and it is the only O(n^2) kernel, and at
+   2048 tokens it is bound by *memory-level parallelism*, not instructions: each
+   (row, head) re-reads its whole band of K and V plus the head_dim floats of q,
+   so one 2048-token layer touches ~6 GB and the serial key loop (load -> dot ->
+   cross-lane reduce -> exp -> local-memory update) leaves only ~2 work-groups
+   per EU to overlap it. Measured effective bandwidth is ~10 GB/s of an 81 GB/s
+   part. Unrolling the key loop and issuing its loads up front is the cheap 2-4x
+   here; a local-memory K/V block per query block is the real fix. A per-lane
    f32 flash loop costs ~60 instructions per (row, head, key) for 512 MAC, i.e.
    0.2 MAC/instruction where a DPAS instruction does 2048. No amount of tiling in
    f32 closes that: this is what the tensor cores are for, and it is exactly why
@@ -1198,15 +1206,19 @@ host shared with the desktop so the CPU column is ~1.4x its idle-box number):
 | text | 64 | 20.3 | 35.3 | 7.0 | 4.7 |
 | text | 128 | 33.0 | 61.5 | 9.2 | 6.1 |
 | text | 512 | 118.2 | 534.6 | 20.4 | 13.6 |
-| text | 2048 | 574.1 | 6662.5 | 140.4 | 93.6 |
+| text | 2048 | 1082 | 14800 | 140.4 | 93.6 |
 | batch | 8x64 | 131.7 | 201.5 | 17.4 | 11.6 |
 | batch | 32x64 | 555.9 | 896.3 | 69.9 | 46.6 |
 | image | 270 tok | 640.8 | 2998.1 | 258 | 172 |
 | audio | 54 tok | 32.7 | 69.3 | 23.0 | 15.3 |
 | video | 8 frames | 2202.8 | 7635.2 | 792 | 528 |
 
-(text 2048 is the worst row: at that length the sliding-window band is 1025 keys
-and the f32 attention loop dominates everything; see the roadmap.)
+(text 2048 is the worst row and it is a *traffic* problem, not an instruction
+problem: every (row, head) walks its own 1025-key band and re-reads K and V, so
+one layer touches 8192 row-heads x 1025 keys x 2 KB = 16.8 GB, which no cache
+absorbs. The 4-row block sharing in the kernel cuts that 4x; the fix is to stage
+a K/V block in local memory and walk it once for a whole query block, or to run
+attention through the matrix engine (which re-reads K/V once per tile).)
 
 The goal for this round was 1.5x over OpenVINO int8 on the GPU in every row. That
 is **not met**; the device path is correct but slower than the CPU path, so it

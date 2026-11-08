@@ -53,19 +53,22 @@ Same run, same process (`--sources e2,ov-int8-gpu --iters 2 --repeat 2`):
 
 | task | length | e2 CPU | e2 GPU | ov-int8 GPU | e2 GPU / OV |
 |---|---:|---:|---:|---:|---:|
-| text | 8 | 7.4 | 17.0 | 5.7 | 0.34 |
-| text | 64 | 20.3 | 21.2 | 6.4 | 0.30 |
-| text | 128 | 33.0 | 25.5 | 7.7 | 0.30 |
-| text | 512 | 118.2 | 83.5 | 19.6 | 0.23 |
-| text | 2048 | 1082 | 460 | 138.7 | 0.30 |
-| image | 270 tok | 640.8 | 604 | 273.6 | 0.45 |
-| audio | 54 tok | 32.7 | 36.6 | 23.9 | 0.65 |
-| video | 8 frames | 2202.8 | 2478 | 820 | 0.33 |
+| text | 8 | 7.4 | 11.6 | 6.3 | 0.54 |
+| text | 64 | 20.3 | 14.4 | 7.4 | 0.51 |
+| text | 128 | 33.0 | 19.6 | 8.8 | 0.45 |
+| text | 512 | 118.2 | 68.8 | 25.3 | 0.37 |
+| text | 2048 | 1082 | 382 | 138.3 | 0.36 |
+| batch | 8x64 | 131.7 | 52.6 | 17.7 | 0.34 |
+| batch | 32x64 | 555.9 | 225 | 71.2 | 0.32 |
+| image | 270 tok | 640.8 | 540 | 290.6 | 0.54 |
+| audio | 54 tok | 32.7 | 39.7 | 26.8 | 0.67 |
+| video | 8 frames | 2202.8 | 2710 | 849.5 | 0.31 |
 
-(The CPU column is round 8's, measured under heavier host load; read the GPU/OV
-column, it is from one run.) Round 8 measured 534 ms at text 512 and 11750 ms at
-2048 on the device, so the round is 6-25x faster; it is still 1.5-6x *slower*
-than OpenVINO int8 on the GPU, i.e. **the 1.5x goal is not met**.
+(The CPU column is round 8's, from another session; the GPU and OV columns are
+one run. The GPU is ahead of the CPU from 64 tokens up.) Round 8 measured 534 ms
+at text 512 and 11750 ms at 2048 on the device, so the round is 7.8x and 31x
+faster; it is still 1.5-3.2x *slower* than OpenVINO int8 on the GPU, i.e. **the
+1.5x goal is not met**.
 
 The profile and the roadmap are in PERFORMANCE.md ("Round 9"): the GEMM kernel
 runs at 50% of the 17-18 TMAC/s matrix-engine ceiling but a forward is ~1500

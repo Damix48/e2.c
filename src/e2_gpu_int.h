@@ -114,7 +114,7 @@ int e2_gpu_enq_linear_pq(e2_gpu *g, float *y, const int8_t *xq, const float *xs,
  * back to the CPU int8 attention). */
 int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
                     const float *v, int t, int heads, int kv_heads, int head_dim,
-                    int window);
+                    int window, int nseq, const int *seq_off);
 /* Quantise / launch halves, for callers that share the activation. */
 int e2_gpu_pack_act(e2_gpu *g, const float *x, int m, int k, e2_act *a);
 int e2_gpu_enq_act(e2_gpu *g, float *y, int m, const e2_linear *l, const e2_act *a);

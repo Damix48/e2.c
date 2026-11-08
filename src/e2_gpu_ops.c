@@ -217,16 +217,17 @@ int e2_gpu_op_rope_vision(e2_ctx *ctx, float *q, float *k, int t, int heads,
     return LAUNCH(g, g->k_rope_vision, (uint32_t)((long)t * heads * hf), 64, "rope_vision");
 }
 
-/* int8 attention on the matrix engine (see e2_gpu_enq_attn).  Multiple
- * sequences and head dims without a 128-wide layout stay on the CPU: both need
- * a per-sequence band the score product does not have. */
+/* int8 attention on the matrix engine (see e2_gpu_enq_attn).  A head dim with
+ * no 128-wide layout, or a batch too large to score as one rectangle, stays on
+ * the CPU int8 path. */
 int e2_gpu_op_attn(e2_ctx *ctx, float *out, const float *q, const float *k,
                    const float *v, int t, int heads, int kv_heads, int head_dim,
                    int window, int nseq, const int *seq_off) {
     e2_gpu *g = e2_gpu_on(ctx) ? ctx->gpu : NULL;
     if (g && g->ready && SKIPPED(SK_ATTN)) return OP_FAIL;
-    if (!g || !g->ready || nseq != 1) return OP_FAIL;
-    if (e2_gpu_enq_attn(g, out, q, k, v, t, heads, kv_heads, head_dim, window) == 0)
+    if (!g || !g->ready) return OP_FAIL;
+    if (e2_gpu_enq_attn(g, out, q, k, v, t, heads, kv_heads, head_dim, window,
+                        nseq, seq_off) == 0)
         return 0;
     e2_gpu_flush(ctx);
     return OP_FAIL;

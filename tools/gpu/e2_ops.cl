@@ -232,10 +232,12 @@ __kernel void k_attn_pack(__global const float *src, __global char *pq,
 /* scores -> P.  One sub-group per query row.  P is int8 in [0,127] with one
  * scale per 128-wide key block, and the 1/sum of the row is folded into those
  * scales, so the context product needs no normalisation pass.  Keys outside
- * [row-window, row+window] get p = 0 (the sliding window; a key past kvalid is
- * excluded too). */
+ * [row-window, row+window] get p = 0, and so does every key of another
+ * sequence (seq_off[s] <= row < seq_off[s+1]), which is what lets a batch share
+ * one score product. */
 __kernel void k_attn_softmax(__global const float *S, __global char *P,
-                             __global float *psc, const int rows, const int kpad,
+                             __global float *psc, __global const int *seq_off,
+                             const int nseq, const int rows, const int kpad,
                              const int kvalid, const int window)
 {
     int gs = get_sub_group_size();
@@ -246,6 +248,15 @@ __kernel void k_attn_softmax(__global const float *S, __global char *P,
     if (window > 0) {
         lo = row - window; if (lo < 0) lo = 0;
         hi = row + window + 1; if (hi > kvalid) hi = kvalid;
+    }
+    if (nseq > 1) {
+        int sq = 0;
+        while (sq + 1 < nseq && row >= seq_off[sq + 1]) sq++;
+        if (seq_off[sq] > lo) lo = seq_off[sq];
+        int se = seq_off[sq + 1];
+        if (se > kvalid) se = kvalid;
+        if (se < hi) hi = se;
+        if (hi <= lo) hi = lo + 1;
     }
     __global const float *sp = S + (size_t)row * kpad;
     float mx = -3.0e38f;

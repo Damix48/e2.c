@@ -1399,39 +1399,41 @@ activation stream.
 ## Status against the goal
 
 **Same run, same process** (`--sources e2,ov-int8-gpu --e2-device gpu --iters 2
---repeat 2`), which is the only comparison this host can support (load average
-2.5-5, ±10% run to run):
+--repeat 2`), the only comparison this host supports (load average 2.5-5, ±10%
+run to run; an earlier identical run of the same binary gave 17.0/83.5 where this
+one gives 11.6/68.8 for text 8/512, so read ratios, not absolutes):
 
 | task | length | round 8 e2 | **round 9 e2** | ov-int8 GPU | e2/OV | 1.5x target |
 |---|---:|---:|---:|---:|---:|---:|
-| text | 8 | 18.6 | **17.0** (13.5 alone) | 5.7 | 0.34 | 3.8 |
-| text | 64 | 35.3 | **21.2** | 6.4 | 0.30 | 4.3 |
-| text | 128 | 61.5 | **25.5** | 7.7 | 0.30 | 5.1 |
-| text | 512 | 534.6 | **83.5** (55 alone) | 19.6 | 0.23 | 13.1 |
-| text | 2048 | 11750 | **460** | 138.7 | 0.30 | 93 |
-| batch | 8x64 | 201.5 | **95.6** | 15.7 | 0.16 | 10.5 |
-| batch | 32x64 | 896.3 | **325** | 65.8 | 0.20 | 43.9 |
-| image | 270 tok | 2998 | **604** | 273.6 | 0.45 | 182 |
-| audio | 54 tok | 69.3 | **36.6** | 23.9 | 0.65 | 15.9 |
-| video | 8 frames | 7635 | **2478** | 820 | 0.33 | 547 |
+| text | 8 | 18.6 | **11.6** | 6.3 | 0.54 | 4.2 |
+| text | 64 | 35.3 | **14.4** | 7.4 | 0.51 | 4.9 |
+| text | 128 | 61.5 | **19.6** | 8.8 | 0.45 | 5.9 |
+| text | 512 | 534.6 | **68.8** | 25.3 | 0.37 | 16.9 |
+| text | 2048 | 11750 | **382** | 138.3 | 0.36 | 92 |
+| batch | 8x64 | 201.5 | **52.6** | 17.7 | 0.34 | 11.8 |
+| batch | 32x64 | 896.3 | **225** | 71.2 | 0.32 | 47.5 |
+| image | 270 tok | 2998 | **540** | 290.6 | 0.54 | 194 |
+| audio | 54 tok | 69.3 | **39.7** | 26.8 | 0.67 | 17.9 |
+| video | 8 frames | 7635 | **2710** | 849.5 | 0.31 | 566 |
 
-Round 9 is **6.4x faster at text 512, 25x at 2048, 2.4x on audio, 3.1x on
-video**, and no row regressed. **The 1.5x-over-OpenVINO goal is not met**: the
-device path is 1.5-6x *slower* than OV on every row and 4-93x off the target.
+Round 9 is **7.8x faster at text 512, 31x at 2048, 4x on the batches, 5.5x on
+image and 2.8x on video**, and no row regressed. **The 1.5x-over-OpenVINO goal
+is not met**: the device path is 1.5-3.2x *slower* than OV on every row and
+3-92x off the target (it needs 1.5x *faster*, i.e. 2.2-4.8x better than today).
 What the round established, all measured:
 
 - the matrix-engine ceiling is 17-18 TMAC/s on this part; the GEMM reaches 9
-  TMAC/s on cache-resident shapes and 44-49 GB/s streaming cold weights. The
-  kernel is no longer the unknown it was.
+  TMAC/s on cache-resident shapes and 44-49 GB/s when streaming cold weights.
+  The kernel is no longer the unknown it was.
 - a *single cold* launch of a small GEMM costs ~2.5x its steady-state time and a
   forward is ~1500 launches, ~640 of them this one GEMM kernel. Ramp/drain, not
-  arithmetic, dominates at text <= 128 (2 WGs per EU do not cover a DRAM
-  latency).
+  arithmetic, dominates at text <= 128.
 - weight traffic is `m/128` passes over the model (480 MB at text 512, 1.9 GB at
-  text 2048), so the row tile is the structural lever for the long rows.
-- the rows that are furthest off (batch, video) are the ones whose attention
-  still falls back to the CPU per layer (`nseq > 1`), and image/video also pay
-  the vision tower's separate per-op paths.
+  2048), so the row tile is the structural lever for the long rows.
+- the device path is now used for batched attention when the score rectangle is
+  at most 512 tokens (8x64 uses it, 32x64 does not yet); the audio tower and the
+  vision tower's attention (head_dim 64, no 128-wide block layout) are still on
+  the CPU and pay a flush per layer.
 
 ## Round 9 roadmap (measured, in the order that pays)
 
@@ -1457,9 +1459,11 @@ What the round established, all measured:
 - `shortcut: the score matrix is materialised in f32` in `e2_gpu_enq_attn` --
   fine up to ~512 tokens (4 MB per head), and 2 passes of DRAM traffic beyond
   that. Upgrade with a per-64-row key band, then with a fused flash kernel.
-- `shortcut: attention takes nseq == 1 only` -- multiple sequences fall back to
-  the CPU int8 attention with a flush per layer, which is what makes the batch
-  rows expensive. Upgrade with the per-row band from roadmap item 3.
+- `shortcut: batched attention scores the whole t x t rectangle` in
+  `e2_gpu_enq_attn` -- correct (the softmax masks by sequence) but only taken
+  when t <= 512, because a 32x64 batch would do 32x the needed products. The
+  rest still runs the CPU int8 attention with a flush per layer. Upgrade with
+  the per-row band from roadmap item 3.
 - `shortcut: one activation quantise per linear call` -- `quant_s8` is 14% of
   text 512 and runs even when the producer kernel could have written int8
   directly. Upgrade with roadmap item 2.

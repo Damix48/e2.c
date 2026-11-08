@@ -292,9 +292,18 @@ static int gemm_launch(e2_gpu *g, float *y, int m, int k, int n, const int8_t *x
  * stay in cache while the softmax pass walks them. */
 int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
                     const float *v, int t, int heads, int kv_heads, int head_dim,
-                    int window) {
+                    int window, int nseq, const int *seq_off) {
     if (t <= 0 || heads <= 0 || kv_heads <= 0 || (heads % kv_heads)) return -1;
     if (head_dim % 128 || head_dim > 512) return -1;
+    /* The score product has no per-sequence band, so a batch pays for the whole
+     * t x t rectangle.  Take that only while it is cheaper than the CPU int8
+     * attention plus a flush per layer, which is what the fallback costs. */
+    if (nseq > 1 && t > 512) return -1;
+    const int *so = NULL;
+    if (nseq > 1) {
+        so = e2_gpu_mirror(g, seq_off, (size_t)nseq * sizeof(int));
+        if (!so) return -1;
+    }
     if (e2_gpu_enq_open(g) != 0) return -1;
 
     const int nblk = head_dim / 128;      /* d blocks, Q row scales */
@@ -380,7 +389,8 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
                         head_dim, nblk, rpad) != 0) return -1;
         /* masked softmax -> P with the row normalisation in its scales */
         {
-            int rows = t, kpad = rpad, kvalid = t, win = window;
+            int rows = t, kpad = rpad, kvalid = t, win = window, nsq = nseq;
+            const int *sep = so ? so : seq_off;
             float *sp = S + (size_t)h * t * rpad;
             int8_t *pp = P + (size_t)h * t * rpad;
             float *sc = psc + (size_t)h * t * nkeyblk;
@@ -388,6 +398,8 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
             if (zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(sp), &sp) != ZE_RESULT_SUCCESS ||
                 zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(pp), &pp) != ZE_RESULT_SUCCESS ||
                 zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(sc), &sc) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(sep), &sep) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(nsq), &nsq) != ZE_RESULT_SUCCESS ||
                 zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(rows), &rows) != ZE_RESULT_SUCCESS ||
                 zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(kpad), &kpad) != ZE_RESULT_SUCCESS ||
                 zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(kvalid), &kvalid) != ZE_RESULT_SUCCESS ||

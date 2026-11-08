@@ -1679,17 +1679,26 @@ all measured:
 * **The f32 activation stream is the problem at text 512.**  The fused MLP
   alone is worth 36 ms of 85, and it removed exactly one f32 intermediate
   (8 MB/layer).  Everything else that writes f32 costs the same order.
-* **The GEMM kernel in isolation is fine and the end-to-end GEMM phase is not.**
+* **The GEMM phase is bound by writing fresh f32 output, not by arithmetic.**
   `E2_GB_LAYERS` runs the real per-layer GEMM sequence with 24 cold weight
   buffers and a barrier per launch: 7.1 ms at m=512.  The same 216 GEMMs inside
-  the real forward cost ~49 ms (`E2_GPU_NOLAUNCH=1 E2_GPU_NOATTN=1`).  **That
-  3-7x gap is the single most important open question in this codebase**, and
-  this round did not attribute it.  Ruled out: launch count, barriers (in the
-  isolated testbed they cost <5%), the tile, and output write-allocate (the
-  epilogue writes full 64-byte lines).  Measured to matter: writing *fresh*
-  output memory instead of one warm tile (9.6 -> 15.5 ms at m=512 with 8
-  rotating buffers, i.e. the testbed understates the real cost by ~2x, but not
-  by 5x).
+  the real forward cost ~49 ms (`E2_GPU_NOLAUNCH=1 E2_GPU_NOATTN=1`).  Sweeping
+  how much *distinct* output memory the testbed writes (`E2_GB_YBUF=N`) closes
+  the gap completely:
+
+  | distinct output | 4 MB | 16 MB | 32 MB | 64 MB | 128 MB |
+  |---|---:|---:|---:|---:|---:|
+  | GEMM phase at m=512 | 10.2 | 20.7 | 15.8 | 33.6 | 43.8 ms |
+
+  A forward at 512 tokens writes ~340-400 MB of distinct f32 activation (per
+  layer: q 2, k 1, v 1, o 1, down 1, ple_gate 1, ple_proj 1, and six norm
+  outputs at 1 MB each).  At the 128 MB point the phase is already 43.8 ms, so
+  **the end-to-end GEMM phase is explained by activation write bandwidth, and
+  the isolated testbed was misleading because it overwrote one warm tile.**
+  Ruled out along the way: launch count, barriers (in the testbed they cost
+  <5%), the tile, and output write-allocate (the epilogue writes full 64-byte
+  lines).  This is why the f16 activation stream is roadmap item 2: it halves
+  the only number that matters here.
 * **The vision attention is the whole image/video cost.**  Image 442 ms is
   GEMM 190 + elementwise 10 + attention 240.  Both paths are terrible: the CPU
   int8 attention is 240 ms and the device path is 290 ms, for 35 GMAC of work
@@ -1701,15 +1710,21 @@ all measured:
 
 ## Round 10 roadmap (measured, in the order that pays)
 
-1. **Attribute and kill the end-to-end vs isolated GEMM gap** (49 vs 7.1 ms at
-   text 512).  Nothing else matters until this is understood: it is 4x of the
-   total, and every other row inherits it.  The next experiment is to run the
-   *real* forward with `E2_GB_LAYERS`-style weights but the real arena and
-   activation pattern, one variable at a time.
-2. **Make the activation stream f16.**  The residual stream and every GEMM
-   output are f32 and each is 1-4 MB per layer.  f16 halves that with ~10 bits
-   of mantissa, which the 0.9997 cosine has room for.  Expected 15-25 ms at
-   text 512 if the traffic hypothesis holds.
+1. **Make the activation stream f16.**  This is now the top item because the
+   measurement above pins the cost: the GEMM phase is bound by distinct f32
+   activation bytes, and a forward writes 340-400 MB of them at text 512.  The
+   residual stream has to stay f32 (24 accumulations), but every GEMM output and
+   every norm output can be f16: 170-200 MB instead, i.e. the 43.8 ms point of
+   the table instead of the ~49 ms one, and roughly half of the 63 ms forward.
+   The kernels that must gain an f16 source: `k_rmsnorm_q`, `k_norm_rope`,
+   `k_attn_pack`, `k_quant_s8`, `k_gelu_tanh`/`k_mul_slice`, and the GEMM
+   epilogue (`vstore_half8`).  Accuracy budget: the path is at cos 0.9997 vs
+   f32 today and the target is 0.999.
+2. **Fuse the remaining epilogues that can be fused.**  Two per layer are worth
+   ~3 MB each: `ple_gate + gelu + mul_slice` into one GEMM epilogue, and
+   `rmsnorm_add(post_attn) + rmsnorm_q(pre_ff)` into one kernel (the second
+   currently re-reads the row the first just wrote).  ~10 ms of the 63 at text
+   512, no new maths.
 3. **A fused int8 flash attention** (16 query rows, 128-key blocks, online
    softmax, K/V from SLM, P fed back as the DPAS A operand in the accumulator
    layout - which is already the A layout).  Kills the score matrix for the

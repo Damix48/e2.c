@@ -82,6 +82,13 @@ static inline void xmx_store(__global float *y, const float8 facc[E2_XTB][E2_XFB
                              __global const float *wsc, int m0, int lane, int ystr,
                              int n0, int m, int ntb)
 {
+#ifdef E2_DBG_NOSTORE
+    /* benchmark only: price the epilogue store.  The guarded store keeps the
+     * accumulator live so the compiler cannot delete the whole GEMM. */
+    if (m0 == -1 && n0 == -1)
+        y[0] = facc[0][0][0] * wsc[0] + lane + ystr + m + ntb;
+    return;
+#endif
 #pragma unroll
     for (int tc = 0; tc < ntb; tc++) {
         const int row = m0 + tc * 8 + lane;

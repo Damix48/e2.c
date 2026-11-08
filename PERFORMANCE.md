@@ -1396,6 +1396,28 @@ Round 8's f32 attention was 73% of the forward; it is now 9%. The cost is
 dominated by the GEMM and by the *number* of elementwise launches over the
 activation stream.
 
+## Where the device time goes now (text 512, corrected)
+
+`E2_GPU_NOLAUNCH=1 E2_GPU_NOATTN=1` / `E2_GPU_NOATTN=1` / plain, min of 3, one
+run (load ~8, so the absolute values are ~1.4x the quiet-host numbers; read the
+shares):
+
+| phase | ms | share | launches |
+|---|---:|---:|---:|
+| GEMM (projections + `mlp_gu` + `gemm_ple` + the two `b2` products) | 24 | 38% | 193 |
+| norms, quantise, rope, scale (the activation stream) | 21 | 33% | 314 |
+| attention (Q, pack, scores, softmax, context) | 18 | 29% | 133 |
+
+Launch counts per forward, from the `E2_GPU_TS` names: 145 GEMMs, 24 `mlp_gu`,
+24 `gemm_ple`, 145 `rmsnorm_q`, 97 `quant_s8`, 48 `norm_rope`, 24 `pack_k`,
+24 `pack_v`, 44 `softmax`, 24 `scale` - about 600 kernels, which at ~5 us each
+with a barrier is 3 ms of the 63.
+
+So the remaining cost is split roughly one third each between the GEMM phase,
+the activation stream and the attention.  None of the three is dominated by
+launches, and the f16 idea only addresses the middle third (21 ms), so its
+realistic ceiling is ~10 ms, not the 40 the ybuf sweep suggested.
+
 ## Status against the goal
 
 **Same run, same process** (`--sources e2,ov-int8-gpu --e2-device gpu --iters 2
@@ -1680,6 +1702,12 @@ all measured:
 * **The f32 activation stream is the problem at text 512.**  The fused MLP
   alone is worth 36 ms of 85, and it removed exactly one f32 intermediate
   (8 MB/layer).  Everything else that writes f32 costs the same order.
+* **A profiling-knob bug invalidated the first attribution.**  `E2_GPU_NOLAUNCH`
+  cached its decision in a way that stopped filtering after the first kernel, so
+  "GEMM only" was really "the whole pipeline".  Fixed (it now filters by kernel
+  handle and covers both tile variants); the corrected attribution for text 512
+  is in the next section.  This is the third measurement trap of the round and
+  the reason every number below is cross-checked two ways.
 * **The end-to-end vs isolated GEMM gap is real, large, and still not
   attributed.**  `E2_GB_LAYERS` runs the real per-layer GEMM sequence with 24
   cold weight buffers and a barrier per launch: 7.1 ms at m=512.  The same 216
@@ -1722,16 +1750,19 @@ all measured:
    compare against 340 MB; (d) check whether the per-GEMM activation buffer
    being a fresh arena allocation (different 4 KB/2 MB pages each time) is
    what the ybuf sweep was really pricing.
-2. **f16 activations**, *if* (1) points at the activation stream after all.
-   The residual stream must stay f32 (24 accumulations), but every GEMM output
-   and norm output can be f16; the kernels that need an f16 source are
-   `k_rmsnorm_q`, `k_norm_rope`, `k_attn_pack`, `k_quant_s8`, `k_gelu_tanh`/
-   `k_mul_slice`, and the GEMM epilogue (`vstore_half8`).  Do **not** start this
-   before (1): experiment 13 says the traffic is only worth ~2.6 ms.
-3. **Fuse `rmsnorm_add(post_attn) + rmsnorm_q(pre_ff)`** into one kernel (the
-   second re-reads the row the first just wrote).  One op, one launch per layer,
-   and by experiment 13's rate expect ~1%, not the 5% the traffic estimate
-   suggests.
+2. **Halve the activation stream** (33% of the forward).  Two routes, and the
+   second is cheaper: (a) f16 for every GEMM and norm output - the residual
+   stream must stay f32, the kernels needing an f16 source are `k_rmsnorm_q`,
+   `k_norm_rope`, `k_attn_pack`, `k_quant_s8` and the GEMM epilogue
+   (`vstore_half8`); (b) fold the norm into its consumer so the f32 row is
+   never written at all - `rmsnorm_add(post_attn) + rmsnorm_q(pre_ff)` into one
+   kernel is 3 MB per layer, and the same trick applies to
+   `rmsnorm_q(in_norm) + qkv` if the GEMM's A-operand quantiser can be given a
+   pre-normed source.  Ceiling ~10 ms.
+3. **The attention third** (18 ms, and 240 ms of image).  A fused int8 flash
+   kernel (16 query rows, 128-key blocks, online softmax, K/V staged) removes
+   the materialised score matrix, which is what makes the vision tower
+   pathological.  It also unlocks batched text attention above 512 tokens.
 3. **A fused int8 flash attention** (16 query rows, 128-key blocks, online
    softmax, K/V from SLM, P fed back as the DPAS A operand in the accumulator
    layout - which is already the A layout).  Kills the score matrix for the

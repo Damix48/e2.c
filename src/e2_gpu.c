@@ -21,15 +21,17 @@
 int e2_gpu_launch_3d(e2_gpu *g, ze_kernel_handle_t k, uint32_t gx, uint32_t gy,
                      uint32_t gz, const char *name) {
     ze_group_count_t gc = {gx ? gx : 1, gy ? gy : 1, gz ? gz : 1};
-    /* E2_GPU_NOLAUNCH=1 keeps only the GEMMs (results are wrong, only the clock
-     * is meaningful): it prices everything else against them in one run. */
-    static int nol;
-    if (!nol && getenv("E2_GPU_NOLAUNCH") &&
-        k != g->k_gemm_z && k != g->k_gemm_b2) {
+    /* E2_GPU_NOLAUNCH=1 keeps only the GEMM launches (results are wrong, only
+     * the clock is meaningful): it prices everything else against them in one
+     * run.  Both tile variants count as a GEMM. */
+    static int nol = -1;
+    if (nol < 0) nol = getenv("E2_GPU_NOLAUNCH") ? 1 : 0;
+    if (nol && k != g->k_gemm_z && k != g->k_gemm_b2 && k != g->k_bgemm_z &&
+        k != g->k_bgemm_b2 && k != g->k_mlp_gu && k != g->k_bmlp_gu &&
+        k != g->k_gemm_ple && k != g->k_bgemm_ple) {
         g->ndisp++;
         return 0;
     }
-    if (!nol && getenv("E2_GPU_NOLAUNCH")) nol = 1;
     if (g->ts_on && zeCommandListAppendWriteGlobalTimestamp &&
         zeCommandListAppendWriteGlobalTimestamp(g->list, &g->ts[g->ts_n], NULL, 0,
                                                 NULL) == ZE_RESULT_SUCCESS) {

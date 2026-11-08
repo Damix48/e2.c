@@ -46,8 +46,10 @@ typedef struct e2_gpu {
     ze_command_queue_handle_t queue;
     ze_command_list_handle_t imm;   /* immediate list, one-shot fallbacks */
     ze_command_list_handle_t list;  /* deferred list: a whole forward */
-    ze_module_handle_t dmodule, omodule;
+    ze_module_handle_t dmodule, bmodule, omodule;
     ze_kernel_handle_t k_gemm, k_gemm_z, k_gemm_b2, k_mlp_gu;
+    /* the same three, with the large token tile (tools/gpu/e2_xmx_big.cl) */
+    ze_kernel_handle_t k_bgemm_z, k_bgemm_b2, k_bmlp_gu;
     ze_kernel_handle_t k_rmsnorm, k_rmsnorm_q, k_norm_rope, k_rope_text,
         k_rope_vision;
     ze_kernel_handle_t k_attn_pack, k_attn_softmax, k_quant_s8;
@@ -87,6 +89,12 @@ typedef struct e2_gpu {
      * event-checked ring of slots when that matters. */
     e2_arena act;
 } e2_gpu;
+
+/* Bytes of score matrix the attention keeps live at once.  Above this the
+ * rectangle stops fitting in L3 and the materialised scores dominate the
+ * forward (90 MB per layer at 1200 patches), so the heads are walked in groups
+ * small enough to stay cached. */
+#define E2_GPU_ATT_BUDGET (8u << 20)
 
 /* Quantised activation: row-major centred int8 plus one scale per 128-wide
  * block.  No repacking - the matrix engine's B operand is a row-major tile. */

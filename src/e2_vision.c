@@ -94,6 +94,9 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
         e2_rmsnorm_add(ctx, x, tmp, L->post_attn_norm, P, H, c->vision_eps);
 
         e2_rmsnorm(ctx, hb, x, L->pre_ff_norm, P, H, c->vision_eps);
+        /* device path: gate, up, gelu*up and the down projection without the
+         * f32 intermediate (29 MB per layer at 1200 patches) */
+        if (e2_gpu_op_mlp(ctx, hb, hb, P, &L->gate, &L->up, &L->down) != 0) {
         {
             const e2_linear *ls[2] = {&L->gate, &L->up};
             float *ys[2] = {tmp, up};
@@ -109,6 +112,7 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
                 e2_gelu_mul(ctx, tmp, up, P * I);
                 e2_linear_forward(ctx, hb, tmp, P, &L->down);
             }
+        }
         }
         e2_rmsnorm_add(ctx, x, hb, L->post_ff_norm, P, H, c->vision_eps);
         if (prof) tp[1] += e2_now_ms() - _t0;

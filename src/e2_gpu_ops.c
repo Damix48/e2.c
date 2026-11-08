@@ -148,7 +148,7 @@ int e2_gpu_op_rmsnorm(e2_ctx *ctx, float *out, const float *x, const float *w,
     if (enq_begin(g) != 0) return OP_FAIL;
     /* mode 1 is the PLE pre-scale: its output is read by mul_slice, never by a
      * GEMM, so quantising it would be a wasted pass over n*L rows. */
-    if (mode != 1 && !(dim % 128) && !getenv("E2_GPU_NONORMQ"))
+    if (mode != 1 && !(dim % 128))
         return norm_q(g, out, x, wu, src, rows, dim, eps, pre, mode, "rmsnorm_q");
     uint32_t ai = 0;
     if (zeKernelSetArgumentValue(g->k_rmsnorm, ai++, sizeof(x), &x) != ZE_RESULT_SUCCESS ||

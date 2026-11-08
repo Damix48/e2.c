@@ -16,3 +16,6 @@ audit.log
 gpu-probe
 gpu-bench
 logs/
+/tests/e2_ab_a
+/tests/e2_ab_b
+/gpu-bench

@@ -22,17 +22,19 @@ trap 'rm -rf "$TMP"' EXIT
 # clang.  Both end up as plain SPIR-V, which the Level Zero module builder
 # accepts (IGC resolves the builtin when it compiles the module).
 OCLOC_DEVICE=${OCLOC_DEVICE:-arl-h}
+# Extra -D flags for the matrix-engine kernels, e.g. OCLOC_FLAGS=-DE2_CSG=8 to
+# sweep the work-group tile (tools/gpu_bench.c E2_GB_LAYERS prices it).
+OCLOC_FLAGS=${OCLOC_FLAGS:-}
 
 for f in tools/gpu/*.cl; do
     name=$(basename "$f" .cl)
     arr="e2_gpu_spv_${name}"
     # only a real call counts: e2_dpas.cl is the one file that needs ocloc
     # (the Intel matrix builtin), and comments mention it too.
-    if sed -e "s://.*::" -e "s:/\*.*\*/::" "$f" | grep -v "^[[:space:]]*\*" |
-        grep -q "intel_sub_group_"; then
+    if grep -q "E2_DPAS_BODY" "$f"; then
         mkdir -p "$TMP/$name"
         ocloc compile -file "$f" -device "$OCLOC_DEVICE" -out_dir "$TMP/$name" \
-            -output "$name" >/dev/null
+            -output "$name" -options "-I tools/gpu $OCLOC_FLAGS" >/dev/null
         cp "$TMP/$name/${name}_"*.spv "$TMP/$name.spv"
     else
         "$CLANG" -target spirv64-unknown-unknown -x cl -cl-std=CL3.0 -O2 -c "$f" \

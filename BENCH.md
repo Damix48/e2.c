@@ -43,42 +43,58 @@ beats OpenVINO int8 by at least 1.8x (goal was 1.5x).
 
 ## GPU (Intel Arc 140T iGPU, Level Zero)
 
-The GPU backend is opt-in (`E2_DEVICE=gpu`). Every linear, the attention stack
-(QK^T, masked softmax, PV) and the norms run on the Xe matrix engine with int8
-DPAS, **one command-list submission per embedding**. Results match the CPU int8
-kernel bit for bit per tensor (cos 1.0000000 against `e2_gemm_range`), and the
-attention is int8 like the CPU path instead of f32.
+The GPU backend is opt-in (`E2_DEVICE=gpu`). Every linear, the MLP block, the
+attention stack (QK^T, masked softmax, PV) and the norms run on the Xe matrix
+engine with int8 DPAS, **one command-list submission per embedding**. Every GEMM
+result matches the CPU int8 kernel bit for bit, and the final embedding is
+cos 0.9997 against the CPU path.
 
-Same run, same process (`--sources e2,ov-int8-gpu --iters 2 --repeat 2`):
+Round 10 numbers. This box was busy (load average 3-8) and the same binary
+measured 64, 73, 87 and 77 ms for text 512 in four consecutive runs, so read
+the *ratios*, not the absolute values:
 
-| task | length | e2 CPU | e2 GPU | ov-int8 GPU | e2 GPU / OV |
+| task | length | round 9.1 | **round 10** | ov-int8 GPU* | e2 / OV |
 |---|---:|---:|---:|---:|---:|
-| text | 8 | 7.4 | 11.6 | 6.3 | 0.54 |
-| text | 64 | 20.3 | 14.4 | 7.4 | 0.51 |
-| text | 128 | 33.0 | 19.6 | 8.8 | 0.45 |
-| text | 512 | 118.2 | 68.8 | 25.3 | 0.37 |
-| text | 2048 | 1082 | 382 | 138.3 | 0.36 |
-| batch | 8x64 | 131.7 | 52.6 | 17.7 | 0.34 |
-| batch | 32x64 | 555.9 | 225 | 71.2 | 0.32 |
-| image | 270 tok | 640.8 | 540 | 290.6 | 0.54 |
-| audio | 54 tok | 32.7 | 39.7 | 26.8 | 0.67 |
-| video | 8 frames | 2202.8 | 2710 | 849.5 | 0.31 |
+| text | 8 | 13.1 | **12.8** | 5.9 | 0.46 |
+| text | 64 | 16.4 | **15.4** | 7.3 | 0.47 |
+| text | 128 | 21.1 | **20.1** | 8.0 | 0.40 |
+| text | 512 | 70.7 | **63.1** | 19.2 | 0.30 |
+| text | 2048 | 422.5 | **385** | 134.5 | 0.35 |
+| image | 270 tok | 501.5 | **442** | 263 | 0.60 |
+| audio | 54 tok | 36.1 | **35.4** | 23.9 | 0.68 |
+| video | 8 frames | 2164 | **2107** | 794 | 0.38 |
 
-(The CPU column is round 8's, from another session; the GPU and OV columns are
-one run. The GPU is ahead of the CPU from 64 tokens up.) Round 8 measured 534 ms
-at text 512 and 11750 ms at 2048 on the device, so the round is 7.8x and 31x
-faster; it is still 1.5-3.2x *slower* than OpenVINO int8 on the GPU, i.e. **the
-1.5x goal is not met**.
+`*` the OV column is round 9.1's: the HF checkpoint the converter needs is no
+longer on this box, so OV could not be re-measured in the same run. The e2
+columns are a same-run interleaved A/B of the two e2 binaries (min of 5-6 runs).
 
-The profile and the roadmap are in PERFORMANCE.md ("Round 9"): the GEMM kernel
-runs at 50% of the 17-18 TMAC/s matrix-engine ceiling but a forward is ~1500
-small launches, and the remaining structural work is one GEMM launch per layer
-instead of nine (concatenated qkv / gate-up weights + a `gridCountZ` over
-descriptors), fusing norm+quantise, batched attention and the on-device towers.
+Round 10 is **2-12% faster than round 9.1 and 2.8-31x faster than round 8**
+(text 512 was 535 ms in round 8, 70.7 in 9.1, 63.1 now). It is still **1.5-3.3x
+slower than OpenVINO int8 on the GPU, so the 1.5x goal is not met** — that would
+need another 2.2-4.9x.
 
-`make gpu-bench` sweeps the tile and checks every shape against the CPU kernel;
-`E2_GPU_TS=1` prints per-kernel device timestamps, `E2_GPU_SKIP=linear,norm,...`
-keeps an op group on the CPU.
+What round 10 established, all measured (details and the experiment log are in
+PERFORMANCE.md "Round 10"):
+
+* **launch count is not the problem.** Halving it (1102 -> 628 kernels per
+  forward) changed nothing measurable; a launch costs ~1 us without a barrier
+  and ~5 us with one.
+* **the f32 activation stream is.** Fusing the MLP's gate/up/gelu into one
+  int8-producing kernel (so its 8 MB-per-layer f32 intermediate never exists)
+  took the GEMM phase at text 512 from 85 to 49 ms.
+* **the GEMM kernel in isolation is fine, the same GEMMs in the real forward are
+  not**: `make gpu-bench` with `E2_GB_LAYERS=1` runs the real per-layer sequence
+  with cold weights in 7.1 ms at m=512, while the same launches inside the
+  forward cost ~49 ms. That 3-7x gap is the top open question.
+* **the vision attention is the whole image/video cost**: 240 ms of 442, because
+  at 1200 patches the materialised score matrix is 74 MB per layer.
+
+`make gpu-bench` prices the GEMM phase in isolation (`E2_GB_LAYERS=1`,
+`E2_GB_YBUF=N`, `E2_GB_RSG/CSG` to match the tile the SPV was built with);
+`tools/ab.sh` is the only way to A/B anything on this host; `E2_GPU_TS=1` prints
+per-kernel device timestamps, `E2_GPU_SKIP=linear,norm,...` keeps an op group on
+the CPU, `E2_GPU_NOLAUNCH=1` keeps only the GEMM launches, `E2_GPU_NOATTN=1`
+prices the attention.
 
 ## Accuracy
 

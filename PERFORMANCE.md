@@ -1520,3 +1520,223 @@ reach.)  Reading it:
 * The gap is smallest where OpenVINO is worst (audio 0.76, image 0.49, text 8
   0.49, both launch/weight-bound) and largest on the GEMM-bound rows
   (text 512 0.30, batches 0.30).
+
+# Round 10 — measurement discipline, fused passes, and an honest stop
+
+Host: same Core Ultra 9 285H, but this round ran while the box was **much**
+busier than round 9 (load average 1.5 early, 3-8 for most of it, 7.9 at the
+end).  The same binary measured 63.8, 73.1, 87.1 and 76.7 ms for text 512 in
+four consecutive runs.  Absolute numbers are therefore close to meaningless and
+**every claim below is a same-run interleaved A/B** (`tools/ab.sh`, min of 5-6
+alternating runs of the two binaries).  OV could not be re-measured this round
+(the HF checkpoint the converter needs is not on this box any more), so the
+e2-vs-OV ratios below reuse the round 9.1 OV column and are labelled as such.
+
+## What was built
+
+1. **`k_rmsnorm_q`** — the norm kernels write the int8 activation the next GEMM
+   would have quantised itself, and the backend keeps a one-entry cache keyed by
+   the f32 pointer so q/k/v (and gate/up) share one quantise.  Removes one full
+   read+write of every normed row and ~145 launches per forward.  Mode 1 (the
+   PLE pre-scale) deliberately does not fuse: its output is read by `mul_slice`,
+   never by a GEMM, so quantising it would be a wasted pass over n*24 rows.
+2. **`k_gemm_z`** — `gridCountZ` over a run of GEMMs that share one shape and
+   differ only by a constant stride, with `zrep` folding the GQA mapping in
+   (every `zrep`-th head steps the weight operand).  The four score products and
+   the four context products are one launch each; `k_attn_pack` and
+   `k_attn_softmax` got the same z-strides, so a layer is 6 attention launches
+   instead of 6 per head.
+3. **`k_mlp_gu`** — gate and up for the same feature tile in one kernel,
+   combined into `quantise(gelu(gate)*up)` in registers, with `k_gemm_b2`
+   consuming the 64-wide blocks.  The f32 MLP intermediate (8 MB per layer at
+   512 tokens, 29 MB at 1200 patches) never reaches memory.  **This is the
+   biggest single win of the round: the GEMM phase at text 512 drops from 85 to
+   49 ms** (measured with `E2_GPU_SKIP=gelu`, which routes the MLP back through
+   the old f32 path).
+4. **A second tile variant** (`tools/gpu/e2_xmx_big.cl`, 256x64, 512 threads)
+   selected at m >= 768.  The body moved to `tools/gpu/e2_xmx_body.h` so both
+   variants come from one source; `OCLOC_FLAGS` lets `tools/e2_spv.sh` sweep it.
+5. **Attention head grouping**: the score rectangle is the only large temporary
+   (7.6 MB per head at 1200 patches).  Materialising all heads at once is 90 MB
+   per layer, which no cache holds, so heads are walked in groups that fit
+   `E2_GPU_ATT_BUDGET` (8 MB), as multiples of the GQA group count.
+6. **Test guard**: `tests/e2_test.c` now compares the device embedding against a
+   CPU context (cos > 0.995) when the device is on.  The old checks only looked
+   at the norm and pass on a completely wrong kernel - that is how round 9.1
+   lost a round, and this round lost an hour to the same trap (see the bug list).
+
+## Tooling added (this is what the next round needs most)
+
+| tool | what it answers |
+|---|---|
+| `tools/ab.sh SPEC REPS` | interleaved A/B of two binaries, min per row. The only measurement this host supports. |
+| `gpu-bench` `E2_GB_LAYERS=1 [m]` | the **per-layer GEMM sequence** of the text tower with 24 distinct cold weight buffers, one submission, a barrier per launch. This is the GEMM phase in isolation, which the end-to-end bench cannot give. |
+| `gpu-bench` `E2_GB_RSG/CSG` | tells the testbed which tile the SPV was built with (the tile is compiled in, so the launcher must match or the measurement is silently wrong - it was, once, and produced an impossible 35 TMAC/s). |
+| `gpu-bench` `E2_GB_YBUF=N` | rotates the output through N buffers, i.e. writes fresh memory like the real pipeline instead of overwriting one warm tile. |
+| `E2_GPU_NOLAUNCH=1` | keeps only the GEMM launches; prices everything else in one run. |
+| `E2_GPU_NOATTN=1` | prices the attention. |
+
+Two measurement traps found, both of which had already produced wrong
+conclusions before they were caught:
+
+* `E2_GPU_NOLAUNCH` first only covered the ops-layer `LAUNCH` macro, so it
+  silently kept `k_rmsnorm_q` and the attention kernels.  It now lives in
+  `e2_gpu_launch_3d` and filters by kernel handle.
+* the tile sweep launched every variant with the host's `E2_GPU_SG`, so the
+  bigger-tile variants ran a fraction of their tile and reported 4-8x the real
+  throughput.  `E2_GB_RSG/CSG` fixes it.
+
+## The tile sweep (GEMM phase only, `E2_GB_LAYERS`, ms)
+
+Every (RSG,CSG) up to 1024 threads, min of 4:
+
+| tile | TMxTN | thr | m=8 | 64 | 128 | 256 | 512 | 1024 | 2048 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| (4,8) | 64x128 | 256 | 4.06 | 5.61 | 3.63 | 6.09 | 11.87 | 30.7 | 65.7 |
+| **(8,4)** | **128x64** | **256** | **2.09** | **3.85** | **3.47** | **4.14** | **7.14** | 12.0 | 32.0 |
+| (8,8) | 128x128 | 512 | 2.50 | 3.84 | 5.42 | 6.54 | 11.65 | 22.5 | 53.6 |
+| (16,8) | 256x128 | 1024 | 3.34 | 5.75 | 8.50 | 8.58 | 11.77 | 22.4 | 44.9 |
+| (32,4) | 512x64 | 1024 | 3.82 | 4.95 | 6.97 | 9.43 | 8.76 | 11.7 | 24.1 |
+| **(16,4)** | **256x64** | **512** | 4.09 | 5.60 | 7.24 | 4.57 | 6.64 | **11.5** | **22.2** |
+| (4,16) | 64x256 | 512 | 3.83 | 6.17 | 6.54 | 6.02 | 10.82 | 20.6 | 45.5 |
+| (8,16) | 128x256 | 1024 | 2.44 | 3.32 | 4.64 | 8.42 | 11.45 | 22.4 | 46.9 |
+
+Readings: the round-9 tile (128x64) was already the best small-m tile — the
+round-9 sweep was not wrong, it just never varied the tile with m.  The only
+real tile win is 256x64 above m~768 (**1.44x** at m=2048), which is why the
+launcher now has two variants.  Doubling the *feature* tile (TN=128/256) never
+pays: the weight tile grows, the activation tile is what was being re-read, and
+the extra registers cost occupancy.
+
+## Experiment log (round 10)
+
+| # | change | effect |
+|---|---|---|
+| 1 | `k_rmsnorm_q` + activation cache | text 8 **-18%**, 64 -12%, 128 -9%, 512 -3% (A/B, 4 reps) |
+| 2 | head-batched attention (`k_gemm_z`, z-strided pack/softmax) | 1102 -> 628 kernels per forward, and **no measurable time**: the per-launch cost is ~1 us, not the 5-8 us the ledger assumed. Do not spend effort on launch count again |
+| 3 | **fused MLP** (`k_mlp_gu` + `k_gemm_b2`) | GEMM phase at text 512 **85 -> 49 ms**; whole-forward text 8 14.7 -> 13.1, 64 17.5 -> 15.3, 128 22.2 -> 20.3, 512 71.0 -> 60.8, 2048 410 -> 375 |
+| 4 | big tile for m >= 768 | text 2048 **404 -> 360 ms** (1.11x) |
+| 5 | vision tower MLP fusion | image -3% (the vision MLP is 29 MB/layer of f32, but its GEMM phase is not the bottleneck) |
+| 6 | attention head grouping over an 8 MB budget | image **-10%**, video -3%, text 512 -3%, text 2048 +8% (within the noise at load 7.9; kept for the large-t case) |
+| 7 | device attention for `head_dim=64` (the vision tower) | **9% SLOWER than the CPU int8 attention** even though it removes 18 flushes per image. Reverted to `head_dim % 128 == 0` |
+| 8 | 256 GRF per thread for the new kernels (the MLP kernel spills ~12 regs) | **no gain** (text 512 64.5 -> 63.7, inside noise). Reverted |
+| 9 | descriptor-array batched GEMM (`e2_gdesc` in global memory) | **every output wrong**: a pointer stored in a `__global` struct does not survive the IGC SPIR-V path. Deleted; z-strides replaced it |
+| 10 | 64-wide activation blocks for the MLP input | wrong (mixed block widths inside one k loop); the MLP input stays 128-wide, only the *output* is 64-wide |
+| 11 | TN=128/256 tiles | worse at every m (table above) |
+| 12 | 512/1024-thread work groups | better only with a *bigger token tile*; a bigger feature tile with 512 threads loses |
+
+## Bugs found (all in this round's own new code)
+
+| # | bug | symptom |
+|---|---|---|
+| 1 | `k_gemm_multi` descriptor pointers | wrong output, no error (see #9 above) |
+| 2 | `k_mlp_gu` returned early before its `barrier()` | **GPU hang**, then `ZE_RESULT_ERROR_DEVICE_LOST` on the next submit |
+| 3 | `k_gemm_b2` used `xmx_block4` with `nblk = k>>6` | read past the weight array, NaN in the residual stream |
+| 4 | `k_mlp_gu` accumulated in 64-wide blocks but its input scales are 128-wide | wrong values, batch != single |
+| 5 | head grouping dropped the GQA weight strides (`zwp = 0`) | every query head used kv head 0: `l0_att` cos 0.66 |
+| 6 | `e2_gpu_gemm_flush` was never called from `e2_gpu_flush` | the last GEMM of a forward never ran (with the descriptor design) |
+
+Bug 5 is the reason `tests/e2_test.c` now has a CPU-vs-GPU cosine check: every
+existing check passed with the attention completely wrong.
+
+## Status against the goal
+
+Same-run A/B, round 9.1 binary -> round 10 binary, min of 5-6 interleaved runs,
+load average 3-8:
+
+| task | round 9.1 | **round 10** | ratio |
+|---|---:|---:|---:|
+| text 8 | 13.09 | **12.77** | 0.98 |
+| text 64 | 16.41 | **15.40** | 0.94 |
+| text 128 | 21.11 | **20.06** | 0.95 |
+| text 512 | 70.73 | **63.11** | 0.89 |
+| text 2048 | 422.5 | **385.1** | 0.91 |
+| image 270 tok | 501.5 | **441.9** | 0.88 |
+| audio 54 tok | 36.10 | **35.36** | 0.98 |
+| video 8 frames | 2164 | **2107** | 0.97 |
+
+Against the round 9.1 OpenVINO int8 column (not re-measurable this round):
+
+| task | e2@GPU r10 | ov-int8 GPU (r9.1) | e2/OV | 1.5x target | still needed |
+|---|---:|---:|---:|---:|---:|
+| text 8 | 12.8 | 5.9 | 0.46 | 4.0 | 3.2x |
+| text 64 | 15.4 | 7.3 | 0.47 | 4.9 | 3.2x |
+| text 128 | 20.1 | 8.0 | 0.40 | 5.3 | 3.8x |
+| text 512 | 63.1 | 19.2 | 0.30 | 12.8 | 4.9x |
+| text 2048 | 385 | 134.5 | 0.35 | 89.7 | 4.3x |
+| image | 442 | 263 | 0.60 | 175 | 2.5x |
+| audio | 35.4 | 23.9 | 0.68 | 15.9 | 2.2x |
+| video | 2107 | 794 | 0.38 | 529 | 4.0x |
+
+**The goal is not met and this round did not get close: it is 2-12% better, not
+2-5x.**  Saying otherwise would be dishonest.  What the round did establish,
+all measured:
+
+* **The launch count was never the problem.**  Halving it (1102 -> 628 kernels)
+  changed nothing measurable.  The per-launch cost is ~1 us without a barrier
+  and ~5 us with one (`gpu-bench`, 64 launches of a 1-work-group GEMM: 0.001 vs
+  0.005 ms).  At 628 launches that is 3 ms of the 63.
+* **The f32 activation stream is the problem at text 512.**  The fused MLP
+  alone is worth 36 ms of 85, and it removed exactly one f32 intermediate
+  (8 MB/layer).  Everything else that writes f32 costs the same order.
+* **The GEMM kernel in isolation is fine and the end-to-end GEMM phase is not.**
+  `E2_GB_LAYERS` runs the real per-layer GEMM sequence with 24 cold weight
+  buffers and a barrier per launch: 7.1 ms at m=512.  The same 216 GEMMs inside
+  the real forward cost ~49 ms (`E2_GPU_NOLAUNCH=1 E2_GPU_NOATTN=1`).  **That
+  3-7x gap is the single most important open question in this codebase**, and
+  this round did not attribute it.  Ruled out: launch count, barriers (in the
+  isolated testbed they cost <5%), the tile, and output write-allocate (the
+  epilogue writes full 64-byte lines).  Measured to matter: writing *fresh*
+  output memory instead of one warm tile (9.6 -> 15.5 ms at m=512 with 8
+  rotating buffers, i.e. the testbed understates the real cost by ~2x, but not
+  by 5x).
+* **The vision attention is the whole image/video cost.**  Image 442 ms is
+  GEMM 190 + elementwise 10 + attention 240.  Both paths are terrible: the CPU
+  int8 attention is 240 ms and the device path is 290 ms, for 35 GMAC of work
+  (0.15 TMAC/s).  The reason is structural: at 1200 patches the materialised
+  score matrix is 74 MB per layer.  Head grouping recovers 10% of that; only a
+  fused flash kernel fixes it.
+* **Audio is a CPU tower.**  `e2_gpu_no_dev` keeps the mel + conformer on the
+  CPU.  It is already within 1.5x of OV, and it needs its own round.
+
+## Round 10 roadmap (measured, in the order that pays)
+
+1. **Attribute and kill the end-to-end vs isolated GEMM gap** (49 vs 7.1 ms at
+   text 512).  Nothing else matters until this is understood: it is 4x of the
+   total, and every other row inherits it.  The next experiment is to run the
+   *real* forward with `E2_GB_LAYERS`-style weights but the real arena and
+   activation pattern, one variable at a time.
+2. **Make the activation stream f16.**  The residual stream and every GEMM
+   output are f32 and each is 1-4 MB per layer.  f16 halves that with ~10 bits
+   of mantissa, which the 0.9997 cosine has room for.  Expected 15-25 ms at
+   text 512 if the traffic hypothesis holds.
+3. **A fused int8 flash attention** (16 query rows, 128-key blocks, online
+   softmax, K/V from SLM, P fed back as the DPAS A operand in the accumulator
+   layout - which is already the A layout).  Kills the score matrix for the
+   vision tower (240 ms -> tens) and for text at 2048 tokens, and lets batched
+   text attention be taken at any length.
+4. **Audio tower on the device** (mel + subsample conv + conformer with the
+   blocked mask).  35.4 -> ~20 ms is the whole remaining gap on that row.
+5. **The vision tower's GEMM phase** (190 ms for ~180 GMAC = 0.95 TMAC/s, 6x
+   worse than the text tower's rate).  The shapes are m=1200, k=768, n=768..3072;
+   it should behave like m=1024 in the tile table (11.5 ms), so something in the
+   vision pipeline is different - same open question as item 1.
+
+## Shortcuts taken (round 10)
+
+- `shortcut: the attention score matrix is materialised in f32` (still) --
+  bounded to `E2_GPU_ATT_BUDGET` per head group, which caps the damage but does
+  not remove it.  Upgrade with roadmap item 3.
+- `shortcut: batched text attention is refused above 512 tokens` (still) --
+  a batch would score the whole t x t rectangle per sequence.  Upgrade with the
+  per-row key band, then with the flash kernel.
+- `shortcut: the MLP intermediate uses 64-wide activation blocks` -- one
+  work-group column tile, so the block max needs no second pass.  Finer than
+  the 128-wide blocks elsewhere, so accuracy is at least as good, but the down
+  projection then needs `k_gemm_b2`.  Upgrade by making the block width a kernel
+  argument if a third width ever appears.
+- The vision tower's attention is on the CPU (`head_dim % 128` gate) because the
+  device path measured 9% slower.  That is a measurement, not a design choice.
+- `shortcut: one tile per m range` -- two variants, threshold 768.  The table
+  above shows the optimum moves smoothly with m; a per-m choice of three
+  variants would win another ~5% at m=512.

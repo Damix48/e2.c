@@ -280,7 +280,10 @@ int e2_gpu_enq_gemm_z(e2_gpu *g, float *y, const int8_t *xq, const float *xsc,
                       int xstr, int xscstr, int ystr, long zxq, long zxsc,
                       long zwp, long zwsc, long zy, int zrep, int nd, int b2) {
     if (e2_gpu_enq_open(g) != 0) return -1;
-    ze_kernel_handle_t kern = b2 ? g->k_gemm_b2 : g->k_gemm_z;
+    const int big = m >= E2_GPU_BIG_MIN;
+    ze_kernel_handle_t kern = b2 ? (big ? g->k_bgemm_b2 : g->k_gemm_b2)
+                                 : (big ? g->k_bgemm_z : g->k_gemm_z);
+    const int tm = big ? E2_GPU_BIG_TM : E2_GPU_TM;
     uint32_t ai = 0;
     if (zeKernelSetArgumentValue(kern, ai++, sizeof(xq), &xq) != ZE_RESULT_SUCCESS ||
         zeKernelSetArgumentValue(kern, ai++, sizeof(xsc), &xsc) != ZE_RESULT_SUCCESS ||
@@ -301,8 +304,7 @@ int e2_gpu_enq_gemm_z(e2_gpu *g, float *y, const int8_t *xq, const float *xsc,
         zeKernelSetArgumentValue(kern, ai++, sizeof(int), &zrep) != ZE_RESULT_SUCCESS)
         return -1;
     /* x walks tokens so consecutive work groups share a weight tile */
-    return e2_gpu_launch_3d(g, kern,
-                            (uint32_t)((m + E2_GPU_TM - 1) / E2_GPU_TM),
+    return e2_gpu_launch_3d(g, kern, (uint32_t)((m + tm - 1) / tm),
                             (uint32_t)((n + E2_GPU_TN - 1) / E2_GPU_TN),
                             (uint32_t)nd, "gemm") == 0 ? 0 : -1;
 }
@@ -325,7 +327,7 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
                     const float *v, int t, int heads, int kv_heads, int head_dim,
                     int window, int nseq, const int *seq_off) {
     if (t <= 0 || heads <= 0 || kv_heads <= 0 || (heads % kv_heads)) return -1;
-    if (head_dim % 64 || head_dim > 512) return -1;
+    if (head_dim % 128 || head_dim > 512) return -1;
     /* The score product has no per-sequence band, so a batch pays for the whole
      * t x t rectangle.  Take that only while it is cheaper than the CPU int8
      * attention plus a flush per layer, which is what the fallback costs. */
@@ -338,27 +340,21 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
     if (e2_gpu_enq_open(g) != 0) return -1;
     if (getenv("E2_GPU_NOATTN")) return 0;   /* profiling knob: price attention */
 
-    /* 128-wide d blocks where the head allows it (fewer, coarser scales), 64
-     * otherwise (the vision tower's head_dim is 64). */
-    const int ablk = head_dim % 128 ? 64 : 128;
-    const int nblk = head_dim / ablk;     /* d blocks, Q row scales */
-    const int b2 = ablk == 64;
+    const int nblk = head_dim / 128;      /* d blocks, Q row scales */
     const int rpad = (t + 127) & ~127;    /* key rows in the packed K / V^T */
     const int groups = heads / kv_heads;
+    const int nkeyblk = rpad / 128;
     int8_t *q8 = e2_arena_alloc(&g->act, (size_t)t * heads * head_dim);
     float *qsc = e2_arena_alloc(&g->act, (size_t)t * heads * nblk * sizeof(float));
     int8_t *kpq = e2_arena_alloc(&g->act, (size_t)kv_heads * rpad * head_dim);
     float *ksc = e2_arena_alloc(&g->act, (size_t)kv_heads * rpad * sizeof(float));
     int8_t *vpq = e2_arena_alloc(&g->act, (size_t)kv_heads * rpad * head_dim);
     float *vsc = e2_arena_alloc(&g->act, (size_t)kv_heads * head_dim * sizeof(float));
-    float *S = e2_arena_alloc(&g->act, (size_t)heads * t * rpad * sizeof(float));
-    int8_t *P = e2_arena_alloc(&g->act, (size_t)heads * t * rpad);
-    float *psc = e2_arena_alloc(&g->act, (size_t)heads * t * (rpad / 128) * sizeof(float));
-    if (!q8 || !qsc || !kpq || !ksc || !vpq || !vsc || !S || !P || !psc) return -1;
+    if (!q8 || !qsc || !kpq || !ksc || !vpq || !vsc) return -1;
 
-    /* Q -> centred int8 + one scale per d block, all (token, head) rows */
+    /* Q -> centred int8 + one scale per 128-wide d block, all (token, head) rows */
     {
-        int qrows = t * heads, kk = head_dim, blk = ablk;
+        int qrows = t * heads, kk = head_dim, blk = 128;
         uint32_t ai = 0;
         float *sc = qsc;
         if (zeKernelSetArgumentValue(g->k_quant_s8, ai++, sizeof(q), &q) != ZE_RESULT_SUCCESS ||
@@ -418,43 +414,69 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
             return -1;
     }
 
-    const int nkeyblk = rpad / 128;
-    /* all heads' scores: m = t query rows, n = rpad keys, k = head_dim */
-    if (e2_gpu_enq_gemm_z(g, S, q8, qsc, kpq, ksc, t, head_dim, rpad,
-                          heads * head_dim, heads * nblk, rpad,
-                          head_dim, nblk, (long)rpad * head_dim, rpad,
-                          (long)t * rpad, groups, heads, b2) != 0)
-        return -1;
-    /* masked softmax -> P with the row normalisation in its scales */
-    {
-        int rows = t, kpad = rpad, kvalid = t, win = window, nsq = nseq;
-        const int *sep = so ? so : seq_off;
-        long zS = (long)t * rpad, zP = (long)t * rpad, zsc = (long)t * nkeyblk;
-        uint32_t ai = 0;
-        if (zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(S), &S) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(P), &P) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(psc), &psc) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(sep), &sep) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(nsq), &nsq) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(rows), &rows) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(kpad), &kpad) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(kvalid), &kvalid) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(win), &win) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(long), &zS) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(long), &zP) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(long), &zsc) != ZE_RESULT_SUCCESS)
+    /* The scores are the only large temporary here: 2*t*rpad*4 bytes per head
+     * (7.6 MB at 1200 patches).  Materialising all heads at once turns that
+     * into 90 MB that no cache holds, so walk the heads in groups whose score
+     * rectangle still fits L3.  A group is a multiple of `groups` to keep the
+     * GQA stride uniform. */
+    const size_t per_head = (size_t)t * rpad * (sizeof(float) + 1) +
+                            (size_t)t * nkeyblk * sizeof(float);
+    int hg = (int)(E2_GPU_ATT_BUDGET / per_head);
+    if (hg < 1) hg = 1;
+    hg -= hg % groups;
+    if (hg < groups) hg = groups;
+    if (hg > heads) hg = heads;
+    for (int h0 = 0; h0 < heads; h0 += hg) {
+        const int nh = h0 + hg > heads ? heads - h0 : hg;
+        float *S = e2_arena_alloc(&g->act, (size_t)nh * t * rpad * sizeof(float));
+        int8_t *P = e2_arena_alloc(&g->act, (size_t)nh * t * rpad);
+        float *psc = e2_arena_alloc(&g->act,
+                                    (size_t)nh * t * nkeyblk * sizeof(float));
+        if (!S || !P || !psc) return -1;
+        /* all heads of the group score in one launch */
+        if (e2_gpu_enq_gemm_z(g, S, q8 + (size_t)h0 * head_dim,
+                              qsc + (size_t)h0 * nblk,
+                              kpq + (size_t)(h0 / groups) * rpad * head_dim,
+                              ksc + (size_t)(h0 / groups) * rpad, t, head_dim,
+                              rpad, heads * head_dim, heads * nblk, rpad,
+                              head_dim, nblk, (long)rpad * head_dim, rpad,
+                              (long)t * rpad, groups, nh, 0) != 0)
             return -1;
-        if (e2_gpu_launch_3d(g, g->k_attn_softmax, (uint32_t)(t * 32 / 64), 1,
-                             (uint32_t)heads, "attn_softmax") != 0)
+        {
+            int rows = t, kpad = rpad, kvalid = t, win = window, nsq = nseq;
+            const int *sep = so ? so : seq_off;
+            long zS = (long)t * rpad, zP = (long)t * rpad, zsc = (long)t * nkeyblk;
+            uint32_t ai = 0;
+            if (zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(S), &S) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(P), &P) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(psc), &psc) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(sep), &sep) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(nsq), &nsq) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(rows), &rows) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(kpad), &kpad) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(kvalid), &kvalid) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(win), &win) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(long), &zS) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(long), &zP) != ZE_RESULT_SUCCESS ||
+                zeKernelSetArgumentValue(g->k_attn_softmax, ai++, sizeof(long), &zsc) != ZE_RESULT_SUCCESS)
+                return -1;
+            if (e2_gpu_launch_3d(g, g->k_attn_softmax, (uint32_t)(t * 32 / 64), 1,
+                                 (uint32_t)nh, "attn_softmax") != 0)
+                return -1;
+        }
+        /* context, written straight into the [token][head][dim] output */
+        if (e2_gpu_enq_gemm_z(g, out + (size_t)h0 * head_dim, P, psc,
+                              vpq + (size_t)(h0 / groups) * rpad * head_dim,
+                              vsc + (size_t)(h0 / groups) * head_dim, t, rpad,
+                              head_dim, rpad, nkeyblk, heads * head_dim,
+                              (long)t * rpad, (long)t * nkeyblk,
+                              (long)rpad * head_dim, head_dim, head_dim,
+                              groups, nh, 0) != 0)
             return -1;
     }
-    /* context, written straight into the [token][head][dim] output */
-    return e2_gpu_enq_gemm_z(g, out, P, psc, vpq, vsc, t, rpad, head_dim,
-                             rpad, nkeyblk, heads * head_dim,
-                             (long)t * rpad, (long)t * nkeyblk,
-                             (long)rpad * head_dim, head_dim,
-                             head_dim, groups, heads, 0);
+    return 0;
 }
+
 int e2_gpu_enq_mlp(e2_gpu *g, float *y, const float *x, int m,
                    const e2_linear *gate, const e2_linear *up,
                    const e2_linear *down) {
@@ -494,8 +516,10 @@ int e2_gpu_enq_mlp(e2_gpu *g, float *y, const float *x, int m,
         zeKernelSetArgumentValue(g->k_mlp_gu, ai++, sizeof(int), &k) != ZE_RESULT_SUCCESS ||
         zeKernelSetArgumentValue(g->k_mlp_gu, ai++, sizeof(int), &inblk) != ZE_RESULT_SUCCESS)
         return -1;
-    if (e2_gpu_launch_3d(g, g->k_mlp_gu,
-                         (uint32_t)((m + E2_GPU_TM - 1) / E2_GPU_TM),
+    const int big = m >= E2_GPU_BIG_MIN;
+    const int tm = big ? E2_GPU_BIG_TM : E2_GPU_TM;
+    if (e2_gpu_launch_3d(g, big ? g->k_bmlp_gu : g->k_mlp_gu,
+                         (uint32_t)((m + tm - 1) / tm),
                          (uint32_t)((n + E2_GPU_TN - 1) / E2_GPU_TN), 1,
                          "mlp_gu") != 0)
         return -1;
@@ -564,10 +588,38 @@ int e2_gpu_enq_linear_pq(e2_gpu *g, float *y, const int8_t *xq, const float *xs,
 /* lifecycle                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Build one tile variant of the matrix-engine module and create its kernels.
+ * Both variants expose the same four entry points, so the launcher only swaps
+ * the handles.  A missing variant is not fatal: the small one is required. */
+static int xmx_module(e2_gpu *g, const unsigned char *spv, size_t len, int sg,
+                      ze_module_handle_t *mod, ze_kernel_handle_t *k_probe,
+                      ze_kernel_handle_t *k_z, ze_kernel_handle_t *k_b2,
+                      ze_kernel_handle_t *k_mlp) {
+    ze_module_desc_t md; memset(&md, 0, sizeof(md));
+    md.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
+    md.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    md.inputSize = len;
+    md.pInputModule = spv;
+    if (zeModuleCreate(g->ctx, g->dev, &md, mod, NULL) != ZE_RESULT_SUCCESS)
+        return -1;
+    static const char *xn[] = {"k_gemm_xmx", "k_gemm_z", "k_gemm_b2", "k_mlp_gu"};
+    ze_kernel_handle_t *out[4] = {k_probe, k_z, k_b2, k_mlp};
+    for (int i = 0; i < 4; i++) {
+        ze_kernel_desc_t d; memset(&d, 0, sizeof(d));
+        d.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
+        d.pKernelName = xn[i];
+        if (zeKernelCreate(*mod, &d, out[i]) != ZE_RESULT_SUCCESS ||
+            zeKernelSetGroupSize(*out[i], 8, (uint32_t)sg, 1) != ZE_RESULT_SUCCESS)
+            return -1;
+    }
+    return 0;
+}
+
 static void gpu_destroy(e2_gpu *g) {
     if (!g) return;
     usm_free(g);
     ze_kernel_handle_t ks[] = {g->k_gemm, g->k_gemm_z, g->k_gemm_b2, g->k_mlp_gu,
+        g->k_bgemm_z, g->k_bgemm_b2, g->k_bmlp_gu,
         g->k_rmsnorm, g->k_rmsnorm_q, g->k_norm_rope, g->k_rope_text,
         g->k_rope_vision,
         g->k_quant_s8, g->k_gelu_mul_q, g->k_gelu_tanh, g->k_scale, g->k_mul_slice,
@@ -575,6 +627,7 @@ static void gpu_destroy(e2_gpu *g) {
     for (size_t i = 0; i < sizeof(ks) / sizeof(ks[0]); i++)
         if (ks[i]) zeKernelDestroy(ks[i]);
     if (g->dmodule) zeModuleDestroy(g->dmodule);
+    if (g->bmodule) zeModuleDestroy(g->bmodule);
     if (g->omodule) zeModuleDestroy(g->omodule);
     if (g->list)    zeCommandListDestroy(g->list);
     if (g->imm)     zeCommandListDestroy(g->imm);
@@ -644,30 +697,14 @@ int e2_gpu_init(e2_ctx *ctx) {
     if (zeCommandListCreate(g->ctx, g->dev, &ld, &g->list) != ZE_RESULT_SUCCESS)
         goto fail;
 
-    {
-        ze_module_desc_t md; memset(&md, 0, sizeof(md));
-        md.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
-        md.format = ZE_MODULE_FORMAT_IL_SPIRV;
-        md.inputSize = e2_gpu_spv_e2_xmx_len;
-        md.pInputModule = e2_gpu_spv_e2_xmx;
-        if (zeModuleCreate(g->ctx, g->dev, &md, &g->dmodule, NULL) != ZE_RESULT_SUCCESS)
-            goto fail;                       /* no matrix engine -> CPU path */
-        static const char *xn[] = {"k_gemm_xmx", "k_gemm_z", "k_gemm_b2",
-            "k_mlp_gu"};
-        ze_kernel_handle_t xk[4] = {0};
-        for (int i = 0; i < 4; i++) {
-            ze_kernel_desc_t d; memset(&d, 0, sizeof(d));
-            d.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
-            d.pKernelName = xn[i];
-            /* 16 sub-groups: eight share the token tile, four the feature tile */
-            if (zeKernelCreate(g->dmodule, &d, &xk[i]) != ZE_RESULT_SUCCESS ||
-                zeKernelSetGroupSize(xk[i], 8, E2_GPU_SG, 1) != ZE_RESULT_SUCCESS)
-                goto fail;
-        }
-        g->k_gemm = xk[0]; g->k_gemm_z = xk[1];
-        g->k_gemm_b2 = xk[2]; g->k_mlp_gu = xk[3];
-        if (getenv("E2_GPU_PROF")) fprintf(stderr, "gpu xmx: gemm up\n");
-    }
+    if (xmx_module(g, e2_gpu_spv_e2_xmx, e2_gpu_spv_e2_xmx_len, E2_GPU_SG,
+                   &g->dmodule, &g->k_gemm, &g->k_gemm_z, &g->k_gemm_b2,
+                   &g->k_mlp_gu) != 0 ||
+        xmx_module(g, e2_gpu_spv_e2_xmx_big, e2_gpu_spv_e2_xmx_big_len,
+                   E2_GPU_BIG_SG, &g->bmodule, &g->k_gemm, &g->k_bgemm_z,
+                   &g->k_bgemm_b2, &g->k_bmlp_gu) != 0)
+        goto fail;                           /* no matrix engine -> CPU path */
+    if (getenv("E2_GPU_PROF")) fprintf(stderr, "gpu xmx: gemm up\n");
 
     {
         static const char *on[] = {"k_rmsnorm", "k_rmsnorm_q", "k_norm_rope",

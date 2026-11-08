@@ -58,6 +58,30 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 768; i++) d = fmaxf(d, fabsf(a[i] - b[i]));
     CHECK(d == 0.0f, "deterministic");
 
+    /* The device path must agree with the CPU path.  Without this the checks
+     * above still pass on a broken kernel - they only look at the norm - which
+     * is exactly how a whole round gets lost (see PERFORMANCE.md round 9.1). */
+    if (e2_device(txt) == E2_DEVICE_GPU) {
+        e2_ctx *cpu = e2_load(textp, tokp);
+        CHECK(cpu != NULL, "cpu context for the device check");
+        if (cpu) {
+            float e[768];
+            e2_set_device(cpu, E2_DEVICE_CPU);
+            CHECK(e2_embed_text(cpu, "What causes the northern lights?", e, 768) == 0,
+                  "cpu embed for the device check");
+            double dot = 0, na = 0, nb = 0;
+            for (int i = 0; i < 768; i++) {
+                dot += (double)a[i] * e[i];
+                na += (double)a[i] * a[i];
+                nb += (double)e[i] * e[i];
+            }
+            double cos = dot / (sqrt(na * nb) + 1e-30);
+            snprintf(msg, sizeof(msg), "gpu matches cpu (cos %.4f)", cos);
+            CHECK(cos > 0.995, msg);
+            e2_free(cpu);
+        }
+    }
+
     const char *texts[4] = {"hello", "a longer sentence about retrieval", "x", ""};
     float batch[4 * 768];
     CHECK(e2_embed_text_batch(txt, texts, 4, batch, 768) == 0, "batch");

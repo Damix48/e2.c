@@ -377,6 +377,137 @@ static int run_shape(int m, int k, int n, int iters) {
     return 0;
 }
 
+/* The per-layer GEMM sequence of the 512-token text tower, with one distinct
+ * cold weight buffer per layer, one submission, a barrier after each launch -
+ * i.e. the shape the real pipeline sees.  This is the number the end-to-end
+ * bench cannot give: it separates the GEMM phase from attention and from the
+ * elementwise passes. */
+static int run_layers(int m) {
+    static const int sh[][2] = {   /* n, k: q, k, v, o, gate, up, down, plg, plp */
+        {1024, 512}, {512, 512}, {512, 512}, {512, 1024}, {2048, 512},
+        {2048, 512}, {512, 2048}, {512, 512}, {512, 512},
+    };
+    const int NL = 24, NS = (int)(sizeof(sh) / sizeof(sh[0]));
+    const size_t per = 4u << 20;               /* 4 MB of weights per layer */
+    int8_t *w = usm((size_t)NL * per);
+    float *wsc = usm(sizeof(float) * 4096);
+    /* E2_GB_YBUF=N: rotate the output through N buffers, so each GEMM writes
+     * fresh memory instead of overwriting one warm tile.  The real pipeline
+     * does that (every activation is a new arena buffer) and it is the whole
+     * difference between the isolated GEMM phase and the end-to-end one. */
+    int ybuf = getenv("E2_GB_YBUF") ? atoi(getenv("E2_GB_YBUF")) : 1;
+    size_t ysz = sizeof(float) * (size_t)m * 2048;
+    float *yall = usm(ysz * (size_t)ybuf);
+    float *y = yall;
+    int8_t *xq = usm((size_t)m * 2048);
+    float *xsc = usm(sizeof(float) * (size_t)m * 32);
+    memset(w, 3, (size_t)NL * per);
+    memset(xq, 1, (size_t)m * 2048);
+    for (int i = 0; i < 4096; i++) wsc[i] = 0.01f;
+    for (int i = 0; i < m * 32; i++) xsc[i] = 0.01f;
+
+    ze_module_desc_t md;
+    memset(&md, 0, sizeof(md));
+    md.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
+    md.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    md.inputSize = e2_gpu_spv_e2_xmx_len;
+    md.pInputModule = e2_gpu_spv_e2_xmx;
+    static unsigned char *spv;
+    if (getenv("E2_GB_SPV")) {
+        FILE *f = fopen(getenv("E2_GB_SPV"), "rb");
+        if (!f) { fprintf(stderr, "no %s\n", getenv("E2_GB_SPV")); return -1; }
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        spv = malloc((size_t)n);
+        if (fread(spv, 1, (size_t)n, f) != (size_t)n) return -1;
+        fclose(f);
+        md.inputSize = (size_t)n;
+        md.pInputModule = spv;
+    }
+    ze_module_handle_t mod = NULL;
+    ze_module_build_log_handle_t mlog = NULL;
+    ze_result_t mrc = zeModuleCreate(g_ctx, g_dev, &md, &mod, &mlog);
+    if (mrc != ZE_RESULT_SUCCESS) {
+        char buf[2048] = "";
+        size_t sz = sizeof(buf) - 1;
+        if (mlog) zeModuleBuildLogGetString(mlog, &sz, buf);
+        fprintf(stderr, "module: %s\n", buf);
+        return -1;
+    }
+    ze_kernel_desc_t kd;
+    memset(&kd, 0, sizeof(kd));
+    kd.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
+    kd.pKernelName = "k_gemm_z";
+    ze_kernel_handle_t kh = NULL;
+    ck(zeKernelCreate(mod, &kd, &kh), "kernel");
+
+    /* the tile is compiled into the SPIR-V, so the sweep has to say which one
+     * it built: E2_GB_RSG/E2_GB_CSG must match the -D flags */
+    int rsg = getenv("E2_GB_RSG") ? atoi(getenv("E2_GB_RSG")) : 4;
+    int csg = getenv("E2_GB_CSG") ? atoi(getenv("E2_GB_CSG")) : 8;
+    int tm = rsg * 16, tn = csg * 16;
+    ck(zeKernelSetGroupSize(kh, 8, (uint32_t)(rsg * csg), 1), "gs2");
+    int reps = getenv("E2_GB_REPS") ? atoi(getenv("E2_GB_REPS")) : 5;
+    double best = 1e9;
+    for (int r = 0; r < reps; r++) {
+        ck(zeCommandListReset(g_list), "reset");
+        for (int li = 0; li < NL; li++) {
+            for (int s = 0; s < NS; s++) {
+                int n = sh[s][0], k = sh[s][1];
+                int8_t *wp = w + (size_t)li * per;
+                int xstr = k, xscstr = k / 128, ystr = n, nd = 1, zrep = 1;
+                y = yall + ysz * (size_t)((li * NS + s) % ybuf);
+                long z0 = 0;
+                uint32_t i = 0;
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(xq), &xq), "a0");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(xsc), &xsc), "a1");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(wp), &wp), "a2");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(wsc), &wsc), "a3");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(y), &y), "a4");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(m), &m), "a5");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(k), &k), "a6");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(n), &n), "a7");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(xstr), &xstr), "a8");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(xscstr), &xscstr), "a9");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(ystr), &ystr), "a10");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(long), &z0), "a11");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(long), &z0), "a12");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(long), &z0), "a13");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(long), &z0), "a14");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(long), &z0), "a15");
+                ck(zeKernelSetArgumentValue(kh, i++, sizeof(zrep), &zrep), "a16");
+                ze_group_count_t gc = {
+                    (uint32_t)((m + tm - 1) / tm),
+                    (uint32_t)((n + tn - 1) / tn), (uint32_t)nd};
+                ck(zeCommandListAppendLaunchKernel(g_list, kh, &gc, NULL, 0, NULL), "l");
+                if (!getenv("E2_GB_NOBARRIER"))
+                    ck(zeCommandListAppendBarrier(g_list, NULL, 0, NULL), "b");
+            }
+        }
+        ck(zeCommandListClose(g_list), "close");
+        double t0 = now_ms();
+        ck(zeCommandQueueExecuteCommandLists(g_queue, 1, &g_list, NULL), "exec");
+        ck(zeCommandQueueSynchronize(g_queue, UINT64_MAX), "sync");
+        double dt = now_ms() - t0;
+        if (dt < best) best = dt;
+    }
+    double gm = 0;
+    for (int s = 0; s < NS; s++) gm += (double)m * sh[s][1] * sh[s][0] / 1e9;
+    gm *= NL;
+    printf("layers m=%d: %.3f ms  %.1f GMAC  %.0f GMAC/s  %.1f GB/s of weights\n",
+           m, best, gm, gm / best * 1e3,
+           (double)NL * per / best / 1e6);
+    zeKernelDestroy(kh);
+    zeModuleDestroy(mod);
+    zeMemFree(g_ctx, w);
+    zeMemFree(g_ctx, wsc);
+    zeMemFree(g_ctx, yall);
+    zeMemFree(g_ctx, xq);
+    zeMemFree(g_ctx, xsc);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (e2_gpu_l0_open() != 0) { fprintf(stderr, "no Level Zero\n"); return 1; }
     ck(zeInit(ZE_INIT_FLAG_GPU_ONLY), "zeInit");
@@ -416,6 +547,7 @@ int main(int argc, char **argv) {
     ck(zeCommandListCreate(g_ctx, g_dev, &ld, &g_list), "list");
 
     int iters = getenv("E2_GB_REPS") ? atoi(getenv("E2_GB_REPS")) : 40;
+    if (getenv("E2_GB_LAYERS")) return run_layers(argc >= 2 ? atoi(argv[1]) : 512);
     if (argc >= 4) {
         run_shape(atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), iters);
     } else {

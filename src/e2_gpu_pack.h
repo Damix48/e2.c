@@ -34,6 +34,17 @@
 #define E2_GPU_TN  (E2_GPU_CSG * E2_GPU_XFB * 8)   /* 64 features per work group */
 #define E2_GPU_SG  (E2_GPU_RSG * E2_GPU_CSG)       /* sub-groups per work group */
 
+/* Second tile variant (tools/gpu/e2_xmx_big.cl): the same kernel with a bigger
+ * token tile, which is what the long rows need because the weight passes then
+ * drop from m/128 to m/256.  The launcher picks by row count; below the
+ * crossover the bigger tile just idles most of the machine. */
+#define E2_GPU_BIG_RSG 16
+#define E2_GPU_BIG_CSG 4
+#define E2_GPU_BIG_TM  (E2_GPU_BIG_RSG * 2 * 8)    /* 256 tokens */
+#define E2_GPU_BIG_TN  (E2_GPU_BIG_CSG * 2 * 8)    /* 64 features */
+#define E2_GPU_BIG_SG  (E2_GPU_BIG_RSG * E2_GPU_BIG_CSG)
+#define E2_GPU_BIG_MIN 768                        /* rows: measured crossover */
+
 /* Repack w into the matrix-engine A layout; pq needs n*k bytes.  Returns 0, or
  * -1 if the shape has no matrix-engine layout. */
 static inline int e2_gpu_dpas_pack(const e2_qmat *w, int8_t *pq)

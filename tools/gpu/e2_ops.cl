@@ -277,10 +277,15 @@ __kernel void k_attn_softmax(__global const float *S, __global char *P,
                 if (v > bm) bm = v;
             }
         bm = sub_group_reduce_max(bm);
-        float s = bm * inv / 127.0f;
+        /* Quantise against the block max (q in [0,127]), and fold the row
+         * normalisation into the *dequantisation* scale only.  Folding 1/sum
+         * into the quantiser step shrinks it by `sum`, so every component above
+         * bm/sum saturates at 127 and the row collapses to a uniform mask. */
+        float s0 = bm / 127.0f;
+        float s = s0 * inv;
         if (s < 1e-20f) s = 1e-20f;
         if (lane == 0) psc[(size_t)row * nblk + b] = s;
-        float is = 1.0f / s;
+        float is = s0 > 0.0f ? 1.0f / s0 : 0.0f;
         for (int i = b0 + lane; i < b1; i += gs) {
             float v = (i >= lo && i < hi) ? exp(sp[i] - mx) : 0.0f;
             int q = (int)rint(v * is);

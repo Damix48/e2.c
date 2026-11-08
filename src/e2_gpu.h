@@ -53,6 +53,10 @@ int e2_gpu_op_mul_slice(e2_ctx *ctx, float *h, const float *ple, int n, int L,
 int e2_gpu_op_pos_add(e2_ctx *ctx, float *x, const int *xy, const float *tab,
                       int P, int H, long stride);
 int e2_gpu_op_linear(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
+/* Pre-quantised activation block (fused producer + quantiser paths, e.g.
+ * gelu(gate)*up feeding the down projection). */
+int e2_gpu_op_linear_pq(e2_ctx *ctx, float *y, const uint8_t *xq, const float *xs,
+                        int m, const e2_linear *l);
 int e2_gpu_op_linear_multi(e2_ctx *ctx, const float *x, int m,
                            const e2_linear *const *ls, float *const *ys, int n);
 

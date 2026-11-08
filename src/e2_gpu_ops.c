@@ -323,6 +323,17 @@ int e2_gpu_op_linear(e2_ctx *ctx, float *y, const float *x, int m, const e2_line
     return OP_FAIL;
 }
 
+/* Same GEMM, activation already quantised on the device by a fused producer. */
+int e2_gpu_op_linear_pq(e2_ctx *ctx, float *y, const uint8_t *xq, const float *xs,
+                        int m, const e2_linear *l) {
+    e2_gpu *g = e2_gpu_on(ctx) ? ctx->gpu : NULL;
+    if (g && SKIPPED(SK_LINEAR)) return OP_FAIL;
+    if (!g || !g->ready) return OP_FAIL;
+    if (e2_gpu_enq_linear_pq(g, y, (const int8_t *)xq, xs, m, l) == 0) return 0;
+    e2_gpu_flush(ctx);
+    return OP_FAIL;
+}
+
 /* Linear list sharing one activation block (q/k/v or gate/up): quantise once. */
 int e2_gpu_op_linear_multi(e2_ctx *ctx, const float *x, int m,
                            const e2_linear *const *ls, float *const *ys, int n) {

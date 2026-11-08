@@ -895,6 +895,13 @@ void e2_linear_forward_st(float *y, const float *x, int m, const e2_linear *l,
 void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
                           const float *xs, int m, const e2_linear *l) {
     const e2_qmat *w = &l->w;
+    /* The fused producer (gelu_mul_q) runs on the device, so the consumer has
+     * to as well: the CPU kernel would read the activation before the GPU
+     * kernel that writes it has run. */
+    if (ctx && ctx->device == E2_DEVICE_GPU && ctx->gpu &&
+        !l->in_min && !l->in_max && !l->out_min && !l->out_max && !w->bias &&
+        e2_gpu_op_linear_pq(ctx, y, xq, xs, m, l) == 0)
+        return;
     e2_gemm_init();
     int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};

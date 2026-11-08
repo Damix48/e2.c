@@ -343,7 +343,8 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
         int8_t *pq = kpq + (size_t)h * rpad * head_dim;
         float *sc = ksc + (size_t)h * rpad;
         uint32_t ai = 0;
-        if (zeKernelSetArgumentValue(g->k_attn_pack, ai++, sizeof(k), &k) != ZE_RESULT_SUCCESS ||
+        const float *ksrc = k + (size_t)h * head_dim;   /* [token][kv_head][dim] */
+        if (zeKernelSetArgumentValue(g->k_attn_pack, ai++, sizeof(ksrc), &ksrc) != ZE_RESULT_SUCCESS ||
             zeKernelSetArgumentValue(g->k_attn_pack, ai++, sizeof(pq), &pq) != ZE_RESULT_SUCCESS ||
             zeKernelSetArgumentValue(g->k_attn_pack, ai++, sizeof(sc), &sc) != ZE_RESULT_SUCCESS ||
             zeKernelSetArgumentValue(g->k_attn_pack, ai++, sizeof(rpad2), &rpad2) != ZE_RESULT_SUCCESS ||
@@ -382,11 +383,11 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
         const int kvh = h / groups;
         /* scores: m = t query rows, n = rpad keys, k = head_dim */
         if (gemm_launch(g, S + (size_t)h * t * rpad, t, head_dim, rpad,
-                        q8 + (size_t)h * t * head_dim,
-                        qsc + (size_t)h * t * nblk,
+                        q8 + (size_t)h * head_dim,
+                        qsc + (size_t)h * nblk,
                         kpq + (size_t)kvh * rpad * head_dim,
                         ksc + (size_t)kvh * rpad,
-                        head_dim, nblk, rpad) != 0) return -1;
+                        heads * head_dim, heads * nblk, rpad) != 0) return -1;
         /* masked softmax -> P with the row normalisation in its scales */
         {
             int rows = t, kpad = rpad, kvalid = t, win = window, nsq = nseq;

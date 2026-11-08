@@ -1469,3 +1469,54 @@ What the round established, all measured:
   directly. Upgrade with roadmap item 2.
 - The audio tower still runs entirely on the CPU (`e2_gpu_no_dev`), as in
   round 8.
+
+## Round 9.1 — the device pipeline was numerically wrong (fixed)
+
+A bench run is worthless on a path that computes the wrong thing, so the round
+started by checking the output instead of the clock.  Against the f32 reference
+dump (`tools/e2_ref.py`, 25-token text) the device path scored **cos 0.497**
+while the CPU path scored 0.9991.  Per-stage dumps localised it: `l0_h`, `l0_q`,
+`l0_k`, `l0_v` matched the CPU bit-for-bit and `l0_att` was **0.42**, so the
+regression was entirely in the rewrite's int8 attention, plus one more below.
+
+| # | bug | effect |
+|---|---|---|
+| 1 | `k_attn_softmax` folded `1/sum` into the *quantiser step* as well as the dequant scale, shrinking the step by `sum`. Every component above `bm/sum` clipped to 127, so each row's probabilities collapsed to a uniform mask. | quantise against the block max (`bm/127`) and fold the normalisation into the dequant scale only |
+| 2 | `e2_gpu_enq_attn` packed K from the buffer base for every kv head (all kv heads got head 0) and sliced Q as if activations were head-major. They are `[token][head][dim]`. | row stride `heads*head_dim`, head offset `h*head_dim`; K needs `h*head_dim` into its `[token][kv_head][dim]` buffer |
+| 3 | `e2_linear_forward_pq` (the fused `gelu(gate)*up -> down` path) still ran the **CPU** GEMM on an activation the device had enqueued but not written. | route it through `e2_gpu_op_linear_pq`; the MLP output was stale |
+
+After the three fixes, same binary, embedding vs the f32 reference **0.999305**
+(CPU path 0.999138), and cos(CPU, GPU) is 0.99919 at 512 tokens, 0.99899 at 64,
+0.99899 image, 0.99939 video, 1.000000 audio (audio tower still on the CPU).
+
+## Round 9.1 bench — e2@GPU vs OpenVINO int8 @GPU, one run
+
+`python tools/bench_compare.py --sources e2,ov-int8-gpu --e2-device gpu
+--repeat 2 --iters 3`, host load average 2.7-3.9.  e2@CPU comes from a second
+run of the same assets minutes later (load ~3); the CPU column is the noisy one.
+
+| task | length | e2@GPU | ov-int8@GPU | e2/OV | 1.5x target | e2@CPU |
+|---|---:|---:|---:|---:|---:|---:|
+| text | 8 | 12.1 | 5.9 | 0.49 | 4.0 | 7.7 |
+| text | 64 | 16.1 | 7.3 | 0.45 | 4.9 | 20.1 |
+| text | 128 | 19.8 | 8.0 | 0.40 | 5.3 | 33.3 |
+| text | 512 | 65.0 | 19.2 | 0.30 | 12.8 | 119.1 |
+| text | 2048 | 374.6 | 134.5 | 0.36 | 89.7 | 579.8 |
+| batch | 8x64 | 53.2 | 16.2 | 0.30 | 10.8 | 132.7 |
+| batch | 32x64 | 220.9 | 67.7 | 0.31 | 45.2 | 564.3 |
+| image | 270 tok | 536.4 | 263.2 | 0.49 | 175.4 | 642.8 |
+| audio | 54 tok | 31.5 | 23.9 | 0.76 | 15.9 | 32.9 |
+| video | 8 frames | 2012.7 | 793.7 | 0.39 | 529.1 | 2131.9 |
+
+(e2/OV < 1 means e2 is faster.  The goal column is what e2@GPU would have to
+reach.)  Reading it:
+
+* The device path now beats e2's **own** CPU path on every row except `text 8`
+  (12.1 vs 7.7 — one forward at 8 tokens is all dispatch latency) and audio
+  (31.5 vs 32.9, a tie: the audio tower is still CPU-side and pays a flush per
+  layer).  At text 512 the device is 1.8x the CPU, at 2048 1.5x.
+* Against OpenVINO the device is **1.3-3.4x slower on every row**, i.e. the
+  1.5x-over-OV goal needs a further **2.0-5.0x** on top of today.
+* The gap is smallest where OpenVINO is worst (audio 0.76, image 0.49, text 8
+  0.49, both launch/weight-bound) and largest on the GEMM-bound rows
+  (text 512 0.30, batches 0.30).

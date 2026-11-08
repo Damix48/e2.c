@@ -1669,27 +1669,34 @@ load average 3-8:
 
 | task | round 9.1 | **round 10** | ratio |
 |---|---:|---:|---:|
-| text 8 | 13.09 | **12.77** | 0.98 |
-| text 64 | 16.41 | **15.40** | 0.94 |
-| text 128 | 21.11 | **20.06** | 0.95 |
-| text 512 | 70.73 | **63.11** | 0.89 |
-| text 2048 | 422.5 | **385.1** | 0.91 |
-| image 270 tok | 501.5 | **441.9** | 0.88 |
-| audio 54 tok | 36.10 | **35.36** | 0.98 |
-| video 8 frames | 2164 | **2107** | 0.97 |
+| text 8 | 12.64 | **12.92** | 1.02 |
+| text 64 | 15.52 | **15.79** | 1.02 |
+| text 128 | 20.65 | **20.10** | 0.97 |
+| text 512 | 68.23 | **61.78** | 0.91 |
+| text 2048 | 414.3 | **360.2** | 0.87 |
+| image 270 tok | 481.8 | **430.8** | 0.89 |
+| audio 54 tok | 32.88 | **33.08** | 1.01 |
+| video 8 frames | 2052 | **2108** | 1.03 |
+
+(min of 8 interleaved runs for the text rows, 4 for the media rows, load
+average 4-8.  The short rows are a wash and video is 3% worse inside the noise;
+the gains are all on the rows with many tokens, which is where the fusions
+bite.  An earlier, quieter run of the same two binaries gave -2%/-6%/-5%/-11%/
+-9%/-12%/-2%/-3%, so treat the small rows as "no change" and the long rows as
+-9 to -13%.)
 
 Against the round 9.1 OpenVINO int8 column (not re-measurable this round):
 
 | task | e2@GPU r10 | ov-int8 GPU (r9.1) | e2/OV | 1.5x target | still needed |
 |---|---:|---:|---:|---:|---:|
-| text 8 | 12.8 | 5.9 | 0.46 | 4.0 | 3.2x |
-| text 64 | 15.4 | 7.3 | 0.47 | 4.9 | 3.2x |
+| text 8 | 12.9 | 5.9 | 0.46 | 4.0 | 3.2x |
+| text 64 | 15.8 | 7.3 | 0.46 | 4.9 | 3.2x |
 | text 128 | 20.1 | 8.0 | 0.40 | 5.3 | 3.8x |
-| text 512 | 63.1 | 19.2 | 0.30 | 12.8 | 4.9x |
-| text 2048 | 385 | 134.5 | 0.35 | 89.7 | 4.3x |
-| image | 442 | 263 | 0.60 | 175 | 2.5x |
-| audio | 35.4 | 23.9 | 0.68 | 15.9 | 2.2x |
-| video | 2107 | 794 | 0.38 | 529 | 4.0x |
+| text 512 | 61.8 | 19.2 | 0.31 | 12.8 | 4.8x |
+| text 2048 | 360 | 134.5 | 0.37 | 89.7 | 4.0x |
+| image | 431 | 263 | 0.61 | 175 | 2.5x |
+| audio | 33.1 | 23.9 | 0.72 | 15.9 | 2.1x |
+| video | 2108 | 794 | 0.38 | 529 | 4.0x |
 
 **The goal is not met and this round did not get close: it is 2-12% better, not
 2-5x.**  Saying otherwise would be dishonest.  What the round did establish,

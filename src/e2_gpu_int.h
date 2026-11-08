@@ -13,6 +13,7 @@
 
 #include "e2_gpu.h"
 #include "e2_gpu_l0.h"
+#include "e2_gpu_pack.h"
 
 /* One resident packed matrix.  Keyed by the source pointer: the model file is
  * mmap'd and never moves, so the address is a stable id.  Only the matrix
@@ -46,8 +47,9 @@ typedef struct e2_gpu {
     ze_command_list_handle_t imm;   /* immediate list, one-shot fallbacks */
     ze_command_list_handle_t list;  /* deferred list: a whole forward */
     ze_module_handle_t dmodule, omodule;
-    ze_kernel_handle_t k_gemm;
-    ze_kernel_handle_t k_rmsnorm, k_norm_rope, k_rope_text, k_rope_vision;
+    ze_kernel_handle_t k_gemm, k_gemm_z, k_gemm_b2, k_mlp_gu;
+    ze_kernel_handle_t k_rmsnorm, k_rmsnorm_q, k_norm_rope, k_rope_text,
+        k_rope_vision;
     ze_kernel_handle_t k_attn_pack, k_attn_softmax, k_quant_s8;
     ze_kernel_handle_t k_gelu_mul_q, k_gelu_tanh, k_scale;
     ze_kernel_handle_t k_mul_slice, k_pos_add;
@@ -71,6 +73,11 @@ typedef struct e2_gpu {
     e2_gpu_wct wct;
     e2_gpu_mir *mir;
     int mir_cap, mir_used, mir_shift;
+
+    /* The activation a norm just quantised, so the GEMM that follows does not
+     * quantise it a second time (q/k/v share one).  Keyed by the f32 pointer;
+     * cleared as soon as a GEMM reads a different activation. */
+    struct { const float *x; int m, k; int8_t *q; float *sc; } ac;
 
     /* Packed activations live as long as the forward: a GEMM in the queued
      * list may not have run yet when the next one is packed, so they cannot
@@ -102,6 +109,23 @@ void *e2_usm_alloc(e2_gpu *g, size_t n);
 void *e2_usm_realloc(e2_gpu *g, void **p, size_t *cap, size_t need);
 e2_gpu_wc *e2_gpu_weight(e2_gpu *g, const e2_qmat *w);
 const void *e2_gpu_mirror(e2_gpu *g, const void *p, size_t bytes);
+
+/* One launch of `nd` GEMMs that share a shape and differ by a constant stride
+ * (the attention heads).  0 = enqueued. */
+int e2_gpu_enq_gemm_z(e2_gpu *g, float *y, const int8_t *xq, const float *xsc,
+                      const int8_t *wp, const float *wsc, int m, int k, int n,
+                      int xstr, int xscstr, int ystr, long zxq, long zxsc,
+                      long zwp, long zwsc, long zy, int zrep, int nd, int b2);
+
+/* Enqueue y[m][n] = x @ w^T for a model matrix.  0 = enqueued. */
+int e2_gpu_gemm_add(e2_gpu *g, float *y, const int8_t *xq, const float *xsc,
+                    int m, const e2_qmat *w);
+
+/* Enqueue y = quantise(gelu(gate(x)) * up(x)) followed by down(y), the whole
+ * MLP block: two launches instead of six, and no f32 intermediate. */
+int e2_gpu_enq_mlp(e2_gpu *g, float *y, const float *x, int m,
+                   const e2_linear *gate, const e2_linear *up,
+                   const e2_linear *down);
 
 /* Enqueue y[m][n] = x @ w^T (quantising x on the device).  0 = enqueued. */
 int e2_gpu_enq_linear(e2_gpu *g, float *y, const float *x, int m, const e2_linear *l);

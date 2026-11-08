@@ -173,6 +173,10 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
         e2_rmsnorm(ctx, h, x, ly->pre_ff_norm, n, H, c->text_eps);
         p2[4] += e2_now_ms() - _q;
         _i = 9;
+        if (e2_gpu_op_mlp(ctx, h, h, n, &ly->gate, &ly->up, &ly->down) == 0) {
+            _i = 15;
+            goto mlp_done;
+        }
         {
             const e2_linear *ls[2] = {&ly->gate, &ly->up};
             float *ys[2] = {tmp, up};
@@ -193,6 +197,7 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
             _i = 11;
             PROF_T(e2_linear_forward(ctx, h, tmp, n, &ly->down));
         }
+mlp_done:
         _q = e2_now_ms();
         e2_rmsnorm_add(ctx, x, h, ly->post_ff_norm, n, H, c->text_eps);
         p2[6] += e2_now_ms() - _q;

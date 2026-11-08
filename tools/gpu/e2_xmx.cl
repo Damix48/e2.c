@@ -5,36 +5,37 @@
  *
  * Arithmetic (identical to src/e2_gemm.c, so the results match the CPU path):
  *
- *   y[m][n] = sum_b xblk[m][b] * wsc[n] * ( sum_k q[m][k]*w[n][k] - 128*wsum[b][n] )
+ *   y[m][n] = sum_b xsc[m][b] * wsc[n] * sum_{k in block b} q[m][k]*w[n][k]
  *
- * with b over 128-wide k blocks, q the activation biased by +128 and wsum[b][n]
- * the sum of the 128 int8 weights of that block.  The int32 accumulator spans
- * exactly one 128 block, then the epilogue folds in that block's activation
- * scale, so it never grows past 2^24.
+ * with b over BSTEP*32-wide k blocks.  The int32 accumulator spans exactly one
+ * block, then the epilogue folds in that block's activation scale, so it never
+ * grows past 2^24.  The activation is centred (symmetric) int8, which is what
+ * the matrix engine's i8_i8 form needs: no zero point, no weight sums.
  *
  * Operands.  A is the weight matrix, B the activation, which is the orientation
  * where both are one 32-byte vector load per lane per k step:
  *   A (8 features x 32 k, s8):  ap[fb][kstep][lane][r*4+c]
  *     lane l holds k = 4l..4l+3 of feature r of the 8-feature block fb.
- *   B (32 k x 8 tokens, u8):    plain row-major activations, lane = token,
+ *   B (32 k x 8 tokens, s8):    plain row-major activations, lane = token,
  *     32 contiguous bytes of that token's row.
- *   D: lane = token, dword r = feature, so the epilogue writes y[row][col]
+ *   D: lane = token, dword = feature, so the epilogue writes y[row][col]
  *     with an 8-float store per feature block.
  * The activation is never repacked; only the weights are, once per model at
  * load time (src/e2_gpu_pack.h).
  *
  * Tiling.  A sub-group (8 lanes) computes E2_XTB*8 tokens x E2_XFB*8 features
- * with XTB*XFB int8 and the same number of float8 accumulators (2x2 is 64+64
- * registers, which is what fits).  Four sub-groups share the token tile and
- * four share the feature tile, so one work group covers E2_TM x E2_TN and the
- * operand traffic per GEMM is m/E2_TM weight passes plus n/E2_TN activation
- * passes: the tile size is what sets the arithmetic intensity, and 64x64 keeps
- * this kernel compute-bound rather than load-bound (32 tokens x 16 features was
- * 1.2 TMAC/s, 8x under the engine's 10.5 TMAC/s issue limit).
+ * with XTB*XFB int8 and the same number of float8 accumulators.  Four
+ * sub-groups share the token tile and four share the feature tile, so one work
+ * group covers E2_TM x E2_TN and the operand traffic per GEMM is m/E2_TM
+ * weight passes plus n/E2_TN activation passes.
  *
- * The row tile below E2_TM tokens is padding, which costs nothing at small m:
- * those shapes are weight-bandwidth bound, and every work group still streams
- * its weight tile exactly once.
+ * Three entry points share one body:
+ *   k_gemm_xmx    one GEMM, 128-wide activation blocks
+ *   k_gemm_multi  N independent GEMMs, one per gridCountZ slot (a descriptor
+ *                 array), so q/k/v or the four attention heads are one launch
+ *   k_mlp_gu      gate and up for the same feature tile, fused into
+ *                 quantise(gelu(gate)*up) - the MLP's f32 intermediate never
+ *                 reaches memory.  Its 64-wide blocks feed k_gemm_b2.
  */
 
 #ifndef E2_XTB
@@ -49,8 +50,9 @@
 #ifndef E2_CSG
 #define E2_CSG 4   /* sub-groups sharing the token tile */
 #endif
-#define E2_TM  (E2_RSG * E2_XTB * 8)   /* tokens per work group, mode A */
+#define E2_TM  (E2_RSG * E2_XTB * 8)   /* tokens per work group */
 #define E2_TN  (E2_CSG * E2_XFB * 8)   /* features per work group */
+#define E2_NT  (E2_RSG * E2_XTB * 8)   /* local token slots for the SLM reduce */
 
 /* A operand (weight) byte offset for one lane: the feature block is the outer
  * dimension, so a sub-group streams its weight tile as contiguous runs.  Kept
@@ -58,72 +60,54 @@
 #define XW(base, fb, kstep, lane) \
     ((size_t)((fb) * nkc + (kstep)) * 256 + (size_t)(lane) * 32)
 
-/* One 128-wide k block: 4 DPAS per (token block, feature block).  ntokens is
- * the number of real 8-token blocks in this sub-group's row tile (1 or 2). */
-static inline void xmx_block(__global const char *wp, __global const uchar *xq,
-                             __global const float *xsc, __global const float *wsc,
-                             float8 facc[E2_XTB][E2_XFB],
-                             int b, int lane, int nkc, int nblk, int m, int xstr,
-                             int xscstr, int mtok, int k, int fb0, int n0, int ntb)
-{
-    int8 acc[E2_XTB][E2_XFB];
-#pragma unroll
-    for (int tc = 0; tc < E2_XTB; tc++)
-#pragma unroll
-        for (int fb = 0; fb < E2_XFB; fb++) acc[tc][fb] = (int8)(0);
-#pragma unroll
-    for (int t = 0; t < 4; t++) {
-        const int kstep = b * 4 + t;
-        int8 av[E2_XFB];
-#ifdef E2_DBG_NOLOAD
-        /* benchmark only: operands from registers, to price the loads */
-#pragma unroll
-        for (int fb = 0; fb < E2_XFB; fb++) av[fb] = (int8)(lane + fb + kstep);
-#else
-#pragma unroll
-        for (int fb = 0; fb < E2_XFB; fb++)
-            av[fb] = *(const __global int8 *)(wp + XW(wp, fb0 + fb, kstep, lane));
-#endif
-#pragma unroll
-        for (int tc = 0; tc < E2_XTB; tc++) {
-            const int row = mtok + tc * 8;
-            int8 bv;
-#ifdef E2_DBG_NOLOAD
-            bv = (int8)(lane + tc + kstep);
-#else
-#ifdef E2_DBG_XACT
-            /* benchmark only: activation transposed to [kstep][token][32 B] so a
-             * sub-group's eight lane loads are one contiguous 256-byte run */
-            bv = *(const __global int8 *)(xq + ((size_t)kstep * ((m + 7) & ~7) +
-                                               (size_t)row) * 32);
-#else
-            bv = row < m
-                ? *(const __global int8 *)(xq + (size_t)row * xstr + kstep * 32)
-                : (int8)(0);
-#endif
-#endif
-#pragma unroll
-            for (int fb = 0; fb < E2_XFB; fb++)
-                acc[tc][fb] = intel_sub_group_i8_i8_matrix_mad_k32(av[fb], bv, acc[tc][fb]);
-        }
-    }
-#ifdef E2_DBG_NOEPI
-    /* benchmark only: drop the per-block scale epilogue to price it */
-#pragma unroll
-    for (int fb = 0; fb < E2_XFB; fb++)
-#pragma unroll
-        for (int tc = 0; tc < ntb; tc++) facc[tc][fb] += convert_float8(acc[tc][fb]);
-    return;
-#endif
-#pragma unroll
-    for (int fb = 0; fb < E2_XFB; fb++)
-#pragma unroll
-        for (int tc = 0; tc < ntb; tc++) {
-            const int row = mtok + tc * 8;
-            const float a = xsc[(size_t)(row < m ? row : m - 1) * xscstr + b];
-            facc[tc][fb] += (float8)(a) * convert_float8(acc[tc][fb]);
-        }
+/* One activation block of BSTEP DPAS k-steps, then that block's scale.
+ * `ntb` is the number of real 8-token blocks in this sub-group's row tile.
+ * Instantiated twice because the block width is what the k loop is unrolled
+ * around: 128-wide for the projections, 64-wide for the MLP intermediate
+ * (one work-group column tile), which is finer and therefore at least as
+ * accurate. */
+#define DEF_XMX_BLOCK(NAME, BSTEP)                                            \
+static inline void NAME(const __global char *wp, const __global char *xq,      \
+                        const __global float *xsc,                            \
+                        float8 facc[E2_XTB][E2_XFB], int b, int lane,          \
+                        int nkc, int m, int xstr, int xscstr, int mtok,        \
+                        int fb0, int ntb)                                     \
+{                                                                             \
+    int8 acc[E2_XTB][E2_XFB];                                                 \
+    _Pragma("unroll")                                                         \
+    for (int tc = 0; tc < E2_XTB; tc++)                                       \
+        _Pragma("unroll")                                                     \
+        for (int fb = 0; fb < E2_XFB; fb++) acc[tc][fb] = (int8)(0);           \
+    _Pragma("unroll")                                                         \
+    for (int t = 0; t < (BSTEP); t++) {                                       \
+        const int kstep = b * (BSTEP) + t;                                    \
+        int8 av[E2_XFB];                                                      \
+        _Pragma("unroll")                                                     \
+        for (int fb = 0; fb < E2_XFB; fb++)                                   \
+            av[fb] = *(const __global int8 *)(wp + XW(wp, fb0 + fb, kstep, lane)); \
+        _Pragma("unroll")                                                     \
+        for (int tc = 0; tc < E2_XTB; tc++) {                                 \
+            const int row = mtok + tc * 8;                                    \
+            int8 bv = row < m                                                  \
+                ? *(const __global int8 *)(xq + (size_t)row * xstr + kstep * 32) \
+                : (int8)(0);                                                   \
+            _Pragma("unroll")                                                 \
+            for (int fb = 0; fb < E2_XFB; fb++)                               \
+                acc[tc][fb] = intel_sub_group_i8_i8_matrix_mad_k32(av[fb], bv, \
+                                                                  acc[tc][fb]); \
+        }                                                                     \
+    }                                                                         \
+    _Pragma("unroll")                                                         \
+    for (int fb = 0; fb < E2_XFB; fb++)                                       \
+        _Pragma("unroll")                                                     \
+        for (int tc = 0; tc < ntb; tc++) {                                    \
+            const int row = mtok + tc * 8;                                    \
+            const float a = xsc[(size_t)(row < m ? row : m - 1) * xscstr + b]; \
+            facc[tc][fb] += (float8)(a) * convert_float8(acc[tc][fb]);         \
+        }                                                                     \
 }
+DEF_XMX_BLOCK(xmx_block4, 4)
+DEF_XMX_BLOCK(xmx_block2, 2)
 
 /* Store this sub-group's tile: lane = row, dword = feature.  The per-column
  * weight scale is applied here, once, instead of per k block. */
@@ -142,20 +126,17 @@ static inline void xmx_store(__global float *y, const float8 facc[E2_XTB][E2_XFB
     }
 }
 
-/* mode A: work group = E2_TM tokens x E2_TN features. */
-__attribute__((intel_reqd_sub_group_size(8)))
-__kernel void k_gemm_xmx(__global const uchar *xq, __global const float *xsc,
-                         __global const char *wp, __global const float *wsc,
-                         __global float *y,
-                         const int m, const int k, const int n,
-                         const int xstr, const int xscstr, const int ystr)
+static inline void xmx_gemm(const __global char *xq, const __global float *xsc,
+                            const __global char *wp, const __global float *wsc,
+                            __global float *y, int m, int k, int n, int xstr,
+                            int xscstr, int ystr, uint gx, uint gy)
 {
     const int lane = get_sub_group_local_id();
     const int sg = get_sub_group_id();
     const int nkc = k >> 5, nblk = k >> 7;
-    const int m0 = get_group_id(0) * E2_TM + (sg / E2_CSG) * (E2_XTB * 8);
+    const int m0 = gx * E2_TM + (sg / E2_CSG) * (E2_XTB * 8);
     if (m0 >= m) return;
-    const int n0 = get_group_id(1) * E2_TN + (sg % E2_CSG) * (E2_XFB * 8);
+    const int n0 = gy * E2_TN + (sg % E2_CSG) * (E2_XFB * 8);
     if (n0 >= n) return;
     const int mtok = m0 + lane;
     const int ntb = m0 + 8 >= m ? 1 : E2_XTB;
@@ -167,9 +148,202 @@ __kernel void k_gemm_xmx(__global const uchar *xq, __global const float *xsc,
         for (int fb = 0; fb < E2_XFB; fb++) facc[tc][fb] = (float8)(0.0f);
 
     for (int b = 0; b < nblk; b++)
-        xmx_block(wp, xq, xsc, wsc, facc, b, lane, nkc, nblk, m, xstr, xscstr,
-                  mtok, k, n0 >> 3, n0, ntb);
+        xmx_block4(wp, xq, xsc, facc, b, lane, nkc, m, xstr, xscstr, mtok,
+                   n0 >> 3, ntb);
     xmx_store(y, facc, wsc, m0, lane, ystr, n0, m, ntb);
+}
+
+/* mode A: work group = E2_TM tokens x E2_TN features, one GEMM. */
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void k_gemm_xmx(__global const char *xq, __global const float *xsc,
+                         __global const char *wp, __global const float *wsc,
+                         __global float *y,
+                         const int m, const int k, const int n,
+                         const int xstr, const int xscstr, const int ystr)
+{
+    xmx_gemm(xq, xsc, wp, wsc, y, m, k, n, xstr, xscstr, ystr,
+             get_group_id(0), get_group_id(1));
+}
+
+/* Head-batched form: gridCountZ indexes a run of GEMMs that share one shape
+ * and differ only by a constant stride (the attention heads).  zrep folds the
+ * GQA layout in: every zrep-th head steps the weight operand, which is how two
+ * query heads share one kv head.  A descriptor array would be tidier but a
+ * pointer stored in global memory does not survive the SPIR-V path. */
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void k_gemm_z(__global const char *xq, __global const float *xsc,
+                       __global const char *wp, __global const float *wsc,
+                       __global float *y, const int m, const int k, const int n,
+                       const int xstr, const int xscstr, const int ystr,
+                       const long zxq, const long zxsc, const long zwp,
+                       const long zwsc, const long zy, const int zrep)
+{
+    const uint z = get_group_id(2);
+    if (z) {
+        xq += (size_t)z * zxq;
+        xsc += (size_t)z * zxsc;
+        y += (size_t)z * zy;
+        const uint w = z / (uint)zrep;
+        wp += (size_t)w * zwp;
+        wsc += (size_t)w * zwsc;
+    }
+    xmx_gemm(xq, xsc, wp, wsc, y, m, k, n, xstr, xscstr, ystr,
+             get_group_id(0), get_group_id(1));
+}
+
+/* Same GEMM, 64-wide activation blocks: the input of the MLP down projection,
+ * which k_mlp_gu quantised one 64-feature tile at a time. */
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void k_gemm_b2(__global const char *xq, __global const float *xsc,
+                        __global const char *wp, __global const float *wsc,
+                        __global float *y,
+                        const int m, const int k, const int n,
+                        const int xstr, const int xscstr, const int ystr,
+                        const long zxq, const long zxsc, const long zwp,
+                        const long zwsc, const long zy, const int zrep)
+{
+    const uint z = get_group_id(2);
+    if (z) {
+        xq += (size_t)z * zxq;
+        xsc += (size_t)z * zxsc;
+        y += (size_t)z * zy;
+        const uint w = z / (uint)zrep;
+        wp += (size_t)w * zwp;
+        wsc += (size_t)w * zwsc;
+    }
+    const int lane = get_sub_group_local_id();
+    const int sg = get_sub_group_id();
+    const int nkc = k >> 5, nblk = k >> 6;
+    const int m0 = get_group_id(0) * E2_TM + (sg / E2_CSG) * (E2_XTB * 8);
+    if (m0 >= m) return;
+    const int n0 = get_group_id(1) * E2_TN + (sg % E2_CSG) * (E2_XFB * 8);
+    if (n0 >= n) return;
+    const int mtok = m0 + lane;
+    const int ntb = m0 + 8 >= m ? 1 : E2_XTB;
+    float8 facc[E2_XTB][E2_XFB];
+#pragma unroll
+    for (int tc = 0; tc < E2_XTB; tc++)
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++) facc[tc][fb] = (float8)(0.0f);
+    for (int b = 0; b < nblk; b++)
+        xmx_block2(wp, xq, xsc, facc, b, lane, nkc, m, xstr, xscstr, mtok,
+                   n0 >> 3, ntb);
+    xmx_store(y, facc, wsc, m0, lane, ystr, n0, m, ntb);
+}
+
+/* ------------------------------------------------------------------ */
+/* fused MLP: quantise(gelu(gate) * up)                                */
+/*                                                                     */
+/* One work group covers E2_TM tokens x E2_TN features of the MLP      */
+/* intermediate.  It runs the DPAS loop twice (gate, then up) and       */
+/* combines the two in registers, so the f32 intermediate that used to  */
+/* be 8 MB per layer never reaches memory.  The int8 output uses        */
+/* 64-wide blocks, which is one work-group column tile: the block max   */
+/* is reduced across the E2_CSG sub-groups that share the token tile    */
+/* through a small SLM table.                                           */
+/* ------------------------------------------------------------------ */
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void k_mlp_gu(__global const char *xq, __global const float *xsc,
+                       __global const char *wpg, __global const float *wscg,
+                       __global const char *wpu, __global const float *wscu,
+                       __global char *outq, __global float *outsc,
+                       const int m, const int k, const int n,
+                       const int xstr, const int xscstr)
+{
+    const int lane = get_sub_group_local_id();
+    const int sg = get_sub_group_id();
+    const int csg = sg % E2_CSG;
+    const int nkc = k >> 5, nblk = k >> 7;   /* input: 128-wide blocks */
+    const int m0 = get_group_id(0) * E2_TM + (sg / E2_CSG) * (E2_XTB * 8);
+    const int n0 = get_group_id(1) * E2_TN + csg * (E2_XFB * 8);
+    /* a work group whose token or feature tile is empty still has to reach the
+     * barrier below, so this cannot return early */
+    const int active = (m0 < m && n0 < n);
+    const int mtok = m0 + lane;
+    const int ntb = m0 + 8 >= m ? 1 : E2_XTB;
+    const int fb0 = n0 >> 3;
+
+    /* up first, kept in float; then gate, combined in place */
+    float8 acc[E2_XTB][E2_XFB], gacc[E2_XTB][E2_XFB];
+#pragma unroll
+    for (int tc = 0; tc < E2_XTB; tc++)
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++) acc[tc][fb] = gacc[tc][fb] = (float8)(0.0f);
+    if (active) {
+        for (int b = 0; b < nblk; b++)
+            xmx_block4(wpu, xq, xsc, acc, b, lane, nkc, m, xstr, xscstr, mtok,
+                       fb0, ntb);
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++)
+#pragma unroll
+            for (int tc = 0; tc < ntb; tc++)
+                acc[tc][fb] *= vload8(0, wscu + n0 + fb * 8);
+        for (int b = 0; b < nblk; b++)
+            xmx_block4(wpg, xq, xsc, gacc, b, lane, nkc, m, xstr, xscstr, mtok,
+                       fb0, ntb);
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++)
+#pragma unroll
+            for (int tc = 0; tc < ntb; tc++)
+                gacc[tc][fb] *= vload8(0, wscg + n0 + fb * 8);
+        /* r = gelu(gate) * up, back into acc */
+#pragma unroll
+        for (int tc = 0; tc < E2_XTB; tc++)
+#pragma unroll
+            for (int fb = 0; fb < E2_XFB; fb++) {
+#pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    float g = gacc[tc][fb][r];
+                    float t = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+                    g = t > 15.0f ? g : g / (1.0f + exp(-2.0f * t));
+                    acc[tc][fb][r] *= g;
+                }
+            }
+    }
+
+    /* per-row max of this sub-group's E2_XFB*8 features, reduced across the
+     * sub-groups that share the token tile: a 64-wide block is exactly one
+     * work-group column tile, which is why the down projection uses 64-wide
+     * scales. */
+    __local float sm[E2_NT][E2_CSG];
+#pragma unroll
+    for (int tc = 0; tc < E2_XTB; tc++) {
+        const int lr = (sg / E2_CSG) * (E2_XTB * 8) + tc * 8 + lane;
+        const int row = m0 + tc * 8 + lane;
+        float mx = 0.0f;
+        if (active && row < m) {
+#pragma unroll
+            for (int fb = 0; fb < E2_XFB; fb++)
+#pragma unroll
+                for (int r = 0; r < 8; r++) mx = fmax(mx, fabs(acc[tc][fb][r]));
+        }
+        sm[lr][csg] = mx;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (!active) return;
+    const int blk = n0 >> 6;
+    const int nsc = n >> 6;
+#pragma unroll
+    for (int tc = 0; tc < E2_XTB; tc++) {
+        const int lr = (sg / E2_CSG) * (E2_XTB * 8) + tc * 8 + lane;
+        const int row = m0 + tc * 8 + lane;
+        if (row >= m) continue;
+        float mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < E2_CSG; j++) mx = fmax(mx, sm[lr][j]);
+        float s = mx / 127.0f;
+        if (s < 1e-12f) s = 1e-12f;
+        outsc[(size_t)row * nsc + blk] = s;
+        const float inv = 1.0f / s;
+        __global char *qp = outq + (size_t)row * n + n0;
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++)
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                int v = (int)rint(acc[tc][fb][r] * inv);
+                qp[fb * 8 + r] = (char)(v < -127 ? -127 : (v > 127 ? 127 : v));
+            }
+    }
 }
 
 /* Matrix-engine issue probe: the same tile shape and DPAS mix as k_gemm_xmx

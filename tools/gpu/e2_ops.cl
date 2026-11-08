@@ -59,6 +59,54 @@ __kernel void k_rmsnorm(__global const float *x, __global const float *w,
     }
 }
 
+/* Same as k_rmsnorm (modes 0/1/2) and it also writes the int8 activation the
+ * next GEMM would have produced anyway, so the separate k_quant_s8 pass and its
+ * read+write of the f32 row never happen.  `blk` matches k_quant_s8. */
+__kernel void k_rmsnorm_q(__global const float *x, __global const float *w,
+                          __global const float *src, __global float *out,
+                          __global char *q, __global float *sc,
+                          const int rows, const int dim, const float eps,
+                          const float pre, const int mode, const int blk)
+{
+    int gs = get_sub_group_size();
+    int lane = get_sub_group_local_id();
+    int row = get_global_id(0) / gs;
+    if (row >= rows) return;
+    int acc_row = (mode == 2);
+    const __global float *sp = acc_row ? src + (size_t)row * dim
+                                       : x + (size_t)row * dim;
+    float p = (mode == 1) ? pre : 1.0f;
+    float sum = 0.0f;
+    for (int i = lane; i < dim; i += gs) {
+        float v = sp[i] * p;
+        sum += v * v;
+    }
+    sum = sub_group_reduce_add(sum);
+    float s = rms_scale(sum, dim, eps);
+    __global float *op = out + (size_t)row * dim;
+    for (int i = lane; i < dim; i += gs) {
+        float v = sp[i] * p * s;
+        float r = w ? v * w[i] : v;
+        op[i] = acc_row ? op[i] + r : r;
+    }
+    /* quantise what was just written, one block at a time */
+    int nblk = dim / blk;
+    __global char *qp = q + (size_t)row * dim;
+    for (int b = 0; b < nblk; b++) {
+        float mx = 0.0f;
+        for (int i = lane; i < blk; i += gs) mx = fmax(mx, fabs(op[b * blk + i]));
+        mx = sub_group_reduce_max(mx);
+        float qs = mx / 127.0f;
+        if (qs < 1e-12f) qs = 1e-12f;
+        float inv = 1.0f / qs;
+        for (int i = lane; i < blk; i += gs) {
+            int v = (int)rint(op[b * blk + i] * inv);
+            qp[b * blk + i] = (char)(v < -127 ? -127 : (v > 127 ? 127 : v));
+        }
+        if (lane == 0) sc[(size_t)row * nblk + b] = qs;
+    }
+}
+
 /* rows are (token, head) pairs: position = row/per_pos - seq_off[seq]. */
 static inline int rope_pos(int row, int per_pos, __global const int *seq_off,
                            int nseq)
@@ -186,12 +234,19 @@ __kernel void k_rope_vision(__global float *q, __global float *k,
 __kernel void k_attn_pack(__global const float *src, __global char *pq,
                           __global float *sc, const int rpad, const int rvalid,
                           const int kpad, const int kvalid, const int rstride,
-                          const int kstride)
+                          const int kstride, const long zsrc, const long zpq,
+                          const long zsc)
 {
     int gs = get_sub_group_size();
     int lane = get_sub_group_local_id();
     int row = get_global_id(0) / gs;
     if (row >= rpad) return;
+    /* gridCountZ = heads: the per-head operands are at a fixed stride */
+    if (get_group_id(2)) {
+        src += (size_t)get_group_id(2) * zsrc;
+        pq += (size_t)get_group_id(2) * zpq;
+        sc += (size_t)get_group_id(2) * zsc;
+    }
     int nkc = kpad >> 5;
     __global char *base = pq + (size_t)(row >> 3) * nkc * 256 + (row & 7) * 4;
     if (row >= rvalid) {
@@ -238,12 +293,18 @@ __kernel void k_attn_pack(__global const float *src, __global char *pq,
 __kernel void k_attn_softmax(__global const float *S, __global char *P,
                              __global float *psc, __global const int *seq_off,
                              const int nseq, const int rows, const int kpad,
-                             const int kvalid, const int window)
+                             const int kvalid, const int window,
+                             const long zS, const long zP, const long zsc)
 {
     int gs = get_sub_group_size();
     int lane = get_sub_group_local_id();
     int row = get_global_id(0) / gs;
     if (row >= rows) return;
+    if (get_group_id(2)) {
+        S += (size_t)get_group_id(2) * zS;
+        P += (size_t)get_group_id(2) * zP;
+        psc += (size_t)get_group_id(2) * zsc;
+    }
     int lo = 0, hi = kvalid;
     if (window > 0) {
         lo = row - window; if (lo < 0) lo = 0;

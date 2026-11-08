@@ -81,11 +81,12 @@ int e2_gpu_flush(e2_ctx *ctx) {
                         : zeCommandQueueSynchronize(g->queue, UINT64_MAX);
     zeCommandListReset(g->list);
     e2_arena_reset(&g->act);
+    g->ac.x = NULL;                 /* its buffers came from the arena */
     if (getenv("E2_GPU_TS")) e2_gpu_ts_report(g);
     if (g->ts) g->ts_n = 0;
     if (getenv("E2_GPU_PROF"))
-        fprintf(stderr, "gpu flush: %d kernels submit=%s\n", nd,
-                r == ZE_RESULT_SUCCESS ? "ok" : "FAIL");
+        fprintf(stderr, "gpu flush: %d kernels submit=%s (0x%x)\n", nd,
+                r == ZE_RESULT_SUCCESS ? "ok" : "FAIL", (unsigned)r);
     return r == ZE_RESULT_SUCCESS ? 0 : E2_GPUBAD;
 }
 
@@ -101,6 +102,40 @@ static uint32_t e2_up(uint32_t n, uint32_t m) { return (n + m - 1) / m * m; }
 /* ops                                                                 */
 /* ------------------------------------------------------------------ */
 
+/* The normed row is always consumed by a GEMM that would quantise it, so the
+ * kernel writes the int8 form too and the GEMM picks it up from here instead of
+ * paying a second read+write of the f32 rows.  A GEMM that reads any other
+ * pointer drops the cache, so a stale entry can never be used. */
+static int norm_q(e2_gpu *g, float *out, const float *x, const float *wu,
+                  const float *src, int rows, int dim, float eps, float pre,
+                  int mode, const char *name) {
+    e2_act a;
+    a.q = e2_arena_alloc(&g->act, (size_t)rows * dim);
+    a.scale = e2_arena_alloc(&g->act, (size_t)rows * (dim / 128) * sizeof(float));
+    if (!a.q || !a.scale) return E2_GPUBAD;
+    int blk = 128;
+    uint32_t ai = 0;
+    if (zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(x), &x) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(wu), &wu) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(src), &src) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(out), &out) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(a.q), &a.q) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(a.scale), &a.scale) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(int), &rows) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(int), &dim) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(float), &eps) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(float), &pre) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(int), &mode) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_rmsnorm_q, ai++, sizeof(int), &blk) != ZE_RESULT_SUCCESS)
+        return E2_GPUBAD;
+    if (e2_gpu_launch_named(g, g->k_rmsnorm_q, e2_up((uint32_t)rows * 32u, 64) / 64,
+                            name) != 0)
+        return E2_GPUBAD;
+    g->ac.x = out; g->ac.m = rows; g->ac.k = dim;
+    g->ac.q = a.q; g->ac.sc = a.scale;
+    return 0;
+}
+
 /* mode 0: out = norm(x)*w, 1: out = norm(x*pre)*w, 2: out += norm(src)*w */
 int e2_gpu_op_rmsnorm(e2_ctx *ctx, float *out, const float *x, const float *w,
                       const float *src, int rows, int dim, float eps, float pre,
@@ -111,6 +146,10 @@ int e2_gpu_op_rmsnorm(e2_ctx *ctx, float *out, const float *x, const float *w,
     const float *wu = w ? e2_gpu_mirror(g, w, (size_t)dim * sizeof(float)) : NULL;
     if (w && !wu) return OP_FAIL;
     if (enq_begin(g) != 0) return OP_FAIL;
+    /* mode 1 is the PLE pre-scale: its output is read by mul_slice, never by a
+     * GEMM, so quantising it would be a wasted pass over n*L rows. */
+    if (mode != 1 && !(dim % 128) && !getenv("E2_GPU_NONORMQ"))
+        return norm_q(g, out, x, wu, src, rows, dim, eps, pre, mode, "rmsnorm_q");
     uint32_t ai = 0;
     if (zeKernelSetArgumentValue(g->k_rmsnorm, ai++, sizeof(x), &x) != ZE_RESULT_SUCCESS ||
         zeKernelSetArgumentValue(g->k_rmsnorm, ai++, sizeof(wu), &wu) != ZE_RESULT_SUCCESS ||
@@ -330,6 +369,17 @@ int e2_gpu_op_linear_pq(e2_ctx *ctx, float *y, const uint8_t *xq, const float *x
     if (g && SKIPPED(SK_LINEAR)) return OP_FAIL;
     if (!g || !g->ready) return OP_FAIL;
     if (e2_gpu_enq_linear_pq(g, y, (const int8_t *)xq, xs, m, l) == 0) return 0;
+    e2_gpu_flush(ctx);
+    return OP_FAIL;
+}
+
+int e2_gpu_op_mlp(e2_ctx *ctx, float *y, const float *x, int m,
+                  const e2_linear *gate, const e2_linear *up,
+                  const e2_linear *down) {
+    e2_gpu *g = e2_gpu_on(ctx) ? ctx->gpu : NULL;
+    if (g && g->ready && (SKIPPED(SK_LINEAR) || SKIPPED(SK_GELU))) return OP_FAIL;
+    if (!g || !g->ready) return OP_FAIL;
+    if (e2_gpu_enq_mlp(g, y, x, m, gate, up, down) == 0) return 0;
     e2_gpu_flush(ctx);
     return OP_FAIL;
 }

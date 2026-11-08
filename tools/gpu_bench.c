@@ -89,8 +89,11 @@ static double run_variant(const variant *v, ze_group_count_t gc,
     double best = 1e9;
     for (int r = 0; r < 6; r++) {
         ck(zeCommandListReset(g_list), "reset");
-        for (int i = 0; i < reps; i++)
+        int bar = getenv("E2_GB_BARRIER") != NULL;
+        for (int i = 0; i < reps; i++) {
             ck(zeCommandListAppendLaunchKernel(g_list, v->k, &gc, NULL, 0, NULL), "app");
+            if (bar) ck(zeCommandListAppendBarrier(g_list, NULL, 0, NULL), "bar");
+        }
         ck(zeCommandListClose(g_list), "close");
         double t0 = now_ms();
         ck(zeCommandQueueExecuteCommandLists(g_queue, 1, &g_list, NULL), "exec");
@@ -318,6 +321,57 @@ static int run_shape(int m, int k, int n, int iters) {
         }
     }
     printf("  -> best %.3f ms (%.1f GMAC/s)\n", best, gm / best * 1e3);
+
+    /* k_gemm_z: the head-batched form, nd = 2 writing the same tile */
+    {
+        ze_kernel_desc_t md;
+        memset(&md, 0, sizeof(md));
+        md.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
+        md.pKernelName = "k_gemm_z";
+        ze_kernel_handle_t mk = NULL;
+        if (zeKernelCreate(mod, &md, &mk) == ZE_RESULT_SUCCESS) {
+            ck(zeKernelSetGroupSize(mk, 8, E2_GPU_SG, 1), "mgs");
+            float *y2 = usm(sizeof(float) * (size_t)m * n);
+            int nd = 2, zrep = 1;
+            long z0 = 0;
+            uint32_t mi = 0;
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(dxq), &dxq), "md0");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(dxsc), &dxsc), "md1");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(dpq), &dpq), "md2");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(dwsc), &dwsc), "md3");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(y2), &y2), "md4");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(m), &m), "md5");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(k), &k), "md6");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(n), &n), "md7");
+            int xs = k, xss = nb, ys = n;
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(xs), &xs), "md8");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(xss), &xss), "md9");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(ys), &ys), "md10");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(long), &z0), "md11");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(long), &z0), "md12");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(long), &z0), "md13");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(long), &z0), "md14");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(long), &z0), "md15");
+            ck(zeKernelSetArgumentValue(mk, mi++, sizeof(zrep), &zrep), "md16");
+            memset(y2, 0, sizeof(float) * (size_t)m * n);
+            ze_group_count_t mgc = {(uint32_t)((m + E2_GPU_TM - 1) / E2_GPU_TM),
+                                    (uint32_t)((n + E2_GPU_TN - 1) / E2_GPU_TN),
+                                    (uint32_t)nd};
+            ck(zeCommandListReset(g_list), "mr");
+            ck(zeCommandListAppendLaunchKernel(g_list, mk, &mgc, NULL, 0, NULL), "ml");
+            ck(zeCommandListClose(g_list), "mc");
+            ck(zeCommandQueueExecuteCommandLists(g_queue, 1, &g_list, NULL), "me");
+            ck(zeCommandQueueSynchronize(g_queue, UINT64_MAX), "ms");
+            int bad = 0;
+            for (size_t i = 0; i < (size_t)m * n; i++) if (dy[i] != y2[i]) bad++;
+            printf("  z-batch(nd=2): %d/%zu differ from k_gemm_xmx\n", bad,
+                   (size_t)m * n);
+            zeKernelDestroy(mk);
+            zeMemFree(g_ctx, y2);
+        } else {
+            printf("  z-batch: kernel missing\n");
+        }
+    }
     zeKernelDestroy(kern);
     zeModuleDestroy(mod);
     return 0;

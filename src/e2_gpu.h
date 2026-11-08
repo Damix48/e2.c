@@ -59,6 +59,13 @@ int e2_gpu_op_linear_pq(e2_ctx *ctx, float *y, const uint8_t *xq, const float *x
                         int m, const e2_linear *l);
 int e2_gpu_op_linear_multi(e2_ctx *ctx, const float *x, int m,
                            const e2_linear *const *ls, float *const *ys, int n);
+/* The whole MLP block in two launches: gate and up are computed for the same
+ * feature tile and combined into quantise(gelu(gate)*up) in registers, so the
+ * f32 intermediate never reaches memory, and the down projection consumes the
+ * int8 directly. */
+int e2_gpu_op_mlp(e2_ctx *ctx, float *y, const float *x, int m,
+                  const e2_linear *gate, const e2_linear *up,
+                  const e2_linear *down);
 
 #ifdef __cplusplus
 }

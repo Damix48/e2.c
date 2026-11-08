@@ -216,8 +216,40 @@ __kernel void k_attn_part(__global const float *q, __global const float *k,
     __local float *acc = att_acc[widx];
     for (int i = 0; i < per_lane; i++) acc[lane + i * gs] = 0.0f;
 
+    /* Two keys per trip: both score dots are issued before either is reduced,
+     * which is what gives the memory pipeline something to overlap.  The key
+     * loop is serial per sub-group, and at 2048 tokens this kernel is limited
+     * by memory-level parallelism (~10 GB/s of an 81 GB/s part), not by ALU. */
     float m = -INFINITY, l = 0.0f;
-    for (int j = lo; j < hi; j++) {
+    int j = lo;
+    for (; j + 2 <= hi; j += 2) {
+        __global const float *k0 = kp + (size_t)j * ks;
+        __global const float *k1 = k0 + ks;
+        float s0 = 0.0f, s1 = 0.0f;
+        for (int i = 0; i < per_lane; i++) {
+            float qv = qp[lane + i * gs];
+            int d = lane + i * gs;
+            s0 += qv * k0[d];
+            s1 += qv * k1[d];
+        }
+        s0 = sub_group_reduce_add(s0);
+        s1 = sub_group_reduce_add(s1);
+        __global const float *v0 = vp + (size_t)j * ks;
+        __global const float *v1 = v0 + ks;
+        float m0 = fmax(m, s0);
+        float e0 = exp(s0 - m0);
+        float a0 = exp(m - m0);
+        float m1 = fmax(m0, s1);
+        float e1 = exp(s1 - m1);
+        float a1 = exp(m0 - m1);
+        l = (l * a0 + e0) * a1 + e1;
+        for (int i = 0; i < per_lane; i++) {
+            int d = lane + i * gs;
+            acc[d] = (acc[d] * a0 + e0 * v0[d]) * a1 + e1 * v1[d];
+        }
+        m = m1;
+    }
+    for (; j < hi; j++) {
         __global const float *kj = kp + (size_t)j * ks;
         float s = 0.0f;
         for (int i = 0; i < per_lane; i++) s += qp[lane + i * gs] * kj[lane + i * gs];

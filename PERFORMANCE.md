@@ -1153,7 +1153,8 @@ Every attempt, kept or reverted, with the number that decided it.
 | 12 | `E2_GPU_NOBARRIER`, `E2_GPU_TS`, `E2_GPU_SKIP`, `E2_GPU_PROF` knobs | they turned three guesses into measurements; `E2_GPU_TS` writes a device timestamp before every kernel | **kept** (debug only) |
 | 13 | audio tower on the device | its convolutions and attention are still inline CPU code, so deferred buffers were read half-written (cos 0.00). Now explicitly CPU-only (`e2_gpu_no_dev`) | reverted |
 | 14 | replace `sub_group_reduce_add` with 5 explicit `sub_group_shuffle_xor` steps in attention | 14.69 s vs 14.74 s at 2048 tokens: the collective is *not* what is slow (it does make IGC retry the compilation, so the kernel still compiles both ways) | no |
-| 15 | vision tower on the device | works, exact per tensor (vis_in cos 1.0000000) but the known chaotic amplification of the vision tower turns the f32-vs-int8 attention difference into 0.988 by layer 16 | kept, accuracy documented |
+| 15 | unroll the attention key loop 2x (both scores issued before either is reduced, hoisted q load) | 14.69 -> 11.75 s at 2048 tokens (1.25x), exact (cos 1.0000000 on every layer); the win is memory-level parallelism, as predicted | **kept** |
+| 16 | vision tower on the device | works, exact per tensor (vis_in cos 1.0000000) but the known chaotic amplification of the vision tower turns the f32-vs-int8 attention difference into 0.988 by layer 16 | kept, accuracy documented |
 
 ## Where the device time actually goes
 

@@ -29,21 +29,28 @@ e2_ctx *e2_load(const char *model_path, const char *tokenizer_path) {
     }
     ctx->device = E2_DEVICE_CPU;
     const char *dev = getenv("E2_DEVICE");
-    if (dev && !strcmp(dev, "gpu") && e2_gpu_init(ctx) == 0)
-        ctx->device = E2_DEVICE_GPU;
+    if (dev && !strcmp(dev, "gpu")) {
+        /* Loud on purpose: silently falling back once hid a 5x mis-measurement. */
+        if (e2_gpu_init(ctx) == 0) ctx->device = E2_DEVICE_GPU;
+        else fprintf(stderr, "e2: E2_DEVICE=gpu but the device did not come up; "
+                             "running on the CPU\n");
+    }
     return ctx;
 }
 
 void e2_free(e2_ctx *ctx) {
     if (!ctx) return;
+    /* device-owned scratch first: after e2_gpu_free the USM pointers are gone */
+    e2_arena_free(&ctx->scratch);
+    e2_dev_free(ctx, ctx->qbuf);
+    e2_dev_free(ctx, ctx->sbuf);
+    e2_dev_free(ctx, ctx->tbuf);
+    e2_dev_free(ctx, ctx->ktbuf);
+    e2_dev_free(ctx, ctx->abuf);
+    ctx->qbuf = NULL; ctx->sbuf = NULL; ctx->tbuf = NULL;
+    ctx->ktbuf = NULL; ctx->abuf = NULL;
     e2_gpu_free(ctx);
     e2_pool_free(ctx);
-    e2_arena_free(&ctx->scratch);
-    free(ctx->qbuf);
-    free(ctx->sbuf);
-    free(ctx->tbuf);
-    free(ctx->ktbuf);
-    free(ctx->abuf);
     e2_rope_free(ctx);
     e2_model *m = &ctx->m;
     e2_tok_free(m->tok);
@@ -142,6 +149,7 @@ int e2_embed_text(e2_ctx *ctx, const char *text, float *out, int dim) {
     float emb[E2_EMBED_DIM];
     int rc = e2_text_forward(ctx, ids, n, emb);
     free(ids);
+    e2_gpu_flush(ctx);
     if (rc != 0) return e2_fail("text forward failed");
     ctx->last_ms = e2_now_ms() - t0;
     return finish(emb, out, dim);

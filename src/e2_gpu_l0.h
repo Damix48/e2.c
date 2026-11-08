@@ -49,6 +49,7 @@ typedef struct _ze_module_build_log_handle_t  *ze_module_build_log_handle_t;
 #define ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY       ((ze_result_t)0x70000002)
 #define ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY     ((ze_result_t)0x70000003)
 #define ZE_RESULT_ERROR_MODULE_BUILD_FAILURE     ((ze_result_t)0x70000004)
+#define ZE_RESULT_ERROR_UNKNOWN                  ((ze_result_t)0x7ffffffe)
 #define ZE_RESULT_ERROR_UNINITIALIZED            ((ze_result_t)0x78000001)
 #define ZE_RESULT_ERROR_UNSUPPORTED_VERSION      ((ze_result_t)0x78000002)
 #define ZE_RESULT_ERROR_UNSUPPORTED_FEATURE      ((ze_result_t)0x78000003)
@@ -260,6 +261,17 @@ extern ze_result_t (*zeCommandListCreate)(ze_context_handle_t hContext,
 extern ze_result_t (*zeCommandListDestroy)(ze_command_list_handle_t hList);
 extern ze_result_t (*zeCommandListReset)(ze_command_list_handle_t hList);
 extern ze_result_t (*zeCommandListClose)(ze_command_list_handle_t hList);
+extern ze_result_t (*zeCommandListAppendWriteGlobalTimestamp)(
+    ze_command_list_handle_t hList, uint64_t *dstptr, ze_event_handle_t hSignalEvent,
+    uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents);
+extern ze_result_t (*zeDeviceGetGlobalTimestamps)(ze_device_handle_t hDevice,
+                                                 uint64_t *hostTimestamp,
+                                                 uint64_t *deviceTimestamp);
+extern ze_result_t (*zeDeviceGetProperties2)(ze_device_handle_t, void *);
+extern ze_result_t (*zeCommandListAppendBarrier)(ze_command_list_handle_t hList,
+                                                 ze_event_handle_t hSignalEvent,
+                                                 uint32_t numWaitEvents,
+                                                 ze_event_handle_t *phWaitEvents);
 extern ze_result_t (*zeCommandListAppendLaunchKernel)(ze_command_list_handle_t hList,
                                                       ze_kernel_handle_t hKernel,
                                                       const ze_group_count_t *pLaunch,

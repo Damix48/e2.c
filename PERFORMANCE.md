@@ -1138,3 +1138,117 @@ Every attempt, kept or reverted, with the number that decided it.
 
 | # | try | result | kept? |
 |---|---|---|---|
+|---|---|---|
+| 1 | keep one submission per GEMM, just make the kernel faster | round 7: 247 ms vs 47.7 ms on the CPU; 85% of the time is dispatch+sync | no |
+| 2 | **device-resident tower**: one command list per forward, ops *enqueue* | 531-968 kernels in **one** submission; per-kernel device time finally measurable | **kept** (the whole round rests on it) |
+| 3 | `zeCommandListAppendBarrier` after every kernel | 749 ms vs 724 ms at 512 tokens: barriers are ~3%, not the problem I expected. Kept (correct by construction) | kept, cheap |
+| 4 | attention with per-lane register arrays (`qreg[16]`, `acc[16]`) | IGC spills **4096 B/thread** to scratch (`private_size` in the zeInfo); 27x slower than local memory | no |
+| 5 | attention: accumulators in `__local` (8 KB/WG), q re-read from L1 | `private_size: 0`; attention 750 -> 344 ms at 512 tokens | **kept** |
+| 6 | force `intel_reqd_sub_group_size(16)` on attention | head_dim 512 (the 4 full-attention layers) needs 32 regs/lane and spills again | no |
+| 7 | **band split**: 2 kernels, `k_attn_part` + `k_attn_comb` | only kicks in when `rows/4 < 512`; at 512 tokens there are already 512 WGs, so the split was 1 and nothing changed. Correctness exact (cos 1.0000000) | kept (needed at 64-128 tokens) |
+| 8 | one packed-activation buffer reused by every GEMM | **wrong results**: the queue still holds kernels that read it. This was the "nondeterministic output" bug, not the barriers | no |
+| 9 | per-forward bump arena for packed activations | exact again; ~230 MB at 2048 tokens (see shortcuts) | **kept** |
+| 10 | per-output-row activation scale (round 7's fast DPAS kernel) | 0.9989 vs the CPU path, i.e. 0.9986 vs f32 -- below the 0.999 bar | no |
+| 11 | `k_gemm_dpas_blk`: per-128-block scales, RB=2 x CT=2, int+float8 accumulators | **cos 1.0000000, maxerr 9.5e-07** vs `e2_gemm_range`. 32+32 registers, no spill | **kept** (accuracy path, now the default) |
+| 12 | `E2_GPU_NOBARRIER`, `E2_GPU_TS`, `E2_GPU_SKIP`, `E2_GPU_PROF` knobs | they turned three guesses into measurements; `E2_GPU_TS` writes a device timestamp before every kernel | **kept** (debug only) |
+| 13 | audio tower on the device | its convolutions and attention are still inline CPU code, so deferred buffers were read half-written (cos 0.00). Now explicitly CPU-only (`e2_gpu_no_dev`) | reverted |
+| 14 | vision tower on the device | works, exact per tensor (vis_in cos 1.0000000) but the known chaotic amplification of the vision tower turns the f32-vs-int8 attention difference into 0.988 by layer 16 | kept, accuracy documented |
+
+## Where the device time actually goes
+
+`E2_GPU_TS=1` timestamps every kernel. text 512 tokens, one submission of 968 kernels,
+per-kernel time summed over one forward:
+
+| kernel | calls | total ms | us each |
+|---|---:|---:|---:|
+| `attn_part` (24 layers) | 24 | **254.6** | 10 607 |
+| `gemm_blk` | 220 | 43.5 | 198 |
+| `quant_u8` | 197 | 11.5 | 58 |
+| `rmsnorm` | 149 | 11.1 | 75 |
+| `gelu_mul_q` | 25 | 9.5 | 379 |
+| `pack_u8` | 222 | 6.6 | 30 |
+| `norm_rope` | 48 | 6.5 | 136 |
+| `mul_slice` | 25 | 1.4 | 57 |
+| `scale`, `gelu_tanh`, `pos_add`, `attn_comb` | 76 | 0.9 | 12 |
+
+Three conclusions, all measured rather than guessed:
+
+1. **Attention is 73% of the forward** and it is the only O(n^2) kernel. A per-lane
+   f32 flash loop costs ~60 instructions per (row, head, key) for 512 MAC, i.e.
+   0.2 MAC/instruction where a DPAS instruction does 2048. No amount of tiling in
+   f32 closes that: this is what the tensor cores are for, and it is exactly why
+   the CPU path runs attention through the int8 GEMM (`e2_attn_int8`).
+2. **The elementwise passes are the next block** (39 ms of 347 ms): `quant_u8` and
+   `pack_u8` are two extra passes over every activation, and `rmsnorm`/`norm_rope`
+   are separate from the quantise that follows them. Fusing norm+quantise+pack
+   into one kernel removes ~400 of the 968 launches *and* two thirds of that
+   traffic.
+3. **The GEMM is 5x off its own isolated measurement** (1.28 TMAC/s end-to-end vs
+   4.6 TMAC/s standalone) because RB=2 x CT=2 blk kernel is the accuracy variant,
+   and because small-m launches do not have enough work-groups to fill the device.
+
+## Status of the goal
+
+Same run, all rows (`--sources e2 --repeat 2 --iters 3`, both device settings,
+host shared with the desktop so the CPU column is ~1.4x its idle-box number):
+
+| task | length | e2 CPU | e2 GPU | ov-int8@GPU | 1.5x target |
+|---|---:|---:|---:|---:|---:|
+| text | 8 | 7.4 | 18.6 | 6.3 | 4.2 |
+| text | 64 | 20.3 | 35.3 | 7.0 | 4.7 |
+| text | 128 | 33.0 | 61.5 | 9.2 | 6.1 |
+| text | 512 | 118.2 | 534.6 | 20.4 | 13.6 |
+| text | 2048 | 574.1 | 6662.5 | 140.4 | 93.6 |
+| batch | 8x64 | 131.7 | 201.5 | 17.4 | 11.6 |
+| batch | 32x64 | 555.9 | 896.3 | 69.9 | 46.6 |
+| image | 270 tok | 640.8 | 2998.1 | 258 | 172 |
+| audio | 54 tok | 32.7 | 69.3 | 23.0 | 15.3 |
+| video | 8 frames | 2202.8 | 7635.2 | 792 | 528 |
+
+(text 2048 is the worst row: at that length the sliding-window band is 1025 keys
+and the f32 attention loop dominates everything; see the roadmap.)
+
+The goal for this round was 1.5x over OpenVINO int8 on the GPU in every row. That
+is **not met**; the device path is correct but slower than the CPU path, so it
+stays opt-in (`E2_DEVICE=gpu`) and the CPU path stays the default. What the round
+did deliver is the thing round 7 was missing: a device-resident pipeline whose
+per-kernel cost can be measured, plus a measured list of what the remaining gap
+actually consists of. See "Round 8 roadmap" below for the order to attack it.
+
+```bash
+# correctness + timing of the device path
+E2_DEVICE=gpu ./tests/e2_test models        # passes
+E2_DEVICE=gpu python tools/e2_acc.py text   # 0.9998 vs f32 (CPU path: 0.9997)
+make gpu-check                              # device GEMM vs CPU kernel: cos 1.0000000
+E2_GPU_TS=1 E2_DEVICE=gpu ./tests/e2_bench_full spec.txt   # per-kernel device times
+```
+
+## Round 8 roadmap (measured, in the order that pays)
+
+1. **int8 attention on the matrix engine.** The CPU implementation
+   (`e2_attn_int8`) is already the right algorithm: pack K and V^T, QK^T through
+   the packed-int8 GEMM, softmax, PV through the same GEMM. 15 GMAC at 4 TMAC/s
+   is 3.7 ms for text 512 (today: 254 ms of f32 attention), and it also removes
+   the vision tower's accuracy drift, because it makes the two paths agree bit
+   for bit. This is the single change that matters.
+2. **Fuse norm+quantise+pack, and gelu*mul+quantise+pack.** Each fused kernel
+   removes 2 launches and 2 passes over the activation. Cuts ~40% of the
+   non-attention time and ~400 of 968 launches.
+3. **Small-m GEMM: split K.** At m <= 32 the DPAS kernel has n/16 work-groups
+   (64 for n=1024) on 128 EUs, which is why text 8 streams weights at 16 GB/s
+   instead of 81. A 4-8 way split-K with a reduction pass fills the device.
+4. **Large-m GEMM: SLM tiling.** RB=4 x CT=2 with both operands staged in
+   local memory and double buffered; the traffic formula in the round 7 note
+   says 10-13 TMAC/s is reachable, which is what the 13.6 ms text-512 target
+   needs (6 TMAC/s end to end).
+5. Only then: vision and audio towers fully on the device (per-row, not per-op).
+
+## Shortcuts taken (marked in the code)
+
+- `shortcut: packed activations are bump-allocated per forward` in
+  `src/e2_gpu_int.h` -- a GEMM's packed activation cannot be reused until its
+  kernel has run, so each gets a fresh slice; ~230 MB at 2048 tokens. Upgrade
+  with a small event-checked ring of slots when memory matters.
+- `shortcut: the audio tower runs on the CPU even with E2_DEVICE=gpu` -- its
+  convolution and attention loops are still inline CPU code. Upgrade with a
+  device mel+conv+attention port.

@@ -41,13 +41,39 @@ pools the samples of several passes so a busy host cannot fake a result.
 OpenVINO f32 is slower than its int8 on every row and is omitted. Every row
 beats OpenVINO int8 by at least 1.8x (goal was 1.5x).
 
-On the Arc 140T iGPU (`--sources e2,ov-int8-gpu --e2-device gpu`) e2 is
-currently 3.5-11x **slower** than OpenVINO GPU: e2 runs one Level Zero
-submission per GEMM, which costs ~0.2 ms of dispatch plus ~0.4 ms of host wait
-per call, while OpenVINO compiles the whole graph and submits once per
-inference. Numbers and the analysis are in PERFORMANCE.md ("GPU (Level Zero)").
-The GPU backend is opt-in (`E2_DEVICE=gpu`) and correct (cosine 1.0000 text,
-0.9999 image, 0.9988 audio vs the CPU path).
+## GPU (Intel Arc 140T iGPU, Level Zero)
+
+The GPU backend is opt-in (`E2_DEVICE=gpu`) and still **slower than the CPU
+path**, so it is not the default. It is a full device-resident pipeline: the
+whole tower is appended to one command list and submitted once per embedding
+(968 kernels, one sync), with the packed-int8 matrix engine for every GEMM and
+per-128-block activation scales, so each tensor matches the CPU int8 kernel
+(`cos 1.0000000`, `maxerr 9.5e-07`).
+
+| task | length | e2 CPU | e2 GPU | ov-int8@GPU |
+|---|---:|---:|---:|---:|
+| text | 8 | 7.4 | 18.6 | 6.3 |
+| text | 64 | 20.3 | 35.3 | 7.0 |
+| text | 128 | 33.0 | 61.5 | 9.2 |
+| text | 512 | 118.2 | 534.6 | 20.4 |
+| text | 2048 | 574.1 | 6662.5 | 140.4 |
+| image | 270 tok | 640.8 | 2998.1 | 258 |
+| audio | 54 tok | 32.7 | 69.3 | 23.0 |
+| video | 8 frames | 2202.8 | 7635.2 | 792 |
+
+(One run, host shared with the desktop, so the CPU column is ~1.4x its idle
+number; compare the columns, not the absolute values.)
+
+`E2_GPU_TS=1` gives per-kernel device times. At text 512, f32 attention is 73%
+of the forward, the GEMM 13%, and the elementwise passes 11%. PERFORMANCE.md
+("Round 8") has the per-kernel table, the accuracy per tensor, every experiment
+that failed, and the measured roadmap (int8 attention on the matrix engine
+first, then fused norm+quantise+pack, then split-K for small m).
+
+Accuracy of the device path (vs the CPU path, which is the reference):
+text 0.9996, per layer >= 0.9990; image 0.9922 (the vision tower's known chaotic
+amplification of the f32-vs-int8 attention difference, 0.988 by layer 16); audio
+is identical because that tower still runs on the CPU.
 `--repeat 3` pools 9 samples per row; alone, the same-run ratio still moves
 +/-10% with host load (see PERFORMANCE.md).
 

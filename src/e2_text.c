@@ -1,12 +1,16 @@
 /* e2_text.c - EmbeddingGemma-2 bidirectional text encoder. */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <math.h>
 #include <stdlib.h>
 
+static e2_ctx *e2_dump_ctx;
+
 static void dump_tensor(const char *name, const float *p, size_t n) {
     const char *dir = getenv("E2_DUMP");
     if (!dir) return;
+    e2_gpu_flush(e2_dump_ctx);          /* the device may still owe this buffer */
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
     FILE *f = fopen(path, "wb");
@@ -47,6 +51,7 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
                           const int *seq_off, const int *seq_len, int nseq,
                           float *out) {
     int prof_on = getenv("E2_PROFILE") != NULL;
+    e2_dump_ctx = ctx;
     double prof[16] = {0};
     double p2[10] = {0};
     double _q = 0;
@@ -198,7 +203,9 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
         PROF_T(e2_linear_forward(ctx, h, x, n, &ly->ple_gate));
         PROF_T(e2_gelu_tanh_ctx(ctx, h, n * P));
         _q = e2_now_ms();
-        if (ctx->nthreads > 1 && (long)n * P >= 65536) {
+        if (e2_gpu_op_mul_slice(ctx, h, ple, n * P, L, P, li) == 0) {
+            p2[7] += e2_now_ms() - _q;
+        } else if (ctx->nthreads > 1 && (long)n * P >= 65536) {
             plemul_arg pa = {h, ple, n, L, P, li};
             e2_parallel(ctx, plemul_work, &pa);
         } else {
@@ -235,6 +242,7 @@ int e2_text_forward_multi(e2_ctx *ctx, const float *emb_in, int n,
     e2_linear_forward(ctx, proj, h, n, &lproj);
     if (nseq == 1) dump_tensor("last_hidden_state", proj, (size_t)n * c->text_embed_dim);
 
+    if (e2_gpu_flush(ctx) != 0) return e2_fail("device forward failed");
     for (int sq = 0; sq < nseq; sq++) {
         const float *pr = proj + (size_t)seq_off[sq] * c->text_embed_dim;
         float *o = out + (size_t)sq * c->text_embed_dim;

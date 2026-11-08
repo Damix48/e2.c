@@ -1,17 +1,17 @@
-/* e2_gpu.c - Level Zero packed-int8 GEMM backend.
+/* e2_gpu.c - Level Zero device state, weight residency and the packed-int8
+ * matrix-engine GEMM.
  *
  * Opt-in only (E2_DEVICE=gpu or e2_set_device(ctx, E2_DEVICE_GPU)).  The CPU
- * path in e2_gemm.c stays the default and the reference; every entry point here
- * returns nonzero on any failure so the caller can fall back.
+ * path stays the default and the reference; every entry point returns nonzero
+ * on failure so the caller can fall back.
  *
- * Design: one driver/device/context/in-order queue/command list and one
- * persistent kernel (gemm_4x4 from tools/gpu/e2_gemm.cl).  Weights are copied
- * into shared USM once (cache keyed by the e2_qmat.q pointer); activations and
- * the output tile are re-uploaded/read back per call, which is the measured
- * per-call cost of the CPU -> GEMM -> CPU pipeline.
+ * The pipeline is device-resident: e2_gpu_ops.c appends a whole forward to one
+ * command list and there is exactly one submission and one host sync per
+ * embedding.  Round 7 measured 0.38 ms of dispatch+sync latency per GEMM on
+ * this driver, so the previous one-submission-per-GEMM shape could never beat
+ * the CPU path no matter how fast the kernel was (see PERFORMANCE.md).
  */
-#include "e2_gpu.h"
-#include "e2_gpu_l0.h"
+#include "e2_gpu_int.h"
 #include "e2_gpu_spv.h"
 
 #include <stdlib.h>
@@ -19,91 +19,53 @@
 
 #define E2_GPU_LOCAL 128
 
-/* E2_GPU_PROF=1 splits the per-call cost into upload / submit / sync / copy:
- * the sync dominates on this part and that is what caps the GPU path. */
-static double g_t_up, g_t_sub, g_t_sync, g_t_copy;
-static long g_n_call;
-static int g_prof = -1;
-/* Matrix-engine GEMM: 4-5x the plain kernel's MAC rate, but the CPU-driven
- * "one submission per GEMM" pipeline pays ~0.4 ms of dispatch latency per call,
- * so it is opt-in until the tower runs device-resident (see PERFORMANCE.md). */
-static int g_dpas = -1;
-
-/* One uploaded packed matrix, in shared USM.  Keyed by the source pointer:
- * the model file is mmap'd and never moves, so the address is a stable id. */
-typedef struct {
-    const int8_t *q_src;
-    int n, k, blk, ntiles, nblk;
-    size_t tstride;
-    int8_t *q;          /* shared USM: ntiles * tstride packed tiles (CPU kernel) */
-    float *scale;       /* shared USM: n */
-    int32_t *wsum;      /* shared USM: n * nblk (contiguous) */
-    int8_t *pq;         /* shared USM: DPAS layout, n * k bytes */
-    int32_t *wsumt;     /* shared USM: n, sum over all k of each column */
-} e2_gpu_wc;
-
-/* Open-addressing table of uploads: the text tower cycles through ~8 matrices
- * per layer, so a one-entry cache re-copied ~90 MB per forward. */
-typedef struct {
-    e2_gpu_wc *tab;
-    int cap, used;
-} e2_gpu_wct;
-
-typedef struct {
-    ze_driver_handle_t drv;
-    ze_device_handle_t dev;
-    ze_context_handle_t ctx;
-    ze_command_queue_handle_t queue;
-    ze_command_list_handle_t list;
-    ze_module_handle_t module;
-    ze_kernel_handle_t kern;
-    ze_module_handle_t dmodule;     /* e2_dpas.cl: pack + matrix-engine GEMM */
-    ze_kernel_handle_t k_pack_u8, k_pack_wq, k_gemm;
-    ze_event_pool_handle_t epool;
-    ze_event_handle_t evt;
-    int ready;
-
-    e2_gpu_wct wct;
-    uint8_t *xq; size_t xq_cap;
-    float *xs; size_t xs_cap;
-    float *y; size_t y_cap;
-    /* DPAS path: row-major u8 staging, packed activations, per-row scales */
-    uint8_t *a_raw; size_t a_raw_cap;
-    uint8_t *a_pack; size_t a_pack_cap;
-    float *a_scale; size_t a_scale_cap;
-} e2_gpu;
-
-static void usm_free(e2_gpu *g) {
-    if (g->ctx) {
-        for (int i = 0; i < g->wct.cap; i++) {
-            e2_gpu_wc *e = &g->wct.tab[i];
-            if (!e->q_src) continue;
-            if (e->q)     zeMemFree(g->ctx, e->q);
-            if (e->scale) zeMemFree(g->ctx, e->scale);
-            if (e->wsum)  zeMemFree(g->ctx, e->wsum);
-            if (e->pq)    zeMemFree(g->ctx, e->pq);
-            if (e->wsumt) zeMemFree(g->ctx, e->wsumt);
-        }
-        if (g->xq) zeMemFree(g->ctx, g->xq);
-        if (g->xs) zeMemFree(g->ctx, g->xs);
-        if (g->y)  zeMemFree(g->ctx, g->y);
-        if (g->a_raw)   zeMemFree(g->ctx, g->a_raw);
-        if (g->a_pack)  zeMemFree(g->ctx, g->a_pack);
-        if (g->a_scale) zeMemFree(g->ctx, g->a_scale);
+int e2_gpu_launch_named(e2_gpu *g, ze_kernel_handle_t k, uint32_t groups,
+                        const char *name) {
+    ze_group_count_t gc = {groups ? groups : 1, 1, 1};
+    if (g->ts_on && zeCommandListAppendWriteGlobalTimestamp &&
+        zeCommandListAppendWriteGlobalTimestamp(g->list, &g->ts[g->ts_n], NULL, 0,
+                                                NULL) == ZE_RESULT_SUCCESS) {
+        if (g->ts_n < 2047) g->ts_name[g->ts_n] = name;
+        g->ts_n++;
     }
-    free(g->wct.tab);
-    memset(&g->wct, 0, sizeof(g->wct));
-    g->xq = NULL;
-    g->xs = NULL;
-    g->y = NULL;
-    g->a_raw = NULL;
-    g->a_pack = NULL;
-    g->a_scale = NULL;
-    g->xq_cap = g->xs_cap = g->y_cap = 0;
-    g->a_raw_cap = g->a_pack_cap = g->a_scale_cap = 0;
+    if (zeCommandListAppendLaunchKernel(g->list, k, &gc, NULL, 0, NULL)
+        != ZE_RESULT_SUCCESS)
+        return -1;
+    if (g->barrier && zeCommandListAppendBarrier(g->list, NULL, 0, NULL)
+        != ZE_RESULT_SUCCESS)
+        return -1;
+    g->ndisp++;
+    return 0;
 }
 
-static void *usm_alloc(e2_gpu *g, size_t n) {
+int e2_gpu_launch(e2_gpu *g, ze_kernel_handle_t k, uint32_t groups) {
+    return e2_gpu_launch_named(g, k, groups, "?");
+}
+
+void e2_gpu_ts_report(e2_gpu *g) {
+    if (!g->ts_on || g->ts_n < 2) return;
+    double ns_per_tick = g->ts_res ? g->ts_res : 1.0;
+    fprintf(stderr, "--- per-kernel device time (%d samples, %.3f ns/tick)\n",
+            g->ts_n - 1, ns_per_tick);
+    for (int i = 1; i < g->ts_n && i < 2048; i++) {
+        double dt = (double)(g->ts[i] - g->ts[i - 1]) * ns_per_tick;
+        fprintf(stderr, "TS %10.3f us  %s\n", dt / 1000.0,
+                g->ts_name[i - 1] ? g->ts_name[i - 1] : "?");
+    }
+}
+
+int e2_gpu_enq_open(e2_gpu *g) {
+    if (!g || !g->ready) return -1;
+    if (!g->defer) { g->defer = 1; g->ndisp = 0; }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* memory                                                              */
+/* ------------------------------------------------------------------ */
+
+void *e2_usm_alloc(e2_gpu *g, size_t n) {
+    if (!n) n = 64;
     ze_device_mem_alloc_desc_t ddesc;
     ze_host_mem_alloc_desc_t hdesc;
     memset(&ddesc, 0, sizeof(ddesc));
@@ -116,22 +78,357 @@ static void *usm_alloc(e2_gpu *g, size_t n) {
     return p;
 }
 
+void *e2_usm_realloc(e2_gpu *g, void **p, size_t *cap, size_t need) {
+    if (*cap >= need && *p) return *p;
+    void *n = e2_usm_alloc(g, need);
+    if (!n) return NULL;
+    if (*p) zeMemFree(g->ctx, *p);
+    *p = n;
+    *cap = need;
+    return n;
+}
+
+/* Arena block backend: shared USM while the device path is on, so every
+ * activation buffer a kernel reads is device-addressable. */
+void *e2_arena_usm_alloc(void *opaque, size_t n) {
+    e2_ctx *ctx = opaque;
+    return e2_dev_alloc(ctx, n);
+}
+
+void e2_arena_usm_free(void *opaque, void *p) {
+    e2_dev_free((e2_ctx *)opaque, p);
+}
+
+void *e2_dev_alloc(e2_ctx *ctx, size_t n) {
+    if (ctx && ctx->gpu && ((e2_gpu *)ctx->gpu)->ready)
+        return e2_usm_alloc((e2_gpu *)ctx->gpu, n);
+    return malloc(n);
+}
+
+void e2_dev_free(e2_ctx *ctx, void *p) {
+    if (!p) return;
+    if (ctx && ctx->gpu && ((e2_gpu *)ctx->gpu)->ready) {
+        zeMemFree(((e2_gpu *)ctx->gpu)->ctx, p);
+        return;
+    }
+    free(p);
+}
+
+static void usm_free(e2_gpu *g) {
+    if (!g->ctx) return;
+    for (int i = 0; i < g->wct.cap; i++) {
+        e2_gpu_wc *e = &g->wct.tab[i];
+        if (!e->q_src) continue;
+        if (e->q)     zeMemFree(g->ctx, e->q);
+        if (e->scale) zeMemFree(g->ctx, e->scale);
+        if (e->wsum)  zeMemFree(g->ctx, e->wsum);
+        if (e->pq)    zeMemFree(g->ctx, e->pq);
+        if (e->wsumt) zeMemFree(g->ctx, e->wsumt);
+    }
+    for (int i = 0; i < g->mir_cap; i++)
+        if (g->mir[i].src && g->mir[i].usm) zeMemFree(g->ctx, g->mir[i].usm);
+    free(g->mir);
+    g->mir = NULL;
+    g->mir_cap = g->mir_used = 0;
+    e2_arena_free(&g->act);        /* USM blocks: needs the context, so first */
+    free(g->wct.tab);
+    memset(&g->wct, 0, sizeof(g->wct));
+}
+
+/* Model tensors that kernels read (norm weights, rope tables, position
+ * tables) live in the mmap; copy each into shared USM once. */
+static unsigned mir_hash(const void *p, int cap) {
+    unsigned long long h = (unsigned long long)(uintptr_t)p;
+    h = (h >> 5) * 0x9E3779B97F4A7C15ull;
+    return (unsigned)(h >> 40) & (unsigned)(cap - 1);
+}
+
+static void mir_insert(e2_gpu_mir *tab, int cap, e2_gpu_mir e) {
+    unsigned i = mir_hash(e.src, cap);
+    while (tab[i].src) i = (i + 1) & (unsigned)(cap - 1);
+    tab[i] = e;
+}
+
+const void *e2_gpu_mirror(e2_gpu *g, const void *p, size_t bytes) {
+    if (!p) return NULL;
+    if (!g->mir_cap) {
+        g->mir_cap = 512;
+        g->mir = calloc((size_t)g->mir_cap, sizeof(*g->mir));
+        if (!g->mir) { g->mir_cap = 0; return NULL; }
+    }
+    unsigned i = mir_hash(p, g->mir_cap);
+    for (;;) {
+        e2_gpu_mir *e = &g->mir[i];
+        if (!e->src) break;
+        if (e->src == p) return e->usm;
+        i = (i + 1) & (unsigned)(g->mir_cap - 1);
+    }
+    if (g->mir_used * 4 >= g->mir_cap * 3) {
+        int ncap = g->mir_cap * 2;
+        e2_gpu_mir *nt = calloc((size_t)ncap, sizeof(*nt));
+        if (!nt) return NULL;
+        for (int k = 0; k < g->mir_cap; k++)
+            if (g->mir[k].src) mir_insert(nt, ncap, g->mir[k]);
+        free(g->mir);
+        g->mir = nt;
+        g->mir_cap = ncap;
+        i = mir_hash(p, ncap);
+        while (g->mir[i].src) i = (i + 1) & (unsigned)(ncap - 1);
+    }
+    void *u = e2_usm_alloc(g, bytes);
+    if (!u) return NULL;
+    memcpy(u, p, bytes);
+    g->mir[i].src = p;
+    g->mir[i].usm = u;
+    g->mir[i].bytes = bytes;
+    g->mir_used++;
+    return u;
+}
+
+/* ------------------------------------------------------------------ */
+/* weight residency                                                    */
+/* ------------------------------------------------------------------ */
+
+static unsigned wc_hash(const void *p, int cap) {
+    unsigned long long h = (unsigned long long)(uintptr_t)p;
+    h = (h >> 4) * 0x9E3779B97F4A7C15ull;
+    return (unsigned)(h >> 40) & (unsigned)(cap - 1);
+}
+
+static e2_gpu_wc *wc_slot(e2_gpu_wc *tab, const int8_t *key, int cap) {
+    unsigned i = wc_hash(key, cap);
+    for (;;) {
+        e2_gpu_wc *e = &tab[i];
+        if (!e->q_src || e->q_src == key) return e;
+        i = (i + 1) & (unsigned)(cap - 1);
+    }
+}
+
+static int wc_grow(e2_gpu *g) {
+    int ncap = g->wct.cap ? g->wct.cap * 2 : 256;
+    e2_gpu_wc *nt = calloc((size_t)ncap, sizeof(*nt));
+    if (!nt) return -1;
+    for (int i = 0; i < g->wct.cap; i++) {
+        e2_gpu_wc *old = &g->wct.tab[i];
+        if (!old->q_src) continue;
+        *wc_slot(nt, old->q_src, ncap) = *old;
+    }
+    free(g->wct.tab);
+    g->wct.tab = nt;
+    g->wct.cap = ncap;
+    return 0;
+}
+
+/* Copy one packed matrix into shared USM the first time it is used, and build
+ * the matrix-engine layout: [n/8][k/32][8 lanes][8 x u32], i.e. for one 8-column
+ * block and one 32-wide k chunk, lane l holds the 4-byte k quad 4l..4l+3 of
+ * each of the 8 columns.  Shared memory on an iGPU is the same DRAM, so this is
+ * one CPU pass and no PCIe hop; after that the kernel reads it at full
+ * bandwidth. */
+e2_gpu_wc *e2_gpu_weight(e2_gpu *g, const e2_qmat *w) {
+    int blk = w->blk ? w->blk : 128;
+    int nblk = w->k / blk;
+    int ntiles = (w->n + 15) / 16;
+    size_t tstride = w->tstride ? w->tstride : (size_t)(w->k / 4) * 64;
+    size_t qbytes = (size_t)ntiles * tstride;
+    int wss_src = w->wsmstride ? w->wsmstride : nblk;
+
+    if (g->wct.cap && (g->wct.used + 1) * 4 >= g->wct.cap * 3 && wc_grow(g) != 0)
+        return NULL;
+    if (!g->wct.cap && wc_grow(g) != 0) return NULL;
+    e2_gpu_wc *e = wc_slot(g->wct.tab, w->q, g->wct.cap);
+    if (e->q_src == w->q) return e;                 /* already resident */
+
+    e->q = (int8_t *)e2_usm_alloc(g, qbytes ? qbytes : 64);
+    e->scale = (float *)e2_usm_alloc(g, (size_t)w->n * sizeof(float));
+    e->wsum = (int32_t *)e2_usm_alloc(g, (size_t)w->n * nblk * sizeof(int32_t));
+    if (!e->q || !e->scale || !e->wsum) goto fail;
+    memcpy(e->q, w->q, qbytes);
+    memcpy(e->scale, w->scale, (size_t)w->n * sizeof(float));
+    if (wss_src == nblk) {
+        memcpy(e->wsum, w->wsum, (size_t)w->n * nblk * sizeof(int32_t));
+    } else {
+        for (int i = 0; i < w->n; i++)
+            memcpy(e->wsum + (size_t)i * nblk, w->wsum + (size_t)i * wss_src,
+                   (size_t)nblk * sizeof(int32_t));
+    }
+
+    if ((w->n % 8) == 0 && (w->k % 32) == 0) {
+        int nkc = w->k / 32, nc8 = w->n / 8;
+        e->pq = (int8_t *)e2_usm_alloc(g, (size_t)nc8 * nkc * 256);
+        e->wsumt = (int32_t *)e2_usm_alloc(g, (size_t)w->n * sizeof(int32_t));
+        if (!e->pq || !e->wsumt) goto fail;
+        const int8_t *src = w->q;
+        size_t ts = tstride;
+        for (int cb = 0; cb < nc8; cb++)
+            for (int kc = 0; kc < nkc; kc++) {
+                uint8_t *dst = (uint8_t *)e->pq + ((size_t)cb * nkc + kc) * 256;
+                for (int lane = 0; lane < 8; lane++) {
+                    int col = cb * 8 + lane;
+                    const int8_t *sp = src + (size_t)(col / 16) * ts +
+                                       (size_t)(kc * 8) * 64 + (col % 16) * 4;
+                    uint8_t *dp = dst + lane * 32;
+                    for (int c = 0; c < 8; c++)
+                        memcpy(dp + c * 4, sp + (size_t)c * 64, 4);
+                }
+            }
+        for (int c = 0; c < w->n; c++) {
+            int32_t t = 0;
+            for (int b = 0; b < nblk; b++) t += e->wsum[(size_t)c * nblk + b];
+            e->wsumt[c] = t;
+        }
+    }
+
+    e->q_src = w->q;
+    e->n = w->n; e->k = w->k; e->blk = blk; e->ntiles = ntiles;
+    e->nblk = nblk; e->tstride = tstride;
+    g->wct.used++;
+    return e;
+fail:
+    if (e->q)     zeMemFree(g->ctx, e->q);
+    if (e->scale) zeMemFree(g->ctx, e->scale);
+    if (e->wsum)  zeMemFree(g->ctx, e->wsum);
+    if (e->pq)    zeMemFree(g->ctx, e->pq);
+    if (e->wsumt) zeMemFree(g->ctx, e->wsumt);
+    memset(e, 0, sizeof(*e));
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* GEMM                                                                */
+/* ------------------------------------------------------------------ */
+
+/* Append one packed-int8 GEMM for an already-packed activation block. */
+int e2_gpu_enq_act(e2_gpu *g, float *y, int m, const e2_linear *l, const e2_act *a) {
+    const e2_qmat *w = &l->w;
+    if (m <= 0 || !w->packed || (w->k % 32) || (w->n % 8) || (w->k % 128)) return -1;
+    if (l->in_min || l->in_max || l->out_min || l->out_max || w->bias) return -1;
+    e2_gpu_wc *wc = e2_gpu_weight(g, w);
+    if (!wc || !wc->pq) return -1;
+    if (g->use_blk ? !wc->wsum : !wc->wsumt) return -1;
+    if (e2_gpu_enq_open(g) != 0) return -1;
+
+    uint8_t *app = a->pack;
+    float *sc = a->scale;
+    const int m2 = m, k2 = wc->k, n2 = wc->n;
+    ze_kernel_handle_t kern = g->use_blk ? g->k_gemm_blk : g->k_gemm;
+    const int32_t *wt = g->use_blk ? wc->wsum : wc->wsumt;
+    float *ws = wc->scale;
+    uint8_t *wp = (uint8_t *)wc->pq;
+    uint32_t ai = 0;
+    if (zeKernelSetArgumentValue(kern, ai++, sizeof(app), &app) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(sc), &sc) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(wp), &wp) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(ws), &ws) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(wt), &wt) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(y), &y) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(int), &m2) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(int), &k2) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(kern, ai++, sizeof(int), &n2) != ZE_RESULT_SUCCESS)
+        return -1;
+    /* k_gemm_dpas: RB=4 row blocks x CT=2 column tiles per sub-group (32 rows);
+     * k_gemm_dpas_blk: RB=2 (16 rows, it keeps an int8 and a float8 accumulator
+     * per tile and 32+32 registers is what fits). */
+    int rows_per_sg = g->use_blk ? 16 : 32;
+    uint32_t subs = (uint32_t)(((m + rows_per_sg - 1) / rows_per_sg) * (wc->n / 16));
+    return e2_gpu_launch_named(g, kern, subs ? subs : 1, g->use_blk ? "gemm_blk" : "gemm");
+}
+
+static void *act_usm_alloc(void *opaque, size_t n) {
+    return e2_usm_alloc((e2_gpu *)opaque, n);
+}
+
+static void act_usm_free(void *opaque, void *p) {
+    e2_gpu *g = opaque;
+    if (g->ctx && p) zeMemFree(g->ctx, p);
+}
+
+/* row-major u8 -> matrix-engine layout, into a fresh forward-scoped block. */
+int e2_gpu_pack_act_u8(e2_gpu *g, const uint8_t *src8, int m, int k, e2_act *a) {
+    int nkc = k / 32, mblk = (m + 7) / 8;
+    size_t pk = (size_t)mblk * nkc * 256;
+    a->pack = e2_arena_alloc(&g->act, pk);
+    if (!a->pack) return -1;
+    uint8_t *src = (uint8_t *)src8, *dst = a->pack;
+    int mm = m, kk = k;
+    uint32_t ai = 0;
+    if (zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(src), &src) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(dst), &dst) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(int), &mm) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(int), &kk) != ZE_RESULT_SUCCESS)
+        return -1;
+    return e2_gpu_launch_named(g, g->k_pack_u8, (uint32_t)((size_t)mblk * nkc), "pack_u8");
+}
+
+/* f32 rows -> u8 rows + one scale per 128-wide block -> matrix-engine layout. */
+int e2_gpu_pack_act(e2_gpu *g, const float *x, int m, int k, e2_act *a) {
+    int nblk = k / 128;
+    uint8_t *q8 = e2_arena_alloc(&g->act, (size_t)m * k);
+    a->scale = e2_arena_alloc(&g->act, (size_t)m * nblk * sizeof(float));
+    if (!q8 || !a->scale) return -1;
+    if (e2_gpu_enq_open(g) != 0) return -1;
+    float *sc = a->scale;
+    int rows = m, kk = k, blk = 128;
+    uint32_t ai = 0;
+    if (zeKernelSetArgumentValue(g->k_quant_u8, ai++, sizeof(x), &x) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_quant_u8, ai++, sizeof(q8), &q8) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_quant_u8, ai++, sizeof(sc), &sc) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_quant_u8, ai++, sizeof(int), &rows) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_quant_u8, ai++, sizeof(int), &kk) != ZE_RESULT_SUCCESS ||
+        zeKernelSetArgumentValue(g->k_quant_u8, ai++, sizeof(int), &blk) != ZE_RESULT_SUCCESS)
+        return -1;
+    uint32_t groups = (uint32_t)(((long)m * nblk * 32 + 63) / 64);
+    if (e2_gpu_launch_named(g, g->k_quant_u8, groups, "quant_u8") != 0) return -1;
+    return e2_gpu_pack_act_u8(g, q8, m, k, a);
+}
+
+int e2_gpu_enq_linear(e2_gpu *g, float *y, const float *x, int m, const e2_linear *l) {
+    e2_act a;
+    if (e2_gpu_pack_act(g, x, m, l->w.k, &a) != 0) return -1;
+    return e2_gpu_enq_act(g, y, m, l, &a);
+}
+
+int e2_gpu_enq_linear_list(e2_gpu *g, const float *x, int m,
+                           const e2_linear *const *ls, float *const *ys, int n) {
+    e2_act a;
+    if (!n || e2_gpu_pack_act(g, x, m, ls[0]->w.k, &a) != 0) return -1;
+    for (int i = 0; i < n; i++)
+        if (e2_gpu_enq_act(g, ys[i], m, ls[i], &a) != 0) return -1;
+    return 0;
+}
+
+int e2_gpu_enq_linear_pq(e2_gpu *g, float *y, const uint8_t *xq, const float *xs,
+                         int m, const e2_linear *l) {
+    const e2_qmat *w = &l->w;
+    if (w->blk && w->blk != 128) return -1;
+    e2_act a;
+    if (e2_gpu_pack_act_u8(g, xq, m, w->k, &a) != 0) return -1;
+    a.scale = (float *)xs;
+    return e2_gpu_enq_act(g, y, m, l, &a);
+}
+
+/* ------------------------------------------------------------------ */
+/* lifecycle                                                           */
+/* ------------------------------------------------------------------ */
+
 static void gpu_destroy(e2_gpu *g) {
     if (!g) return;
-    if (g_prof && g_n_call)
-        fprintf(stderr, "gpu calls %ld upload %.1f submit %.1f sync %.1f copy %.1f ms\n",
-                g_n_call, g_t_up, g_t_sub, g_t_sync, g_t_copy);
     usm_free(g);
-    if (g->k_pack_u8) zeKernelDestroy(g->k_pack_u8);
-    if (g->k_pack_wq) zeKernelDestroy(g->k_pack_wq);
-    if (g->k_gemm)    zeKernelDestroy(g->k_gemm);
-    if (g->dmodule)   zeModuleDestroy(g->dmodule);
-    if (g->kern)   zeKernelDestroy(g->kern);
-    if (g->module) zeModuleDestroy(g->module);
-    if (g->list)   zeCommandListDestroy(g->list);
-    if (g->evt)    zeEventDestroy(g->evt);
-    if (g->epool)  zeEventPoolDestroy(g->epool);
-    if (g->ctx)    zeContextDestroy(g->ctx);
+    ze_kernel_handle_t ks[] = {g->k_pack_u8, g->k_pack_wq, g->k_gemm, g->k_gemm_blk,
+        g->k_rmsnorm, g->k_norm_rope, g->k_rope_text, g->k_rope_vision, g->k_attn,
+        g->k_quant_u8, g->k_gelu_mul_q, g->k_gelu_tanh, g->k_scale, g->k_mul_slice,
+        g->k_pos_add, g->k_softmax, g->kern};
+    for (size_t i = 0; i < sizeof(ks) / sizeof(ks[0]); i++)
+        if (ks[i]) zeKernelDestroy(ks[i]);
+    if (g->dmodule) zeModuleDestroy(g->dmodule);
+    if (g->omodule) zeModuleDestroy(g->omodule);
+    if (g->module)  zeModuleDestroy(g->module);
+    if (g->list)    zeCommandListDestroy(g->list);
+    if (g->imm)     zeCommandListDestroy(g->imm);
+    if (g->evt)     zeEventDestroy(g->evt);
+    if (g->epool)   zeEventPoolDestroy(g->epool);
+    if (g->queue)   zeCommandQueueDestroy(g->queue);
+    if (g->ctx)     zeContextDestroy(g->ctx);
     memset(g, 0, sizeof(*g));
 }
 
@@ -142,6 +439,10 @@ int e2_gpu_init(e2_ctx *ctx) {
     e2_gpu *g = calloc(1, sizeof(*g));
     if (!g) return -1;
     ctx->gpu = g;
+    g->use_blk = 1;
+    /* An in-order list orders execution but does not promise that one kernel's
+     * writes reach the next one's view without a barrier; measure it. */
+    g->barrier = getenv("E2_GPU_NOBARRIER") ? 0 : 1;
 
     if (zeInit(ZE_INIT_FLAG_GPU_ONLY) != ZE_RESULT_SUCCESS) goto fail;
 
@@ -179,56 +480,93 @@ int e2_gpu_init(e2_ctx *ctx) {
     cd.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
     if (zeContextCreate(g->drv, &cd, &g->ctx) != ZE_RESULT_SUCCESS) goto fail;
 
-    /* Immediate command list: appends go straight to the hardware queue, so a
-     * GEMM costs one append plus one host sync instead of
-     * reset/close/execute/synchronize on a deferred list (measured ~1 ms of
-     * pure driver overhead per call on this iGPU). */
+    /* One in-order queue + one deferred command list hold a whole forward. */
     ze_command_queue_desc_t qd; memset(&qd, 0, sizeof(qd));
     qd.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
     qd.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
     qd.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
-    if (zeCommandListCreateImmediate(g->ctx, g->dev, &qd, &g->list) != ZE_RESULT_SUCCESS)
+    if (zeCommandQueueCreate(g->ctx, g->dev, &qd, &g->queue) != ZE_RESULT_SUCCESS)
+        goto fail;
+    ze_command_list_desc_t ld; memset(&ld, 0, sizeof(ld));
+    ld.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
+    if (zeCommandListCreate(g->ctx, g->dev, &ld, &g->list) != ZE_RESULT_SUCCESS)
         goto fail;
 
-    ze_module_desc_t md; memset(&md, 0, sizeof(md));
-    md.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
-    md.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    md.inputSize = e2_gpu_spv_e2_gemm_len;
-    md.pInputModule = e2_gpu_spv_e2_gemm;
-    if (zeModuleCreate(g->ctx, g->dev, &md, &g->module, NULL) != ZE_RESULT_SUCCESS) goto fail;
-
-    ze_module_desc_t md2; memset(&md2, 0, sizeof(md2));
-    md2.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
-    md2.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    md2.inputSize = e2_gpu_spv_e2_dpas_len;
-    md2.pInputModule = e2_gpu_spv_e2_dpas;
-
-    ze_kernel_desc_t kd; memset(&kd, 0, sizeof(kd));
-    kd.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
-    kd.pKernelName = "gemm_4x4";
-    if (zeKernelCreate(g->module, &kd, &g->kern) != ZE_RESULT_SUCCESS) goto fail;
-    if (zeKernelSetGroupSize(g->kern, E2_GPU_LOCAL, 1, 1) != ZE_RESULT_SUCCESS) goto fail;
-
-    /* Matrix-engine module.  Optional: if the device/toolchain cannot build
-     * it, keep the plain kernel path (still correct, ~4x slower). */
-    if (zeModuleCreate(g->ctx, g->dev, &md2, &g->dmodule, NULL) == ZE_RESULT_SUCCESS) {
-        static const char *dn[3] = {"k_pack_u8", "k_pack_wq", "k_gemm_dpas"};
-        ze_kernel_handle_t *dk[3] = {&g->k_pack_u8, &g->k_pack_wq, &g->k_gemm};
-        for (int i = 0; i < 3; i++) {
+    {
+        static const char *dn[] = {"k_pack_u8", "k_pack_wq", "k_gemm_dpas", "k_gemm_dpas_blk"};
+        ze_kernel_handle_t dk[4] = {0};
+        ze_module_desc_t md; memset(&md, 0, sizeof(md));
+        md.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
+        md.format = ZE_MODULE_FORMAT_IL_SPIRV;
+        md.inputSize = e2_gpu_spv_e2_dpas_len;
+        md.pInputModule = e2_gpu_spv_e2_dpas;
+        if (zeModuleCreate(g->ctx, g->dev, &md, &g->dmodule, NULL) != ZE_RESULT_SUCCESS)
+            goto fail;                       /* no matrix engine -> CPU path */
+        int got = 0;
+        for (int i = 0; i < 4; i++) {
             ze_kernel_desc_t d; memset(&d, 0, sizeof(d));
             d.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
             d.pKernelName = dn[i];
-            if (zeKernelCreate(g->dmodule, &d, dk[i]) != ZE_RESULT_SUCCESS ||
-                zeKernelSetGroupSize(*dk[i], 8, 1, 1) != ZE_RESULT_SUCCESS)
+            ze_kernel_handle_t k = NULL;
+            if (zeKernelCreate(g->dmodule, &d, &k) != ZE_RESULT_SUCCESS ||
+                zeKernelSetGroupSize(k, 8, 1, 1) != ZE_RESULT_SUCCESS)
                 break;
+            dk[i] = k;
+            got++;
         }
+        if (got < 3) goto fail;
+        g->k_pack_u8 = dk[0];
+        g->k_pack_wq = dk[1];
+        g->k_gemm = dk[2];
+        g->k_gemm_blk = (got >= 4) ? dk[3] : NULL;
+        g->use_dpas = 1;
+        if (!g->k_gemm_blk) g->use_blk = 0;
+        if (getenv("E2_GPU_PROF"))
+            fprintf(stderr, "gpu dpas: %d/4 kernels, use_blk=%d\n", got, g->use_blk);
+    }
+
+    {
+        static const char *on[] = {"k_rmsnorm", "k_norm_rope", "k_rope_text",
+            "k_rope_vision", "k_quant_u8", "k_gelu_mul_q", "k_gelu_tanh",
+            "k_scale", "k_mul_slice", "k_pos_add", "k_softmax",
+            "k_attn_part", "k_attn_comb"};
+        ze_kernel_handle_t ok[13] = {0};
+        ze_module_desc_t md; memset(&md, 0, sizeof(md));
+        md.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
+        md.format = ZE_MODULE_FORMAT_IL_SPIRV;
+        md.inputSize = e2_gpu_spv_e2_ops_len;
+        md.pInputModule = e2_gpu_spv_e2_ops;
+        if (zeModuleCreate(g->ctx, g->dev, &md, &g->omodule, NULL) != ZE_RESULT_SUCCESS)
+            goto fail;
+        int got = 0;
+        for (int i = 0; i < 13; i++) {
+            ze_kernel_desc_t d; memset(&d, 0, sizeof(d));
+            d.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
+            d.pKernelName = on[i];
+            ze_kernel_handle_t k = NULL;
+            if (zeKernelCreate(g->omodule, &d, &k) != ZE_RESULT_SUCCESS ||
+                zeKernelSetGroupSize(k, 64, 1, 1) != ZE_RESULT_SUCCESS)
+                break;
+            ok[i] = k;
+            got++;
+        }
+        if (got < 13) goto fail;
+        /* attention runs ATT_ROWS (4) sub-groups per work-group so a query
+         * block shares its K/V lines; everything else uses one 64-thread WG */
+        if (zeKernelSetGroupSize(ok[11], 128, 1, 1) != ZE_RESULT_SUCCESS) goto fail;
+        g->k_rmsnorm = ok[0]; g->k_norm_rope = ok[1]; g->k_rope_text = ok[2];
+        g->k_rope_vision = ok[3]; g->k_quant_u8 = ok[4]; g->k_gelu_mul_q = ok[5];
+        g->k_gelu_tanh = ok[6]; g->k_scale = ok[7]; g->k_mul_slice = ok[8];
+        g->k_pos_add = ok[9]; g->k_softmax = ok[10];
+        g->k_attn_part = ok[11]; g->k_attn_comb = ok[12];
     }
 
     ze_event_pool_desc_t epd; memset(&epd, 0, sizeof(epd));
     epd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
     epd.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
     epd.count = 1;
-    if (zeEventPoolCreate(g->ctx, &epd, 1, &g->dev, &g->epool) != ZE_RESULT_SUCCESS) goto fail;
+    if (zeEventPoolCreate(g->ctx, &epd, 1, &g->dev, &g->epool) != ZE_RESULT_SUCCESS)
+        goto fail;
     ze_event_desc_t ed; memset(&ed, 0, sizeof(ed));
     ed.stype = ZE_STRUCTURE_TYPE_EVENT_DESC;
     ed.index = 0;
@@ -236,7 +574,31 @@ int e2_gpu_init(e2_ctx *ctx) {
     ed.wait = 0;
     if (zeEventCreate(g->epool, &ed, &g->evt) != ZE_RESULT_SUCCESS) goto fail;
 
+    /* Every activation the kernels touch must live in shared USM: switch the
+     * arena and drop the malloc'd scratch so it is reallocated device-safe. */
     g->ready = 1;
+    if (getenv("E2_GPU_TS")) {
+        g->ts_on = 1;
+        g->ts = e2_usm_alloc(g, 4096 * sizeof(uint64_t));
+        ze_device_properties_t props;
+        memset(&props, 0, sizeof(props));
+        props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+        if (zeDeviceGetProperties(g->dev, &props) == ZE_RESULT_SUCCESS)
+            g->ts_res = (double)props.timerResolution;
+        if (!g->ts) g->ts_on = 0;
+    }
+    g->act.blk_alloc = act_usm_alloc;
+    g->act.blk_free = act_usm_free;
+    g->act.alloc_ctx = g;
+    e2_arena_free(&ctx->scratch);
+    ctx->scratch.blk_alloc = e2_arena_usm_alloc;
+    ctx->scratch.blk_free = e2_arena_usm_free;
+    ctx->scratch.alloc_ctx = ctx;
+    free(ctx->qbuf); ctx->qbuf = NULL; ctx->qcap = 0;
+    free(ctx->sbuf); ctx->sbuf = NULL; ctx->scap = 0;
+    free(ctx->tbuf); ctx->tbuf = NULL; ctx->tcap = 0;
+    free(ctx->ktbuf); ctx->ktbuf = NULL; ctx->ktcap = 0;
+    free(ctx->abuf); ctx->abuf = NULL; ctx->acap = 0;
     return 0;
 fail:
     gpu_destroy(g);
@@ -247,361 +609,8 @@ fail:
 
 void e2_gpu_free(e2_ctx *ctx) {
     if (!ctx || !ctx->gpu) return;
-    gpu_destroy(ctx->gpu);
-    free(ctx->gpu);
+    e2_gpu *g = ctx->gpu;
+    gpu_destroy(g);
+    free(g);
     ctx->gpu = NULL;
-}
-
-static unsigned wc_hash(const void *p, int cap) {
-    unsigned long long h = (unsigned long long)(uintptr_t)p;
-    h = (h >> 4) * 0x9E3779B97F4A7C15ull;
-    return (unsigned)(h >> 40) & (unsigned)(cap - 1);
-}
-
-static e2_gpu_wc *wc_slot(e2_gpu_wc *tab, const int8_t *key, int cap) {
-    unsigned i = wc_hash(key, cap);
-    for (;;) {
-        e2_gpu_wc *e = &tab[i];
-        if (!e->q_src || e->q_src == key) return e;
-        i = (i + 1) & (unsigned)(cap - 1);
-    }
-}
-
-static int wc_grow(e2_gpu *g) {
-    int ncap = g->wct.cap ? g->wct.cap * 2 : 256;
-    e2_gpu_wc *nt = calloc((size_t)ncap, sizeof(*nt));
-    if (!nt) return -1;
-    for (int i = 0; i < g->wct.cap; i++) {
-        e2_gpu_wc *old = &g->wct.tab[i];
-        if (!old->q_src) continue;
-        *wc_slot(nt, old->q_src, ncap) = *old;
-    }
-    free(g->wct.tab);
-    g->wct.tab = nt;
-    g->wct.cap = ncap;
-    return 0;
-}
-
-/* Copy one packed matrix into shared USM the first time it is used.  Shared
- * memory on an iGPU is the same DRAM, so this is one memcpy and no PCIe hop;
- * after that the kernel reads the copy at full bandwidth. */
-static e2_gpu_wc *upload_weight(e2_gpu *g, const e2_qmat *w) {
-    int blk = w->blk ? w->blk : 128;
-    int nblk = w->k / blk;
-    int ntiles = (w->n + 15) / 16;
-    size_t tstride = w->tstride ? w->tstride : (size_t)(w->k / 4) * 64;
-    size_t qbytes = (size_t)ntiles * tstride;
-    int wss_src = w->wsmstride ? w->wsmstride : nblk;
-
-    if (g->wct.cap && (g->wct.used + 1) * 4 >= g->wct.cap * 3 && wc_grow(g) != 0)
-        return NULL;
-    if (!g->wct.cap && wc_grow(g) != 0) return NULL;
-    e2_gpu_wc *e = wc_slot(g->wct.tab, w->q, g->wct.cap);
-    if (e->q_src == w->q) return e;                 /* already resident */
-
-    e->q = (int8_t *)usm_alloc(g, qbytes ? qbytes : 64);
-    e->scale = (float *)usm_alloc(g, (size_t)w->n * sizeof(float));
-    e->wsum = (int32_t *)usm_alloc(g, (size_t)w->n * nblk * sizeof(int32_t));
-    if (!e->q || !e->scale || !e->wsum) {
-        if (e->q) zeMemFree(g->ctx, e->q);
-        if (e->scale) zeMemFree(g->ctx, e->scale);
-        if (e->wsum) zeMemFree(g->ctx, e->wsum);
-        memset(e, 0, sizeof(*e));
-        return NULL;
-    }
-    memcpy(e->q, w->q, qbytes);
-    memcpy(e->scale, w->scale, (size_t)w->n * sizeof(float));
-    if (wss_src == nblk) {
-        memcpy(e->wsum, w->wsum, (size_t)w->n * nblk * sizeof(int32_t));
-    } else {
-        for (int i = 0; i < w->n; i++)
-            memcpy(e->wsum + (size_t)i * nblk, w->wsum + (size_t)i * wss_src,
-                   (size_t)nblk * sizeof(int32_t));
-    }
-    /* Matrix-engine layout: [n/8][k/32][8 lanes][8 x u32].  Built on the CPU
-     * into shared USM, so the kernel reads it directly (no upload, no repack
-     * kernel, one-time cost on first use).  Skipped when n or k do not tile. */
-    if ((w->n % 8) == 0 && (w->k % 32) == 0) {
-        int nkc = w->k / 32, nc8 = w->n / 8;
-        e->pq = (int8_t *)usm_alloc(g, (size_t)nc8 * nkc * 256);
-        e->wsumt = (int32_t *)usm_alloc(g, (size_t)w->n * sizeof(int32_t));
-        if (e->pq && e->wsumt) {
-            const int8_t *src = w->q;
-            size_t ts = tstride;
-            for (int cb = 0; cb < nc8; cb++)
-                for (int kc = 0; kc < nkc; kc++) {
-                    uint8_t *dst = (uint8_t *)e->pq + ((size_t)cb * nkc + kc) * 256;
-                    for (int lane = 0; lane < 8; lane++) {
-                        int col = cb * 8 + lane;
-                        const int8_t *sp = src + (size_t)(col / 16) * ts +
-                                           (size_t)(kc * 8) * 64 + (col % 16) * 4;
-                        uint8_t *dp = dst + lane * 32;
-                        for (int c = 0; c < 8; c++)
-                            memcpy(dp + c * 4, sp + (size_t)c * 64, 4);
-                    }
-                }
-            for (int c = 0; c < w->n; c++) {
-                int32_t t = 0;
-                for (int b = 0; b < nblk; b++) t += e->wsum[(size_t)c * nblk + b];
-                e->wsumt[c] = t;
-            }
-        } else {
-            if (e->pq) zeMemFree(g->ctx, e->pq);
-            if (e->wsumt) zeMemFree(g->ctx, e->wsumt);
-            e->pq = NULL;
-            e->wsumt = NULL;
-        }
-    }
-
-    e->q_src = w->q;
-    e->n = w->n; e->k = w->k; e->blk = blk; e->ntiles = ntiles;
-    e->nblk = nblk; e->tstride = tstride;
-    g->wct.used++;
-    return e;
-}
-
-/* Blocking waits cost ~0.4 ms per GEMM on this driver (the sync dominates the
- * whole GPU path), so poll the host-visible event first and only fall back to
- * the blocking wait if the kernel really is long. */
-static int wait_evt(e2_gpu *g) {
-    for (long i = 0; i < 2000000L; i++) {
-        ze_result_t r = zeEventQueryStatus(g->evt);
-        if (r == ZE_RESULT_SUCCESS) return 0;
-        if (r != ZE_RESULT_NOT_READY) return -1;
-    }
-    return zeEventHostSynchronize(g->evt, UINT64_MAX) == ZE_RESULT_SUCCESS ? 0 : -1;
-}
-
-static int ensure_act(e2_gpu *g, const uint8_t *xq, const float *xs, int xss,
-                      int m, int k) {
-    size_t qbytes = (size_t)m * k;
-    size_t sbytes = (size_t)m * xss * sizeof(float);
-    if (g->xq_cap < qbytes) {
-        uint8_t *p = (uint8_t *)usm_alloc(g, qbytes ? qbytes : 64);
-        if (!p) return -1;
-        if (g->xq) zeMemFree(g->ctx, g->xq);
-        g->xq = p; g->xq_cap = qbytes;
-    }
-    if (g->xs_cap < sbytes) {
-        float *p = (float *)usm_alloc(g, sbytes ? sbytes : 64);
-        if (!p) return -1;
-        if (g->xs) zeMemFree(g->ctx, g->xs);
-        g->xs = p; g->xs_cap = sbytes;
-    }
-    memcpy(g->xq, xq, qbytes);
-    memcpy(g->xs, xs, sbytes);
-    return 0;
-}
-
-
-/* ---- matrix-engine path -------------------------------------------------- */
-
-typedef struct { const float *x; uint8_t *q; float *xs; int m, k; } qrow_arg;
-
-/* Per-row asymmetric u8 quantisation (zero point 128).  The CPU kernel path
- * uses one scale per 128-wide block; the matrix-engine kernel accumulates the
- * whole k in int32, which needs one scale per row (and lets the zero point be
- * folded into a single per-column constant). */
-static void qrow_work(void *vp, int tid, int nt) {
-    qrow_arg *a = vp;
-    int r0, r1;
-    e2_split(a->m, tid, nt, &r0, &r1);
-    int k = a->k;
-    for (int r = r0; r < r1; r++) {
-        const float *xp = a->x + (size_t)r * k;
-        uint8_t *qp = a->q + (size_t)r * k;
-        float amax = 0.0f;
-        for (int i = 0; i < k; i++) {
-            float v = fabsf(xp[i]);
-            if (v > amax) amax = v;
-        }
-        float s = amax > 0.0f ? amax / 127.0f : 1.0f;
-        float inv = 1.0f / s;
-        a->xs[r] = s;
-        for (int i = 0; i < k; i++) {
-            int v = (int)lrintf(xp[i] * inv) + 128;
-            qp[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
-        }
-    }
-}
-
-static int gpu_alloc(void **p, size_t *cap, size_t need, e2_gpu *g) {
-    if (*cap >= need) return 0;
-    void *n = usm_alloc(g, need ? need : 64);
-    if (!n) return -1;
-    if (*p) zeMemFree(g->ctx, *p);
-    *p = n;
-    *cap = need;
-    return 0;
-}
-
-/* Quantise x (CPU) into shared USM, then transpose it into the matrix-engine
- * layout on the device.  Both halves reuse the buffers across calls. */
-static int ensure_pack(e2_gpu *g, e2_ctx *ctx, const float *x, int m, int k) {
-    size_t raw = (size_t)m * k;
-    size_t sc = (size_t)m * sizeof(float);
-    int nkc = k / 32, mblk = (m + 7) / 8;
-    size_t pk = (size_t)mblk * nkc * 256;
-    if (gpu_alloc((void **)&g->a_raw, &g->a_raw_cap, raw, g) != 0) return -1;
-    if (gpu_alloc((void **)&g->a_scale, &g->a_scale_cap, sc, g) != 0) return -1;
-    if (gpu_alloc((void **)&g->a_pack, &g->a_pack_cap, pk, g) != 0) return -1;
-
-    qrow_arg qa = {x, g->a_raw, g->a_scale, m, k};
-    if (ctx->nthreads > 1 && (long)m * k >= 131072)
-        e2_parallel(ctx, qrow_work, &qa);
-    else
-        qrow_work(&qa, 0, 1);
-
-    uint8_t *src = g->a_raw, *dst = g->a_pack;
-    uint32_t ai = 0;
-    int mm = m, kk = k;
-    if (zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(src), &src) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(dst), &dst) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(int), &mm) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_pack_u8, ai++, sizeof(int), &kk) != ZE_RESULT_SUCCESS)
-        return -1;
-    ze_group_count_t gc = {(uint32_t)((size_t)mblk * nkc), 1, 1};
-    if (zeCommandListAppendLaunchKernel(g->list, g->k_pack_u8, &gc, NULL, 0, NULL)
-        != ZE_RESULT_SUCCESS)
-        return -1;
-    return 0;
-}
-
-/* y[i] = x @ W[i]^T for several matrices sharing one activation row block.
- * Returns 0 when the device produced every y, nonzero to fall back to the CPU
- * kernel path. */
-int e2_gpu_linear_multi(e2_ctx *ctx, const float *x, int m,
-                        const e2_linear *const *ls, float *const *ys, int n) {
-    e2_gpu *g = ctx ? ctx->gpu : NULL;
-    if (g_dpas < 0) g_dpas = getenv("E2_GPU_DPAS") != NULL;
-    if (!g_dpas || !g || !g->ready || !g->k_gemm || !g->dmodule) return -1;
-    if (m < 32 || !ls || !n) return -1;
-    const e2_qmat *w0 = &ls[0]->w;
-    if (w0->k % 32 || w0->n % 16) return -1;
-    for (int i = 0; i < n; i++) {
-        const e2_linear *l = ls[i];
-        const e2_qmat *w = &l->w;
-        if (!w->packed || w->k != w0->k) return -1;
-        if (w->n % 16 || (w->blk && w->blk != 128)) return -1;
-        if (l->in_min || l->in_max || l->out_min || l->out_max || w->bias) return -1;
-    }
-    int maxn = 0;
-    for (int i = 0; i < n; i++) if (ls[i]->w.n > maxn) maxn = ls[i]->w.n;
-    if (gpu_alloc((void **)&g->y, &g->y_cap, (size_t)m * maxn * sizeof(float), g) != 0)
-        return -1;
-    double _t0 = g_prof ? e2_now_ms() : 0;
-    if (ensure_pack(g, ctx, x, m, w0->k) != 0) return -1;
-    if (g_prof) g_t_up += e2_now_ms() - _t0;
-
-    for (int i = 0; i < n; i++) {
-        const e2_qmat *w = &ls[i]->w;
-        e2_gpu_wc *wc = upload_weight(g, w);
-        if (!wc || !wc->pq || !wc->wsumt) return -1;
-        int k = w->k, nn = w->n;
-        uint8_t *xp = g->a_pack;
-        float *xs = g->a_scale;
-        uint8_t *wp = (uint8_t *)wc->pq;
-        float *ws = wc->scale;
-        int32_t *wt = wc->wsumt;
-        float *yp = g->y;
-        uint32_t ai = 0;
-        if (zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(xp), &xp) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(xs), &xs) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(wp), &wp) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(ws), &ws) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(wt), &wt) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(yp), &yp) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(int), &m) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(int), &k) != ZE_RESULT_SUCCESS ||
-            zeKernelSetArgumentValue(g->k_gemm, ai++, sizeof(int), &nn) != ZE_RESULT_SUCCESS)
-            return -1;
-        /* one sub-group per 8 work items; RB=4 x CT=2 tiles per sub-group */
-        uint32_t subs = (uint32_t)(((m + 31) / 32) * (nn / 16));
-        ze_group_count_t gc = {subs, 1, 1};
-        double _t1 = g_prof ? e2_now_ms() : 0;
-        if (zeCommandListAppendLaunchKernel(g->list, g->k_gemm, &gc, g->evt, 0, NULL)
-            != ZE_RESULT_SUCCESS)
-            return -1;
-        if (g_prof) { g_t_sub += e2_now_ms() - _t1; _t1 = e2_now_ms(); }
-        if (wait_evt(g) != 0) return -1;
-        if (zeEventHostReset(g->evt) != ZE_RESULT_SUCCESS) return -1;
-        if (g_prof) { g_t_sync += e2_now_ms() - _t1; _t1 = e2_now_ms(); }
-        memcpy(ys[i], g->y, (size_t)m * nn * sizeof(float));
-        if (g_prof) { g_t_copy += e2_now_ms() - _t1; g_n_call++; }
-    }
-    return 0;
-}
-
-int e2_gpu_gemm(e2_ctx *ctx, float *y, int ns, const uint8_t *xq, const float *xs,
-                int xss, int m, int k, const e2_qmat *w, int nb0, int nb1) {
-    e2_gpu *g = ctx ? ctx->gpu : NULL;
-    if (!g || !g->ready) return -1;
-    if (nb0 != 0) return -1;                 /* sub-ranges stay on the CPU for now */
-    if (!w->packed || (k % 128) != 0 || m <= 0 || w->n <= 0 || ns != w->n) return -1;
-
-    int blk = w->blk ? w->blk : 128;
-    int nblk = k / blk;
-    int ntiles = (w->n + 15) / 16;
-    if (nblk <= 0 || nb1 < ntiles) return -1;
-
-    if (g_prof < 0) g_prof = getenv("E2_GPU_PROF") != NULL;
-    double _t0 = g_prof ? e2_now_ms() : 0;
-    e2_gpu_wc *wc = upload_weight(g, w);
-    if (!wc) return -1;
-    if (ensure_act(g, xq, xs, xss, m, k) != 0) return -1;
-    double _t1 = g_prof ? e2_now_ms() : 0;
-    if (g_prof) g_t_up += _t1 - _t0;
-
-    size_t yn = (size_t)m * w->n;
-    if (g->y_cap < yn * sizeof(float)) {
-        float *p = (float *)usm_alloc(g, yn * sizeof(float));
-        if (!p) return -1;
-        if (g->y) zeMemFree(g->ctx, g->y);
-        g->y = p; g->y_cap = yn * sizeof(float);
-    }
-
-    uint32_t ai = 0;
-    const uint8_t *xq_u = g->xq;
-    const float *xs_u = g->xs;
-    const int8_t *q_u = wc->q;
-    const float *scale_u = wc->scale;
-    const int32_t *wsum_u = wc->wsum;
-    float *y_u = g->y;
-    size_t ts = wc->tstride;
-    int wss = nblk;
-    if (zeKernelSetArgumentValue(g->kern, ai++, sizeof(xq_u), &xq_u) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(xs_u), &xs_u) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(q_u), &q_u) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(scale_u), &scale_u) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(wsum_u), &wsum_u) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(y_u), &y_u) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(int), &m) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(int), &k) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(int), &w->n) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(int), &nblk) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(int), &xss) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(int), &wss) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->kern, ai++, sizeof(ts), &ts) != ZE_RESULT_SUCCESS)
-        return -1;
-
-    size_t wi = (size_t)((m + 3) / 4) * ntiles * 4;
-    size_t groups = (wi + E2_GPU_LOCAL - 1) / E2_GPU_LOCAL;
-    if (!groups) groups = 1;
-    ze_group_count_t gc = {(uint32_t)groups, 1, 1};
-
-    if (zeCommandListAppendLaunchKernel(g->list, g->kern, &gc, g->evt, 0, NULL) != ZE_RESULT_SUCCESS)
-        return -1;
-    if (g_prof) { g_t_sub += e2_now_ms() - _t1; _t1 = e2_now_ms(); }
-    if (wait_evt(g) != 0) return -1;
-    if (zeEventHostReset(g->evt) != ZE_RESULT_SUCCESS) return -1;
-    if (g_prof) { g_t_sync += e2_now_ms() - _t1; _t1 = e2_now_ms(); }
-
-    memcpy(y, g->y, yn * sizeof(float));
-    if (g_prof) {
-        g_t_copy += e2_now_ms() - _t1;
-        if (++g_n_call % 512 == 0)
-            fprintf(stderr, "gpu calls %ld upload %.1f submit %.1f sync %.1f copy %.1f ms\n",
-                    g_n_call, g_t_up, g_t_sub, g_t_sync, g_t_copy);
-    }
-    return 0;
 }

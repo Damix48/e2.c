@@ -137,6 +137,11 @@ typedef struct e2_arena_block e2_arena_block;
 typedef struct {
     e2_arena_block *head, *cur;
     size_t used, cap;
+    /* When the device path is on, every block must be shared USM so kernels can
+     * read it; otherwise plain malloc. */
+    void *(*blk_alloc)(void *opaque, size_t);
+    void  (*blk_free)(void *opaque, void *);
+    void *alloc_ctx;
 } e2_arena;
 
 struct e2_ctx {
@@ -242,6 +247,7 @@ void e2_rope_text(e2_ctx *ctx, float *q, float *k, int t, int heads, int kv_head
                   int head_dim, int pos_offset, float theta);
 /* Cached cos/sin table, or NULL on OOM. */
 e2_rope_tab *e2_rope_get(e2_ctx *ctx, float theta, int half, int need);
+e2_rope_tab *e2_rope_get_axis(e2_ctx *ctx, int axis, float theta, int half, int need);
 /* RMSNorm over `per_pos` consecutive rows per position, then rotate each row
  * with the table.  Fuses the two passes the text encoder used to make over q
  * and k (rope was a separate read+write of both). */

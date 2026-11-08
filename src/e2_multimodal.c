@@ -1,11 +1,24 @@
 /* e2_multimodal.c - public image/audio/video/interleaved entry points. */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 int e2_image_load_rgb(const char *path, uint8_t **rgb, int *w, int *h);
 int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *out_tokens);
+
+/* The audio tower still runs its convolutions and attention inline on the CPU,
+ * so the device path must be off around it: a deferred op would leave buffers
+ * half-written while that CPU code reads them. */
+static int e2_audio_forward_cpu(e2_ctx *ctx, const float *samples, int n,
+                                float *out, int *ntok) {
+    int rc = -1;
+    e2_gpu_no_dev(ctx, 1);
+    rc = e2_audio_forward(ctx, samples, n, out, ntok);
+    e2_gpu_no_dev(ctx, 0);
+    return rc;
+}
 
 #define ID_BOS 2
 #define ID_EOS 1
@@ -178,7 +191,7 @@ int e2_embed_audio(e2_ctx *ctx, const float *samples, int n, float *out, int dim
     float *soft = malloc((size_t)cap * ctx->m.meta.text_hidden * sizeof(float));
     if (!soft) return e2_fail("oom");
     int nt = 0;
-    if (e2_audio_forward(ctx, samples, n, soft, &nt) != 0) { free(soft); return -1; }
+    if (e2_audio_forward_cpu(ctx, samples, n, soft, &nt) != 0) { free(soft); return -1; }
     soft_item it = {soft, nt, 0, NULL, NULL};
     int kind = ID_AUDIO;
     int rc = build_and_run(ctx, "<|audio|>", &it, 1, &kind, out, dim);
@@ -266,7 +279,7 @@ static int make_audio_item(e2_ctx *ctx, const float *samples, int n, soft_item *
     int cap = n / 160 + 8;
     it->v = malloc((size_t)cap * ctx->m.meta.text_hidden * sizeof(float));
     if (!it->v) return e2_fail("oom");
-    return e2_audio_forward(ctx, samples, n, it->v, &it->n);
+    return e2_audio_forward_cpu(ctx, samples, n, it->v, &it->n);
 }
 
 int e2_embed(e2_ctx *ctx, const e2_input *in, float *out, int dim) {

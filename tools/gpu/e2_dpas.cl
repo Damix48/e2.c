@@ -142,3 +142,78 @@ __kernel void k_gemm_dpas(__global const uchar *xp, __global const float *xscale
         }
     }
 }
+
+/* Same GEMM with one activation scale per 128-wide k block, which is what the
+ * CPU kernel does, so the result matches e2_gemm_range instead of degrading to
+ * a per-row scale (0.9989 vs the CPU path on a 560-token text, and the ledger
+ * needs 0.999 against f32).
+ *
+ * The int32 accumulator only spans one 128-wide block (4 k chunks), then the
+ * epilogue multiplies by that block's scales and accumulates in f32, so it
+ * needs RB*CT int8 accumulators + RB*CT float8 accumulators live at once:
+ * RB=2, CT=2 -> 32 + 32 registers.  RB=4/CT=2 spilled at 64+64.
+ */
+#define BBLK_RB 2
+#define BBLK_CT 2
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void k_gemm_dpas_blk(__global const uchar *xp, __global const float *xblk,
+                              __global const uchar *wp, __global const float *wscale,
+                              __global const int *wsum_blk, __global float *y,
+                              const int m, const int k, const int n)
+{
+    int lane = get_sub_group_local_id();
+    int sg = get_global_id(0) >> 3;
+    int nkc = k >> 5;
+    int nkb = nkc >> 2;
+    int cts = n / (8 * BBLK_CT);
+    int rg = sg / cts;
+    int cg = sg - rg * cts;
+    int rb0 = rg * BBLK_RB;
+    int ct0 = cg * BBLK_CT;
+    float8 facc[BBLK_RB][BBLK_CT];
+    for (int a = 0; a < BBLK_RB; a++)
+        for (int b = 0; b < BBLK_CT; b++) facc[a][b] = (float8)(0.0f);
+    __global const uchar *ap = xp + (size_t)rb0 * 256 * nkc + lane * 32;
+    __global const uchar *bp = wp + (size_t)ct0 * 256 * nkc + lane * 32;
+    for (int kb = 0; kb < nkb; kb++) {
+        int8 acc[BBLK_RB][BBLK_CT];
+        for (int a = 0; a < BBLK_RB; a++)
+            for (int b = 0; b < BBLK_CT; b++) acc[a][b] = (int8)(0);
+        for (int t = 0; t < 4; t++) {
+            int kc = kb * 4 + t;
+            uint8 av[BBLK_RB];
+            for (int a = 0; a < BBLK_RB; a++)
+                av[a] = vload8(0, (const __global uint *)(ap + ((size_t)a * nkc + kc) * 256));
+            for (int b = 0; b < BBLK_CT; b++) {
+                int8 bv = as_int8(vload8(0, (const __global uint *)(bp + ((size_t)b * nkc + kc) * 256)));
+                for (int a = 0; a < BBLK_RB; a++)
+                    acc[a][b] = intel_sub_group_u8_i8_matrix_mad_k32(av[a], bv, acc[a][b]);
+            }
+        }
+        for (int b = 0; b < BBLK_CT; b++) {
+            int c = 8 * (ct0 + b) + lane;
+            int8 corr = (int8)(128 * wsum_blk[(size_t)(c < n ? c : n - 1) * nkb + kb]);
+            for (int a = 0; a < BBLK_RB; a++) {
+                int r0 = 8 * (rb0 + a);
+                int8 v = acc[a][b] - corr;
+                float8 f = convert_float8(v);
+                for (int r = 0; r < 8; r++) {
+                    int row = r0 + r;
+                    float xs = xblk[(size_t)(row < m ? row : m - 1) * nkb + kb];
+                    facc[a][b][r] += f[r] * xs;
+                }
+            }
+        }
+    }
+    for (int b = 0; b < BBLK_CT; b++) {
+        int c = 8 * (ct0 + b) + lane;
+        if (c >= n) continue;
+        float ws = wscale[c];
+        for (int a = 0; a < BBLK_RB; a++) {
+            int r0 = 8 * (rb0 + a);
+            for (int r = 0; r < 8; r++)
+                if (r0 + r < m)
+                    y[(size_t)(r0 + r) * n + c] = facc[a][b][r] * ws;
+        }
+    }
+}

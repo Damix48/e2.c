@@ -18,6 +18,7 @@
  * so a whole layer costs one dispatch instead of one per (head, block).
  */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -439,8 +440,8 @@ int e2_attn_int8(e2_ctx *ctx, float *out, const float *q, const float *k,
     need = off_uq + (size_t)nt * scstride;
 
     if (ctx->acap < need) {
-        free(ctx->abuf);
-        ctx->abuf = malloc(need);
+        e2_dev_free(ctx, ctx->abuf);
+        ctx->abuf = e2_dev_alloc(ctx, need);
         ctx->acap = ctx->abuf ? need : 0;
     }
     if (!ctx->abuf) return -1;

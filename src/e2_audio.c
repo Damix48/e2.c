@@ -1,5 +1,6 @@
 /* e2_audio.c - mel spectrogram + Gemma 4 audio conformer tower. */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -615,6 +616,7 @@ static void audio_lconv(e2_ctx *ctx, e2_audio_layer *L, float *x, int T,
 /* ------------------------------------------------------------------ */
 
 int e2_audio_forward(e2_ctx *ctx, const float *samples, int n, float *out, int *ntok) {
+
     e2_model *m = &ctx->m;
     e2_meta *c = &m->meta;
     if (!(c->flags & E2_MOD_AUDIO)) return e2_fail("model has no audio tower");

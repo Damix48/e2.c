@@ -38,6 +38,13 @@ ze_result_t (*zeCommandListCreate)(ze_context_handle_t, ze_device_handle_t,
 ze_result_t (*zeCommandListDestroy)(ze_command_list_handle_t) = 0;
 ze_result_t (*zeCommandListReset)(ze_command_list_handle_t) = 0;
 ze_result_t (*zeCommandListClose)(ze_command_list_handle_t) = 0;
+ze_result_t (*zeCommandListAppendBarrier)(ze_command_list_handle_t, ze_event_handle_t,
+                                          uint32_t, ze_event_handle_t *) = 0;
+ze_result_t (*zeCommandListAppendWriteGlobalTimestamp)(
+    ze_command_list_handle_t, uint64_t *, ze_event_handle_t, uint32_t,
+    ze_event_handle_t *) = 0;
+ze_result_t (*zeDeviceGetGlobalTimestamps)(ze_device_handle_t, uint64_t *,
+                                           uint64_t *) = 0;
 ze_result_t (*zeCommandListAppendLaunchKernel)(ze_command_list_handle_t, ze_kernel_handle_t,
                                                const ze_group_count_t *, ze_event_handle_t,
                                                uint32_t, ze_event_handle_t *) = 0;
@@ -97,6 +104,9 @@ int e2_gpu_l0_open(void) {
     LOAD(zeCommandListDestroy);
     LOAD(zeCommandListReset);
     LOAD(zeCommandListClose);
+    LOAD(zeCommandListAppendBarrier);
+    LOAD(zeCommandListAppendWriteGlobalTimestamp);
+    LOAD(zeDeviceGetGlobalTimestamps);
     LOAD(zeCommandListAppendLaunchKernel);
     LOAD(zeModuleCreate);
     LOAD(zeModuleDestroy);

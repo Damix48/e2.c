@@ -1,5 +1,6 @@
 /* e2_ops.c - elementwise, norm, rope and attention kernels. */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -581,6 +582,7 @@ void e2_gelu_tanh(float *x, int n) {
 }
 
 void e2_gelu_tanh_ctx(e2_ctx *ctx, float *x, int n) {
+    if (e2_gpu_op_gelu_tanh(ctx, x, n) == 0) return;
     run_split(ctx, e2_gelu_tanh, x, n);
 }
 
@@ -740,12 +742,13 @@ static void gelu_mul_q_work(void *vp, int tid, int nt) {
 void e2_gelu_mul_q(e2_ctx *ctx, const float *x, const float *up, int rows, int k,
                    uint8_t *q, float *sc, int blk) {
     if (!blk) blk = 128;
+    if (e2_gpu_op_gelu_mul_q(ctx, x, up, rows, k, q, sc, blk) == 0) return;
     int nt = ctx && ctx->nthreads > 1 && (long)rows * k >= 65536 ? ctx->nthreads : 1;
     if (nt > rows) nt = rows;
     size_t tneed = (size_t)nt * k;
     if (ctx && ctx->tcap < tneed * sizeof(float)) {
-        free(ctx->tbuf);
-        ctx->tbuf = malloc(tneed * sizeof(float));
+        e2_dev_free(ctx, ctx->tbuf);
+        ctx->tbuf = e2_dev_alloc(ctx, tneed * sizeof(float));
         ctx->tcap = ctx->tbuf ? tneed * sizeof(float) : 0;
     }
     float *tmp = ctx ? ctx->tbuf : NULL;
@@ -904,12 +907,14 @@ static void norm_run(e2_ctx *ctx, norm_arg *a) {
 
 void e2_rmsnorm_pre(e2_ctx *ctx, float *out, const float *x, const float *w,
                     int rows, int dim, float eps, float pre) {
+    if (e2_gpu_op_rmsnorm(ctx, out, x, w, NULL, rows, dim, eps, pre, 1) == 0) return;
     norm_arg a = {out, x, NULL, w, rows, dim, eps, pre, 1, NULL, 0, NULL, 0};
     norm_run(ctx, &a);
 }
 
 void e2_rmsnorm_add(e2_ctx *ctx, float *x, const float *src, const float *w,
                     int rows, int dim, float eps) {
+    if (e2_gpu_op_rmsnorm(ctx, x, x, w, src, rows, dim, eps, 1.0f, 2) == 0) return;
     norm_arg a = {x, x, src, w, rows, dim, eps, 1.0f, 2, NULL, 0, NULL, 0};
     norm_run(ctx, &a);
 }
@@ -934,6 +939,7 @@ void e2_gelu_mul(e2_ctx *ctx, float *x, const float *up, int n) {
 
 void e2_rmsnorm(e2_ctx *ctx, float *out, const float *x, const float *w, int rows,
                 int dim, float eps) {
+    if (e2_gpu_op_rmsnorm(ctx, out, x, w, NULL, rows, dim, eps, 1.0f, 0) == 0) return;
     norm_arg a = {out, x, NULL, w, rows, dim, eps, 1.0f, 0, NULL, 0, NULL, 0};
     norm_run(ctx, &a);
 }
@@ -942,6 +948,8 @@ void e2_rmsnorm_rope(e2_ctx *ctx, float *x, const float *w, int rows, int dim,
                      float eps, const e2_rope_tab *tb, int per_pos,
                      const int *seq_off, int nseq) {
     if (!tb) { e2_rmsnorm(ctx, x, x, w, rows, dim, eps); return; }
+    if (e2_gpu_op_norm_rope(ctx, x, w, rows, dim, eps, tb, per_pos, seq_off, nseq) == 0)
+        return;
     norm_arg a = {x, x, NULL, w, rows, dim, eps, 1.0f, 3, tb, per_pos, seq_off, nseq};
     norm_run(ctx, &a);
 }
@@ -1022,6 +1030,7 @@ void e2_add_inplace_ctx(e2_ctx *ctx, float *a, const float *b, int n) {
     ew_run(ctx, a, b, n, 0, 0.0f);
 }
 void e2_vec_scale_ctx(e2_ctx *ctx, float *x, int n, float k) {
+    if (e2_gpu_op_scale(ctx, x, n, k) == 0) return;
     ew_run(ctx, x, NULL, n, 1, k);
 }
 void e2_silu_ctx(e2_ctx *ctx, float *x, int n) { ew_run(ctx, x, NULL, n, 2, 0.0f); }
@@ -1234,6 +1243,13 @@ e2_rope_tab *e2_rope_get(e2_ctx *ctx, float theta, int half, int need) {
     return rope_pick(ctx->rope, theta, half, need);
 }
 
+/* Vision rope is axial: axis 0 and axis 1 keep independent tables. */
+e2_rope_tab *e2_rope_get_axis(e2_ctx *ctx, int axis, float theta, int half, int need) {
+    if (axis < 0 || axis > 1) return NULL;
+    if (rope_build(&ctx->ropev[axis], theta, half, need)) return NULL;
+    return &ctx->ropev[axis];
+}
+
 typedef struct {
     float *q, *k;
     int t, heads, kv_heads, head_dim, offset;
@@ -1257,6 +1273,8 @@ static void rope_text_work(void *vp, int tid, int nt) {
 void e2_rope_text(e2_ctx *ctx, float *q, float *k, int t, int heads, int kv_heads,
                   int head_dim, int pos_offset, float theta) {
     int half = head_dim / 2;
+    if (e2_gpu_op_rope_text(ctx, q, k, t, heads, kv_heads, head_dim, pos_offset,
+                            theta) == 0) return;
     e2_rope_tab *tb = rope_pick(ctx->rope, theta, half, t + pos_offset);
     if (!tb) return;
     rope_arg a = {q, k, t, heads, kv_heads, head_dim, pos_offset, tb->c, tb->s};
@@ -1302,6 +1320,7 @@ void e2_rope_vision(e2_ctx *ctx, float *q, float *k, int t, int heads, int head_
         if (xy[2 * i] > mh) mh = xy[2 * i];
         if (xy[2 * i + 1] > mw) mw = xy[2 * i + 1];
     }
+    if (e2_gpu_op_rope_vision(ctx, q, k, t, heads, head_dim, xy, theta) == 0) return;
     if (rope_build(&ctx->ropev[0], theta, half, mh + 1)) return;
     if (rope_build(&ctx->ropev[1], theta, half, mw + 1)) return;
     (void)spatial;
@@ -1630,8 +1649,8 @@ static void attention_f32(e2_ctx *ctx, float *out, const float *q, const float *
     int tpad = ((t + 31) & ~31) + 32;
     size_t need = (size_t)kv_heads * head_dim * tpad;
     if (ctx->ktcap < need) {
-        free(ctx->ktbuf);
-        ctx->ktbuf = malloc(need * sizeof(float));
+        e2_dev_free(ctx, ctx->ktbuf);
+        ctx->ktbuf = e2_dev_alloc(ctx, need * sizeof(float));
         ctx->ktcap = ctx->ktbuf ? need : 0;
     }
     if (!ctx->ktbuf) return;
@@ -1652,6 +1671,9 @@ void e2_attention_text(e2_ctx *ctx, float *out, const float *q, const float *k,
                        const float *v, int t, int heads, int kv_heads, int head_dim,
                        int window) {
     if (t <= 0 || heads <= 0) return;
+    { int off = 0;
+      if (e2_gpu_op_attn(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window, 1,
+                         &off) == 0) return; }
     static int noint8 = -1;
     if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
     if (!noint8 && simd() >= 1 && t >= 32) {
@@ -1683,6 +1705,9 @@ void e2_attention_text_multi(e2_ctx *ctx, float *out, const float *q, const floa
                              const float *v, int t, const int *seq_off, int nseq,
                              int heads, int kv_heads, int head_dim, int window) {
     size_t qs = (size_t)heads * head_dim, ks = (size_t)kv_heads * head_dim;
+    if (nseq > 1 &&
+        e2_gpu_op_attn(ctx, out, q, k, v, t, heads, kv_heads, head_dim, window, nseq,
+                       seq_off) == 0) return;
     static int noint8 = -1;
     if (noint8 < 0) noint8 = getenv("E2_ATTN_F32") ? 1 : 0;
     if (!noint8 && nseq > 1 && t >= 16 && simd() >= 1 &&

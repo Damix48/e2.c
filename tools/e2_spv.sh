@@ -26,7 +26,10 @@ OCLOC_DEVICE=${OCLOC_DEVICE:-arl-h}
 for f in tools/gpu/*.cl; do
     name=$(basename "$f" .cl)
     arr="e2_gpu_spv_${name}"
-    if grep -q "intel_sub_group_" "$f"; then
+    # only a real call counts: e2_dpas.cl is the one file that needs ocloc
+    # (the Intel matrix builtin), and comments mention it too.
+    if sed -e "s://.*::" -e "s:/\*.*\*/::" "$f" | grep -v "^[[:space:]]*\*" |
+        grep -q "intel_sub_group_"; then
         mkdir -p "$TMP/$name"
         ocloc compile -file "$f" -device "$OCLOC_DEVICE" -out_dir "$TMP/$name" \
             -output "$name" >/dev/null

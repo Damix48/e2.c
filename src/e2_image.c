@@ -298,8 +298,10 @@ int e2_image_prepare(e2_ctx *ctx, const uint8_t *src, int w, int h, int max_soft
     int pw = tw / patch, ph = th / patch;
     int P = pw * ph;
     int psz = 3 * patch * patch;
-    float *pat = malloc((size_t)P * psz * sizeof(float));
-    int *pos = malloc((size_t)P * 2 * sizeof(int));
+    /* arena (shared USM on the device path): the patch projection reads it */
+    float *pat = e2_arena_alloc(&ctx->scratch, (size_t)P * psz * sizeof(float));
+    int *pos = e2_arena_alloc(&ctx->scratch, (size_t)P * 2 * sizeof(int));
+    if (!pat || !pos) { free(resized); return -1; }
     int n = 0;
     for (int py = 0; py < ph; py++) {
         for (int px = 0; px < pw; px++) {

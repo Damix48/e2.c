@@ -43,7 +43,9 @@ void *e2_arena_alloc(e2_arena *a, size_t n) {
         }
     size_t sz = n > ARENA_MIN ? n : ARENA_MIN;
     if (sz < a->cap) sz = a->cap;
-    e2_arena_block *b = malloc(sizeof(*b) + sz);
+    e2_arena_block *b = a->blk_alloc
+        ? a->blk_alloc(a->alloc_ctx, sizeof(*b) + sz)
+        : malloc(sizeof(*b) + sz);
     if (!b) return NULL;
     b->size = sz;
     b->used = n;
@@ -66,7 +68,7 @@ void e2_arena_free(e2_arena *a) {
     e2_arena_block *b = a->head;
     while (b) {
         e2_arena_block *n = b->next;
-        free(b);
+        if (a->blk_free) a->blk_free(a->alloc_ctx, b); else free(b);
         b = n;
     }
     memset(a, 0, sizeof(*a));

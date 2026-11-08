@@ -1,5 +1,6 @@
 /* e2_vision.c - Gemma 4 vision tower (16 bidirectional layers + pooler). */
 #include "e2_internal.h"
+#include "e2_gpu.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -11,9 +12,12 @@ int e2_image_prepare(e2_ctx *ctx, const uint8_t *src, int w, int h, int max_soft
                      int *pw_out, int *ph_out);
 int e2_image_load_rgb(const char *path, uint8_t **rgb, int *w, int *h);
 
+static e2_ctx *g_vision_ctx;
+
 static void vdump(const char *name, const float *p, size_t n) {
     const char *dir = getenv("E2_DUMP");
     if (!dir) return;
+    e2_gpu_flush(g_vision_ctx);          /* the device may still owe this buffer */
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
     FILE *f = fopen(path, "wb");
@@ -29,13 +33,14 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
     e2_meta *c = &m->meta;
     if (!(c->flags & E2_MOD_IMAGE)) return e2_fail("model has no vision tower");
 
+    g_vision_ctx = ctx;
+    e2_arena_reset(&ctx->scratch);
     float *pat = NULL;
     int *pos = NULL, P = 0, pw = 0, ph = 0;
     if (e2_image_prepare(ctx, rgb, w, h, max_soft, &pat, &pos, &P, &pw, &ph) != 0) return -1;
 
     const int H = c->vision_hidden, I = c->vision_inter, D = c->vision_head_dim;
     const int heads = c->vision_heads;
-    e2_arena_reset(&ctx->scratch);
     float *x = e2_arena_alloc(&ctx->scratch, (size_t)P * H * sizeof(float));
     float *hb = e2_arena_alloc(&ctx->scratch, (size_t)P * H * sizeof(float));
     float *q = e2_arena_alloc(&ctx->scratch, (size_t)P * heads * D * sizeof(float));
@@ -44,21 +49,22 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
     float *att = e2_arena_alloc(&ctx->scratch, (size_t)P * heads * D * sizeof(float));
     float *tmp = e2_arena_alloc(&ctx->scratch, (size_t)P * I * sizeof(float));
     float *up = e2_arena_alloc(&ctx->scratch, (size_t)P * I * sizeof(float));
-    if (!x || !hb || !q || !k || !v || !att || !tmp || !up) { free(pat); free(pos); return e2_fail("oom"); }
+    if (!x || !hb || !q || !k || !v || !att || !tmp || !up) return e2_fail("oom");
 
     e2_linear lpatch = {0}; lpatch.w = m->patch_proj;
     e2_linear_forward(ctx, x, pat, P, &lpatch);
-    free(pat);
 
     /* add 2-D position embeddings: table[0][x] + table[1][y] */
     const float *tab = m->pos_table;
     size_t stride = (size_t)c->vision_pos_table * H;
-    for (int p = 0; p < P; p++) {
-        int px = pos[p * 2], py = pos[p * 2 + 1];
-        const float *ex = tab + (size_t)px * H;
-        const float *ey = tab + stride + (size_t)py * H;
-        float *xp = x + (size_t)p * H;
-        for (int i = 0; i < H; i++) xp[i] += ex[i] + ey[i];
+    if (e2_gpu_op_pos_add(ctx, x, pos, tab, P, H, (long)stride) != 0) {
+        for (int p = 0; p < P; p++) {
+            int px = pos[p * 2], py = pos[p * 2 + 1];
+            const float *ex = tab + (size_t)px * H;
+            const float *ey = tab + stride + (size_t)py * H;
+            float *xp = x + (size_t)p * H;
+            for (int i = 0; i < H; i++) xp[i] += ex[i] + ey[i];
+        }
     }
 
     vdump("vis_in", x, (size_t)P * H);
@@ -125,8 +131,10 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
     int nt = bx * by;
     vdump("vis_out", x, (size_t)P * H);
     if (prof) fprintf(stderr, "vision: qkv %.0f ms attn %.0f ms  total-layer %.0f ms\n", tp[2], tp[3], tp[1]);
-    float *pooled = calloc((size_t)nt * H, sizeof(float));
-    if (!pooled) { free(pos); return e2_fail("oom"); }
+    if (e2_gpu_flush(ctx) != 0) return e2_fail("device forward failed");
+    float *pooled = e2_arena_alloc(&ctx->scratch, (size_t)nt * H * sizeof(float));
+    if (!pooled) return e2_fail("oom");
+    memset(pooled, 0, (size_t)nt * H * sizeof(float));
     for (int p = 0; p < P; p++) {
         int b = pos[p * 2] / pool + bx * (pos[p * 2 + 1] / pool);
         const float *xp = x + (size_t)p * H;
@@ -140,15 +148,13 @@ int e2_vision_forward(e2_ctx *ctx, const uint8_t *rgb, int w, int h,
     vdump("vis_pool", pooled, (size_t)nt * H);
     /* project to text space */
     e2_rmsnorm(ctx, pooled, pooled, NULL, nt, H, c->vision_eps);
-    float *soft = malloc((size_t)nt * c->text_hidden * sizeof(float));
-    if (!soft) { free(pooled); free(pos); return e2_fail("oom"); }
+    float *soft = e2_arena_alloc(&ctx->scratch, (size_t)nt * c->text_hidden * sizeof(float));
+    if (!soft) return e2_fail("oom");
     e2_linear le = {0}; le.w = m->vis_embed;
     e2_linear_forward(ctx, soft, pooled, nt, &le);
+    if (e2_gpu_flush(ctx) != 0) return e2_fail("device forward failed");
     vdump("image_soft", soft, (size_t)nt * c->text_hidden);
     memcpy(out, soft, (size_t)nt * c->text_hidden * sizeof(float));
-    free(soft);
-    free(pooled);
-    free(pos);
     *out_tokens = nt;
     return 0;
 }

@@ -682,14 +682,9 @@ void e2_gemm_init(void) {
  * cannot express. */
 static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l);
 
-/* Try the GPU GEMM; returns 0 if it produced y, nonzero to use the CPU. */
-static int gpu_try(e2_ctx *ctx, float *y, int ns, const uint8_t *xq, const float *xs,
-                   int xss, int m, int k, const e2_qmat *w) {
-    if (!ctx || ctx->device != E2_DEVICE_GPU || !ctx->gpu || m < 32) return -1;
-    return e2_gpu_gemm(ctx, y, ns, xq, xs, xss, m, k, w, 0, (w->n + 15) / 16);
-}
-
 void e2_linear_forward(e2_ctx *ctx, float *y, const float *x, int m, const e2_linear *l) {
+    /* Device path: the whole forward is one submission, so this only enqueues. */
+    if (e2_gpu_op_linear(ctx, y, x, m, l) == 0) return;
     if (l->in_min || l->in_max) { linear_one(ctx, y, x, m, l); return; }
     e2_linear_forward_multi(ctx, x, m, &l, &y, 1);
 }
@@ -720,22 +715,21 @@ void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
     }
 
     /* Device path: quantise on the fly and run every GEMM of the list on the
-     * matrix engine (four times the CPU kernel's MAC rate on this iGPU). */
-    if (ctx->device == E2_DEVICE_GPU && ctx->gpu &&
-        e2_gpu_linear_multi(ctx, x, m, ls, ys, n) == 0)
-        return;
+     * matrix engine, appended to the forward's command list. */
+    if (n == 1 && e2_gpu_op_linear(ctx, ys[0], x, m, ls[0]) == 0) return;
+    if (n > 1 && e2_gpu_op_linear_multi(ctx, x, m, ls, ys, n) == 0) return;
 
     int m4 = (m + 15) & ~15;
     size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
     if (ctx->qcap < qneed) {
-        free(ctx->qbuf);
-        ctx->qbuf = malloc(qneed);
-        ctx->qcap = qneed;
+        e2_dev_free(ctx, ctx->qbuf);
+        ctx->qbuf = e2_dev_alloc(ctx, qneed);
+        ctx->qcap = ctx->qbuf ? qneed : 0;
     }
     if (ctx->scap < sneed * sizeof(float)) {
-        free(ctx->sbuf);
-        ctx->sbuf = malloc(sneed * sizeof(float));
-        ctx->scap = sneed * sizeof(float);
+        e2_dev_free(ctx, ctx->sbuf);
+        ctx->sbuf = e2_dev_alloc(ctx, sneed * sizeof(float));
+        ctx->scap = ctx->sbuf ? sneed * sizeof(float) : 0;
     }
     uint8_t *xq = ctx->qbuf;
     float *xs = ctx->sbuf;
@@ -763,13 +757,10 @@ void e2_linear_forward_multi(e2_ctx *ctx, const float *x, int m,
         a.w = &l->w;
         a.ns = l->w.n;
         long work = (long)m * l->w.n * k;
-        int gpu = gpu_try(ctx, ys[i], l->w.n, xq, xs, nblk, m, k, &l->w) == 0;
-        if (!gpu) {
-            if (ctx->nthreads <= 1 || work < 2000000L)
-                gemm_work(&a, 0, 1);
-            else
-                e2_parallel(ctx, gemm_work, &a);
-        }
+        if (ctx->nthreads <= 1 || work < 2000000L)
+            gemm_work(&a, 0, 1);
+        else
+            e2_parallel(ctx, gemm_work, &a);
         if (l->w.bias || l->out_min || l->out_max) {
             float lo = l->out_min ? l->out_min[0] : -INFINITY;
             float hi = l->out_max ? l->out_max[0] : INFINITY;
@@ -797,14 +788,14 @@ static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
     int m4 = (m + 15) & ~15;
     size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
     if (ctx->qcap < qneed) {
-        free(ctx->qbuf);
-        ctx->qbuf = malloc(qneed);
-        ctx->qcap = qneed;
+        e2_dev_free(ctx, ctx->qbuf);
+        ctx->qbuf = e2_dev_alloc(ctx, qneed);
+        ctx->qcap = ctx->qbuf ? qneed : 0;
     }
     if (ctx->scap < sneed * sizeof(float)) {
-        free(ctx->sbuf);
-        ctx->sbuf = malloc(sneed * sizeof(float));
-        ctx->scap = sneed * sizeof(float);
+        e2_dev_free(ctx, ctx->sbuf);
+        ctx->sbuf = e2_dev_alloc(ctx, sneed * sizeof(float));
+        ctx->scap = ctx->sbuf ? sneed * sizeof(float) : 0;
     }
     uint8_t *xq = ctx->qbuf;
     float *xs = ctx->sbuf;
@@ -814,8 +805,8 @@ static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
         float hi = l->in_max ? l->in_max[0] : INFINITY;
         size_t tneed = (size_t)m * k;
         if (ctx->tcap < tneed * sizeof(float)) {
-            free(ctx->tbuf);
-            ctx->tbuf = malloc(tneed * sizeof(float));
+            e2_dev_free(ctx, ctx->tbuf);
+            ctx->tbuf = e2_dev_alloc(ctx, tneed * sizeof(float));
             ctx->tcap = ctx->tbuf ? tneed * sizeof(float) : 0;
         }
         float *tmp = ctx->tbuf;
@@ -841,12 +832,10 @@ static void linear_one(e2_ctx *ctx, float *y, const float *x, int m, const e2_li
     }
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
     long work = (long)m * w->n * k;
-    if (gpu_try(ctx, y, w->n, xq, xs, nblk, m, k, w) != 0) {
-        if (ctx->nthreads <= 1 || work < 2000000L)
-            gemm_work(&a, 0, 1);
-        else
-            e2_parallel(ctx, gemm_work, &a);
-    }
+    if (ctx->nthreads <= 1 || work < 2000000L)
+        gemm_work(&a, 0, 1);
+    else
+        e2_parallel(ctx, gemm_work, &a);
     if (w->bias || l->out_min || l->out_max) {
         float lo = l->out_min ? l->out_min[0] : -INFINITY;
         float hi = l->out_max ? l->out_max[0] : INFINITY;
@@ -908,14 +897,13 @@ void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
     const e2_qmat *w = &l->w;
     e2_gemm_init();
     int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
+    if (e2_gpu_op_linear_pq(ctx, y, xq, xs, m, l) == 0) return;
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
     long work = (long)m * w->n * k;
-    if (gpu_try(ctx, y, w->n, xq, xs, nblk, m, k, w) != 0) {
-        if (!ctx || ctx->nthreads <= 1 || work < 2000000L)
-            gemm_work(&a, 0, 1);
-        else
-            e2_parallel(ctx, gemm_work, &a);
-    }
+    if (!ctx || ctx->nthreads <= 1 || work < 2000000L)
+        gemm_work(&a, 0, 1);
+    else
+        e2_parallel(ctx, gemm_work, &a);
 }
 
 /* Caller-owned m4-padded u8 activation scratch (ctx->qbuf) plus its block
@@ -924,13 +912,13 @@ uint8_t *e2_quant_scratch(e2_ctx *ctx, int m, int k, float **xs) {
     int blk = BLK, m4 = (m + 15) & ~15, nblk = k / blk;
     size_t qneed = (size_t)m4 * k, sneed = (size_t)m4 * nblk;
     if (ctx->qcap < qneed) {
-        free(ctx->qbuf);
-        ctx->qbuf = malloc(qneed);
+        e2_dev_free(ctx, ctx->qbuf);
+        ctx->qbuf = e2_dev_alloc(ctx, qneed);
         ctx->qcap = ctx->qbuf ? qneed : 0;
     }
     if (ctx->scap < sneed * sizeof(float)) {
-        free(ctx->sbuf);
-        ctx->sbuf = malloc(sneed * sizeof(float));
+        e2_dev_free(ctx, ctx->sbuf);
+        ctx->sbuf = e2_dev_alloc(ctx, sneed * sizeof(float));
         ctx->scap = ctx->sbuf ? sneed * sizeof(float) : 0;
     }
     if (!ctx->qbuf || !ctx->sbuf) return NULL;

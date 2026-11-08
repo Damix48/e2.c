@@ -41,9 +41,9 @@ endif
 SRC := src/e2.c src/e2_model.c src/e2_util.c src/e2_gemm.c src/e2_ops.c \
        src/e2_attn.c src/e2_text.c src/e2_tokenizer.c src/e2_image.c \
        src/e2_vision.c src/e2_audio.c src/e2_audio_file.c src/e2_multimodal.c \
-       src/e2_gpu.c src/e2_gpu_l0.c
+       src/e2_gpu.c src/e2_gpu_ops.c src/e2_gpu_l0.c
 OBJ := $(SRC:.c=.o)
-HDR := e2.h src/e2_internal.h src/e2_gpu.h src/e2_gpu_l0.h src/e2_gpu_spv.h
+HDR := e2.h src/e2_internal.h src/e2_gpu.h src/e2_gpu_int.h src/e2_gpu_l0.h src/e2_gpu_spv.h
 
 .PHONY: all clean test bench compare pack help spv
 
@@ -85,6 +85,10 @@ spv:
 gpu-probe: tools/gpu_probe.c src/e2_gpu_l0.c libe2.a $(HDR) src/e2_gpu_l0.h src/e2_gpu_spv.h
 	$(CC) $(CFLAGS) -o $@ tools/gpu_probe.c src/e2_gpu_l0.c libe2.a $(LDFLAGS)
 
+# dev-only device-GEMM correctness check (not shipped)
+gpu-check: tools/gpu_gemm_check.c libe2.a $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< libe2.a $(LDFLAGS)
+
 # dev-only kernel microbenchmark (not shipped)
 mb: tools/mb.c libe2.a $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< libe2.a $(LDFLAGS)
@@ -111,4 +115,4 @@ pack:
 	python tools/e2_pack.py --modalities text,image,audio,video --out models/e2-text+image+audio+video.bin --tokenizer-out models/e2-tokenizer.bin
 
 clean:
-	rm -f $(OBJ) libe2.a e2cli tests/e2_test tests/e2_bench tests/e2_bench_full mb gpu-probe
+	rm -f $(OBJ) libe2.a e2cli tests/e2_test tests/e2_bench tests/e2_bench_full mb gpu-probe gpu-check

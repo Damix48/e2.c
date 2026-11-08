@@ -31,9 +31,12 @@ make bench           # text throughput / latency
 `__attribute__((target(...)))` and selected at runtime.
 
 The Intel GPU (Level Zero) backend is opt-in and needs no build dependency
-(`libze_loader.so.1` is dlopen'd, the SPIR-V module is a checked-in generated
-header): `E2_DEVICE=gpu ./e2cli ...` or `e2_set_device(ctx, E2_DEVICE_GPU)`.
-On the current Arc 140T it is slower than the CPU -- see PERFORMANCE.md.
+(`libze_loader.so.1` is dlopen'd, the SPIR-V modules are a checked-in generated
+header, `make spv` regenerates it): `E2_DEVICE=gpu ./e2cli ...` or
+`e2_set_device(ctx, E2_DEVICE_GPU)`. It runs every linear, the attention stack
+and the norms on the Xe matrix engine (int8 DPAS) with one submission per
+embedding. On the current Arc 140T it is still slower than the CPU for short
+inputs and faster for image/video -- see PERFORMANCE.md ("Round 9").
 
 Optional system libraries are auto-detected with `pkg-config`: libpng +
 libjpeg-turbo replace the vendored decoders, libwebp adds WebP input, and
@@ -218,12 +221,12 @@ All matrix multiplications go through `e2_linear_forward()` in
 scales and per-128 activation scales) and register it in `select_kernel()`.
 The packed layout is `[N/16][K/4][16][4]` int8.
 
-Attention/RMSNorm/RoPE live in `src/e2_ops.c`; a GPU backend can replace those
-entry points. **No GPU backend is shipped in this repository yet** — the CUDA,
-Metal and Vulkan paths are a documented extension point, not untested code.
-The CPU backend is complete and validated. The same is true for ARM NEON:
-the kernel is present behind `make DOTPROD=1` but could not be tested on this
-x86 machine.
+Attention/RMSNorm/RoPE live in `src/e2_ops.c`; a backend that wants them
+device-side replaces those entry points, which is what the Level Zero backend
+does (`src/e2_gpu_ops.c` returns nonzero to fall back to the CPU per op). The
+CUDA, Metal and Vulkan paths are a documented extension point, not untested
+code. The same is true for ARM NEON: the kernel is present behind
+`make DOTPROD=1` but could not be tested on this x86 machine.
 
 ## Debug switches
 

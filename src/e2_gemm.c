@@ -897,7 +897,6 @@ void e2_linear_forward_pq(e2_ctx *ctx, float *y, const uint8_t *xq,
     const e2_qmat *w = &l->w;
     e2_gemm_init();
     int k = w->k, blk = w->blk ? w->blk : BLK, nblk = k / blk;
-    if (e2_gpu_op_linear_pq(ctx, y, xq, xs, m, l) == 0) return;
     gemm_arg a = {y, xq, xs, nblk, m, k, w->n, w, g_kernel};
     long work = (long)m * w->n * k;
     if (!ctx || ctx->nthreads <= 1 || work < 2000000L)

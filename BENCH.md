@@ -43,39 +43,39 @@ beats OpenVINO int8 by at least 1.8x (goal was 1.5x).
 
 ## GPU (Intel Arc 140T iGPU, Level Zero)
 
-The GPU backend is opt-in (`E2_DEVICE=gpu`) and still **slower than the CPU
-path**, so it is not the default. It is a full device-resident pipeline: the
-whole tower is appended to one command list and submitted once per embedding
-(968 kernels, one sync), with the packed-int8 matrix engine for every GEMM and
-per-128-block activation scales, so each tensor matches the CPU int8 kernel
-(`cos 1.0000000`, `maxerr 9.5e-07`).
+The GPU backend is opt-in (`E2_DEVICE=gpu`). Every linear, the attention stack
+(QK^T, masked softmax, PV) and the norms run on the Xe matrix engine with int8
+DPAS, **one command-list submission per embedding**. Results match the CPU int8
+kernel bit for bit per tensor (cos 1.0000000 against `e2_gemm_range`), and the
+attention is int8 like the CPU path instead of f32.
 
-| task | length | e2 CPU | e2 GPU | ov-int8@GPU |
-|---|---:|---:|---:|---:|
-| text | 8 | 7.4 | 18.6 | 6.3 |
-| text | 64 | 20.3 | 35.3 | 7.0 |
-| text | 128 | 33.0 | 61.5 | 9.2 |
-| text | 512 | 118.2 | 534.6 | 20.4 |
-| text | 2048 | 1082 | 11750 | 140.4 |
-| image | 270 tok | 640.8 | 2998.1 | 258 |
-| audio | 54 tok | 32.7 | 69.3 | 23.0 |
-| video | 8 frames | 2202.8 | 7635.2 | 792 |
+Same run, same process (`--sources e2,ov-int8-gpu --iters 2 --repeat 2`):
 
-(One run, host shared with the desktop, so the CPU column is ~1.4x its idle
-number; compare the columns, not the absolute values.)
+| task | length | e2 CPU | e2 GPU | ov-int8 GPU | e2 GPU / OV |
+|---|---:|---:|---:|---:|---:|
+| text | 8 | 7.4 | 17.0 | 5.7 | 0.34 |
+| text | 64 | 20.3 | 21.2 | 6.4 | 0.30 |
+| text | 128 | 33.0 | 25.5 | 7.7 | 0.30 |
+| text | 512 | 118.2 | 83.5 | 19.6 | 0.23 |
+| text | 2048 | 1082 | 460 | 138.7 | 0.30 |
+| image | 270 tok | 640.8 | 604 | 273.6 | 0.45 |
+| audio | 54 tok | 32.7 | 36.6 | 23.9 | 0.65 |
+| video | 8 frames | 2202.8 | 2478 | 820 | 0.33 |
 
-`E2_GPU_TS=1` gives per-kernel device times. At text 512, f32 attention is 73%
-of the forward, the GEMM 13%, and the elementwise passes 11%. PERFORMANCE.md
-("Round 8") has the per-kernel table, the accuracy per tensor, every experiment
-that failed, and the measured roadmap (int8 attention on the matrix engine
-first, then fused norm+quantise+pack, then split-K for small m).
+(The CPU column is round 8's, measured under heavier host load; read the GPU/OV
+column, it is from one run.) Round 8 measured 534 ms at text 512 and 11750 ms at
+2048 on the device, so the round is 6-25x faster; it is still 1.5-6x *slower*
+than OpenVINO int8 on the GPU, i.e. **the 1.5x goal is not met**.
 
-Accuracy of the device path (vs the CPU path, which is the reference):
-text 0.9996, per layer >= 0.9990; image 0.9922 (the vision tower's known chaotic
-amplification of the f32-vs-int8 attention difference, 0.988 by layer 16); audio
-is identical because that tower still runs on the CPU.
-`--repeat 3` pools 9 samples per row; alone, the same-run ratio still moves
-+/-10% with host load (see PERFORMANCE.md).
+The profile and the roadmap are in PERFORMANCE.md ("Round 9"): the GEMM kernel
+runs at 50% of the 17-18 TMAC/s matrix-engine ceiling but a forward is ~1500
+small launches, and the remaining structural work is one GEMM launch per layer
+instead of nine (concatenated qkv / gate-up weights + a `gridCountZ` over
+descriptors), fusing norm+quantise, batched attention and the on-device towers.
+
+`make gpu-bench` sweeps the tile and checks every shape against the CPU kernel;
+`E2_GPU_TS=1` prints per-kernel device timestamps, `E2_GPU_SKIP=linear,norm,...`
+keeps an op group on the CPU.
 
 ## Accuracy
 

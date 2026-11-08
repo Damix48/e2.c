@@ -43,9 +43,9 @@ SRC := src/e2.c src/e2_model.c src/e2_util.c src/e2_gemm.c src/e2_ops.c \
        src/e2_vision.c src/e2_audio.c src/e2_audio_file.c src/e2_multimodal.c \
        src/e2_gpu.c src/e2_gpu_ops.c src/e2_gpu_l0.c
 OBJ := $(SRC:.c=.o)
-HDR := e2.h src/e2_internal.h src/e2_gpu.h src/e2_gpu_int.h src/e2_gpu_l0.h src/e2_gpu_spv.h
+HDR := e2.h src/e2_internal.h src/e2_gpu.h src/e2_gpu_int.h src/e2_gpu_l0.h src/e2_gpu_pack.h src/e2_gpu_spv.h
 
-.PHONY: all clean test bench compare pack help spv
+.PHONY: all clean test bench compare pack help spv gpu-bench
 
 all: libe2.a e2cli
 	@echo "e2: system-image=$(USE_SYSTEM_IMAGE) webp=$(USE_WEBP) sndfile=$(USE_SNDFILE)"
@@ -81,9 +81,9 @@ tests/e2_bench_full: tests/e2_bench_full.c libe2.a $(HDR)
 spv:
 	sh tools/e2_spv.sh
 
-# dev-only Level Zero GEMM probe (not shipped; dlopens libze_loader at runtime)
-gpu-probe: tools/gpu_probe.c src/e2_gpu_l0.c libe2.a $(HDR) src/e2_gpu_l0.h src/e2_gpu_spv.h
-	$(CC) $(CFLAGS) -o $@ tools/gpu_probe.c src/e2_gpu_l0.c libe2.a $(LDFLAGS)
+# dev-only matrix-engine kernel benchmark: tile/mode sweep (not shipped)
+gpu-bench: tools/gpu_bench.c src/e2_gpu_l0.c libe2.a $(HDR)
+	$(CC) $(CFLAGS) -o $@ tools/gpu_bench.c src/e2_gpu_l0.c libe2.a $(LDFLAGS)
 
 # dev-only device-GEMM correctness check (not shipped)
 gpu-check: tools/gpu_gemm_check.c libe2.a $(HDR)
@@ -115,4 +115,4 @@ pack:
 	python tools/e2_pack.py --modalities text,image,audio,video --out models/e2-text+image+audio+video.bin --tokenizer-out models/e2-tokenizer.bin
 
 clean:
-	rm -f $(OBJ) libe2.a e2cli tests/e2_test tests/e2_bench tests/e2_bench_full mb gpu-probe gpu-check
+	rm -f $(OBJ) libe2.a e2cli tests/e2_test tests/e2_bench tests/e2_bench_full mb gpu-check gpu-bench

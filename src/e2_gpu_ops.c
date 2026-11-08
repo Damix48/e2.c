@@ -93,11 +93,6 @@ int e2_gpu_flush(e2_ctx *ctx) {
 
 static uint32_t e2_up(uint32_t n, uint32_t m) { return (n + m - 1) / m * m; }
 
-static int launch1(e2_gpu *g, ze_kernel_handle_t k, uint32_t threads, uint32_t local) {
-    (void)k;
-    return e2_gpu_launch(g, k, e2_up(threads, local) / local) == 0 ? 0 : E2_GPUBAD;
-}
-
 #define LAUNCH(g, k, threads, local, name) \
     (e2_gpu_launch_named(g, k, e2_up(threads, local) / local, name) == 0 \
          ? 0 : E2_GPUBAD)
@@ -222,65 +217,19 @@ int e2_gpu_op_rope_vision(e2_ctx *ctx, float *q, float *k, int t, int heads,
     return LAUNCH(g, g->k_rope_vision, (uint32_t)((long)t * heads * hf), 64, "rope_vision");
 }
 
+/* int8 attention on the matrix engine (see e2_gpu_enq_attn).  Multiple
+ * sequences and head dims without a 128-wide layout stay on the CPU: both need
+ * a per-sequence band the score product does not have. */
 int e2_gpu_op_attn(e2_ctx *ctx, float *out, const float *q, const float *k,
                    const float *v, int t, int heads, int kv_heads, int head_dim,
                    int window, int nseq, const int *seq_off) {
     e2_gpu *g = e2_gpu_on(ctx) ? ctx->gpu : NULL;
     if (g && g->ready && SKIPPED(SK_ATTN)) return OP_FAIL;
-    if (!g || !g->ready || t <= 0 || heads <= 0 || kv_heads <= 0) return OP_FAIL;
-    if (head_dim > 512 || (heads % kv_heads) || !g->k_attn_comb) return OP_FAIL;
-    if (e2_gpu_enq_open(g) != 0) return OP_FAIL;
-    const int *so = e2_gpu_mirror(g, seq_off, (size_t)nseq * sizeof(int));
-    if (!so) return OP_FAIL;
-
-    /* Split the key band until the grid can fill the device (4 work-groups per
-     * EU); each work-group keeps the 4 query rows that share a band. */
-    long rows = (long)nseq * t * heads;
-    long wgs = (rows + 3) / 4;
-    int band = window > 0 ? (2 * window + 1 < t ? 2 * window + 1 : t) : t;
-    int nchunk = (int)((4 * 128 + wgs - 1) / (wgs ? wgs : 1));
-    if (nchunk > band / 32) nchunk = band / 32;   /* >= 32 keys per chunk */
-    if (nchunk < 1) nchunk = 1;
-    if (nchunk > 16) nchunk = 16;
-    uint32_t ai = 0;
-    /* nchunk == 1 writes the result directly; otherwise the partials are
-     * summed by k_attn_comb. */
-    float *part = out, *stats = NULL;
-    if (nchunk > 1) {
-        part = e2_arena_alloc(&g->act, (size_t)nchunk * rows * head_dim * sizeof(float));
-        stats = e2_arena_alloc(&g->act, (size_t)2 * nchunk * rows * sizeof(float));
-        if (!part || !stats) return OP_FAIL;
-    }
-    if (zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(q), &q) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(k), &k) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(v), &v) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(part), &part) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(stats), &stats) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(so), &so) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(int), &nseq) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(int), &t) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(int), &heads) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(int), &kv_heads) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(int), &head_dim) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(int), &window) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_part, ai++, sizeof(int), &nchunk) != ZE_RESULT_SUCCESS)
-        return OP_FAIL;
-    long npos = (t + 3) / 4;
-    if (LAUNCH(g, g->k_attn_part, (uint32_t)((long)nseq * heads * npos * nchunk * 128),
-               128, "attn_part") != 0)
-        return OP_FAIL;
-    if (nchunk == 1) return 0;
-    ai = 0;
-    if (zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(part), &part) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(stats), &stats) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(out), &out) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(int), &nseq) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(int), &t) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(int), &heads) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(int), &head_dim) != ZE_RESULT_SUCCESS ||
-        zeKernelSetArgumentValue(g->k_attn_comb, ai++, sizeof(int), &nchunk) != ZE_RESULT_SUCCESS)
-        return OP_FAIL;
-    return LAUNCH(g, g->k_attn_comb, (uint32_t)(rows * 32), 64, "attn_comb");
+    if (!g || !g->ready || nseq != 1) return OP_FAIL;
+    if (e2_gpu_enq_attn(g, out, q, k, v, t, heads, kv_heads, head_dim, window) == 0)
+        return 0;
+    e2_gpu_flush(ctx);
+    return OP_FAIL;
 }
 
 int e2_gpu_op_gelu_mul_q(e2_ctx *ctx, const float *x, const float *up, int rows,
@@ -369,15 +318,6 @@ int e2_gpu_op_linear(e2_ctx *ctx, float *y, const float *x, int m, const e2_line
     if (g && SKIPPED(SK_LINEAR)) return OP_FAIL;
     if (!g) return OP_FAIL;
     if (e2_gpu_enq_linear(g, y, x, m, l) == 0) return 0;
-    e2_gpu_flush(ctx);
-    return OP_FAIL;
-}
-
-int e2_gpu_op_linear_pq(e2_ctx *ctx, float *y, const uint8_t *xq, const float *xs,
-                        int m, const e2_linear *l) {
-    e2_gpu *g = e2_gpu_on(ctx) ? ctx->gpu : NULL;
-    if (!g) return OP_FAIL;
-    if (e2_gpu_enq_linear_pq(g, y, xq, xs, m, l) == 0) return 0;
     e2_gpu_flush(ctx);
     return OP_FAIL;
 }

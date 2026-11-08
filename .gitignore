@@ -14,4 +14,5 @@ core.*
 /dist
 audit.log
 gpu-probe
+gpu-bench
 logs/

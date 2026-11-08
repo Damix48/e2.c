@@ -1265,3 +1265,203 @@ E2_GPU_TS=1 E2_DEVICE=gpu ./tests/e2_bench_full spec.txt   # per-kernel device t
 - `shortcut: the audio tower runs on the CPU even with E2_DEVICE=gpu` -- its
   convolution and attention loops are still inline CPU code. Upgrade with a
   device mel+conv+attention port.
+
+---
+
+# Round 9 — the device GEMM, rewritten
+
+Host for every number below: **Intel Core Ultra 9 285H** (6 P + 8 E + 2 LP-E,
+AVX-VNNI, no AVX-512, Arc 140T iGPU, 128 EU, 2.35 GHz, 30.6 GB DDR), Debian 13,
+**shared with other work** (load average 2.5-5). The machine moves: the same
+binary measured 54.9, 59.6 and 57.9 ms for text 512 in three consecutive runs,
+so ratios within one run are the only trustworthy numbers. (The header of this
+file describes a Ryzen 9700X; that was round 7's box, not this one.)
+
+Goal of the round, restated: beat **OpenVINO int8 on the iGPU** by 1.5x in every
+row. OpenVINO measured here (`--sources ov-int8-gpu`, same run family):
+
+| task | length | ov-int8 GPU | 1.5x target |
+|---|---:|---:|---:|
+| text | 8 | 6.4 | 4.3 |
+| text | 64 | 8.4 | 5.6 |
+| text | 128 | 8.9 | 5.9 |
+| text | 512 | 21.6 | 14.4 |
+| text | 2048 | 144.9 | 96.6 |
+| batch | 8x64 | 19.0 | 12.7 |
+| batch | 32x64 | 71.3 | 47.5 |
+| image | 270 tok | 314.5 | 210 |
+| audio | 54 tok | 20.9 | 13.9 |
+| video | 8 frames | 920 | 613 |
+
+## What changed
+
+The round replaced the device compute path outright; the CPU path, the public
+API and the model format are untouched.
+
+1. **Centred int8 activations, signed x signed DPAS.** The activation is
+   quantised to `round(x/scale)` in [-127,127] instead of `+128` in [0,255].
+   Same precision (the CPU quantiser is symmetric: `scale = amax/127`), same
+   arithmetic, but the matrix engine's `i8_i8` form has **no zero point**, so
+   the epilogue loses the `128*sum(w)` correction and its `wsum` table
+   entirely. Measured on the kernel in isolation: **4.07 -> 9.4 TMAC/s**
+   (m=512 k=512 n=1024, weight-scale multiply hoisted out of the k loop as
+   well). This is the single biggest win of the round and it *deleted* code:
+   no `wsum`, no `wsumt`, no `k_pack_wq`, no `k_pack_u8`.
+2. **The activation is never repacked.** The B operand of an `i8_i8` DPAS is
+   a row-major tile (lane = token, 32 contiguous bytes of that row), which is
+   exactly what the quantiser already writes. The whole DPAS-pack pipeline for
+   activations (`k_pack_a`, `k_pack_u8`, 222 launches and 6.6 ms at text 512 in
+   round 8) is gone.
+3. **Weight tile = 128 tokens x 64 features per work group** (`E2_XTB/XFB/RSG/
+   CSG` in `tools/gpu/e2_xmx.cl`, mirrored in `src/e2_gpu_pack.h`). Eight
+   sub-groups share the token tile and four the feature tile, so one work group
+   of 256 threads covers 128x64 and the operand traffic per GEMM is `m/128`
+   weight passes plus `n/64` activation passes. 16x16 per sub-group with 4x4
+   sub-groups (64x64 per work group) was the starting point; a sweep of
+   (RSG,CSG) on text 512 gave 64x64 55.5 ms, **128x64 47.6 ms**, 128x128 51.6,
+   256x64 58.5, 64x128 55.7, 128x32 56.6.
+4. **int8 attention on the matrix engine** (`e2_gpu_enq_attn`): quantise Q,
+   pack K and V^T into the A operand layout with a per-row scale
+   (`k_attn_pack`, one kernel for both by taking strides), QK^T through the same
+   GEMM kernel, a masked softmax that writes int8 P with the row's 1/sum folded
+   into the per-128-key-block scales (`k_attn_softmax`), then PV through the
+   same GEMM written straight into the `[token][head][dim]` output.
+   **Text 512: 304 ms of f32 attention -> ~9 ms.** The score matrix is
+   materialised; that is what will have to change at 2048 tokens (see the
+   roadmap).
+5. The GEMM kernel gained `xstr`, `xscstr`, `ystr`, so attention reuses it
+   without any copy or transpose.
+
+Deleted along the way: `tools/gpu/e2_gemm.cl` (the pre-DPAS kernels),
+`tools/gpu/e2_dpas.cl` (replaced by `e2_xmx.cl`), `tools/gpu_probe.c` (replaced
+by `tools/gpu_bench.c`, which checks results against the CPU kernel and can
+sweep the tile without rebuilding the engine), `k_attn_part`/`k_attn_comb`/
+`k_softmax` (f32 attention), `k_pack_a`/`k_pack_u8`/`k_pack_wq`.
+
+## Experiment log (round 9)
+
+| # | change | effect |
+|---|---|---|
+| 1 | 32-byte vector loads for both DPAS operands, `[fb][kstep][lane][8 words]` weight layout | the layout trap of round 8: an `int8*` base scales offsets by 32, so every address was wrong. Found by the CPU-vs-device check, not by reading |
+| 2 | **centred int8 + `i8_i8` DPAS** (drop the zero-point term and `wsum`) | 4.07 -> 5.5-7.9 TMAC/s immediately, and 0.9999 -> 1.0000000 cosine (the CPU path is symmetric anyway) |
+| 3 | hoist the per-column weight scale out of the k-block loop (apply once at the store) | part of the 2x above |
+| 4 | transposed activation layout `[kstep][token][32]` so a sub-group's 8 lane loads are one contiguous 256-byte run | **no gain** (6.5 vs 5.5-7.9, inside the noise). The gather is not the limit; do not add the transpose pass |
+| 5 | 256 GRF per thread (`-cl-intel-256-GRF-per-thread` at module build) | **no gain**. The kernel is not register-starved |
+| 6 | `(RSG,CSG)` sweep incl. 256x64 and 128x128 work-group tiles | 128x64 wins (see above); 512-thread work groups lose more to occupancy than they gain in reuse |
+| 7 | software-pipelined k loop (next k step's operands fetched before the DPAS) | **2x slower** (text 8 13.5 -> 19.3, text 512 55 -> 83). The double operand buffers + the epilogue temporaries spill; IGC's own scheduling was already fine. Reverted |
+| 8 | split-K over sub-groups with an SLM reduction (mode B for small m) | **slower than the plain 128-token tile even at m=8** (m=8 k=512 n=2048: 1023 vs 3024 GMAC/s). Small m is weight-bandwidth bound, and wasting 7/8 of the row tile costs nothing; the extra barrier and reduction cost more. Removed |
+| 9 | `zeKernelSetGroupSize(..., 8, 32, 1)` set per launch instead of once at init | no difference (it is per-kernel state); the per-launch call was removed |
+| 10 | barriers between kernels (`E2_GPU_NOBARRIER`) | barriers cost 9 ms of 65 ms at text 512 (14%). Left on by default, it is a correctness knob |
+
+## Measurements of the kernel in isolation
+
+`make gpu-bench` (dev-only, checks every shape against `e2_gemm_range`):
+
+| shape | GMAC/s | note |
+|---|---:|---|
+| m=512 k=512 n=2048 | 9000 | weights (2 MB) stay in L3 across the 40 reps |
+| m=512 k=512 n=32768 | 2980 | 16 MB of weights: 4 passes = 64 MB weights + 64 MB output in 2.9 ms = **44 GB/s** |
+| m=128 k=512 n=32768 | 3242 | same, i.e. 49 GB/s of DRAM |
+| m=512 k=2048 n=512 | 9175 | |
+| m=2048 k=512 n=8192 | 2241 | 16 passes over the weights |
+
+Matrix-engine issue ceiling on this part, measured by `k_xmx_probe` (the same
+kernel with the operand loads removed): **8.3-9.1 G DPAS/s = 17-18.6 TMAC/s**.
+
+So the kernel itself reaches 50% of the engine ceiling on cache-resident shapes
+and ~58% of DRAM peak when streaming, which is respectable. What is left is
+per-launch cost: a forward is ~1500 kernels appended to one command list, and
+the sweep above says the *steady-state* rate is not what a single cold launch
+achieves. Text 512 runs 290 GEMMs of ~0.25 GMAC each (15-20 us of engine time)
+and pays ~40 us of ramp/drain per launch.
+
+## Where the device time goes now (text 512, `E2_GPU_TS=1`)
+
+Per forward, from the per-kernel device timestamps (they inflate every entry by
+a constant because the timestamp write itself costs time, so read the shares,
+not the absolute values):
+
+| kernel | calls | share |
+|---|---:|---:|
+| gemm (290 of them GEMMs proper, the rest is the same kernel for attention) | 642 | 52% |
+| quant_s8 | 363 | 14% |
+| rmsnorm | 243 | 13% |
+| attn_softmax | 160 | 6% |
+| gelu_mul_q | 40 | 5% |
+| norm_rope | 80 | 5% |
+| attn_pack_k / attn_pack_v | 146 | 3% |
+| mul_slice, scale, gelu_tanh | 120 | 2% |
+
+Round 8's f32 attention was 73% of the forward; it is now 9%. The cost is
+dominated by the GEMM and by the *number* of elementwise launches over the
+activation stream.
+
+## Status against the goal
+
+**Same run, same process** (`--sources e2,ov-int8-gpu --e2-device gpu --iters 2
+--repeat 2`), which is the only comparison this host can support (load average
+2.5-5, ±10% run to run):
+
+| task | length | round 8 e2 | **round 9 e2** | ov-int8 GPU | e2/OV | 1.5x target |
+|---|---:|---:|---:|---:|---:|---:|
+| text | 8 | 18.6 | **17.0** (13.5 alone) | 5.7 | 0.34 | 3.8 |
+| text | 64 | 35.3 | **21.2** | 6.4 | 0.30 | 4.3 |
+| text | 128 | 61.5 | **25.5** | 7.7 | 0.30 | 5.1 |
+| text | 512 | 534.6 | **83.5** (55 alone) | 19.6 | 0.23 | 13.1 |
+| text | 2048 | 11750 | **460** | 138.7 | 0.30 | 93 |
+| batch | 8x64 | 201.5 | **95.6** | 15.7 | 0.16 | 10.5 |
+| batch | 32x64 | 896.3 | **325** | 65.8 | 0.20 | 43.9 |
+| image | 270 tok | 2998 | **604** | 273.6 | 0.45 | 182 |
+| audio | 54 tok | 69.3 | **36.6** | 23.9 | 0.65 | 15.9 |
+| video | 8 frames | 7635 | **2478** | 820 | 0.33 | 547 |
+
+Round 9 is **6.4x faster at text 512, 25x at 2048, 2.4x on audio, 3.1x on
+video**, and no row regressed. **The 1.5x-over-OpenVINO goal is not met**: the
+device path is 1.5-6x *slower* than OV on every row and 4-93x off the target.
+What the round established, all measured:
+
+- the matrix-engine ceiling is 17-18 TMAC/s on this part; the GEMM reaches 9
+  TMAC/s on cache-resident shapes and 44-49 GB/s streaming cold weights. The
+  kernel is no longer the unknown it was.
+- a *single cold* launch of a small GEMM costs ~2.5x its steady-state time and a
+  forward is ~1500 launches, ~640 of them this one GEMM kernel. Ramp/drain, not
+  arithmetic, dominates at text <= 128 (2 WGs per EU do not cover a DRAM
+  latency).
+- weight traffic is `m/128` passes over the model (480 MB at text 512, 1.9 GB at
+  text 2048), so the row tile is the structural lever for the long rows.
+- the rows that are furthest off (batch, video) are the ones whose attention
+  still falls back to the CPU per layer (`nseq > 1`), and image/video also pay
+  the vision tower's separate per-op paths.
+
+## Round 9 roadmap (measured, in the order that pays)
+
+1. **One GEMM launch per layer, not nine.** Concatenate q/k/v into one packed
+   matrix (n = 2048) and gate/up into one (n = 4096) at load time, and give the
+   kernel a `gridCountZ` over a small descriptor array so attention's four heads
+   become one launch per product. 642 -> ~150 launches, and each launch has 4x
+   the y parallelism, which is exactly what the ramp/drain cost needs.
+2. **Fuse norm+quantise** (`k_rmsnorm` writing s8 + block scales directly) and
+   **residual-add+norm+temperature**: 606 elementwise launches at text 512
+   become ~250, and each fusion removes a full read+write of the activation.
+3. **Batched attention** (nseq > 1): the device path refuses it today, so
+   8x64/32x64 fall back to the CPU with one flush per layer. The mask already
+   takes per-row key bounds; the score product needs a per-64-row key band.
+4. **Attention at 2048 tokens**: the materialised score matrix is 268 MB per
+   layer for the full-attention layers, so it needs the per-row band (513 keys
+   for the 20 sliding layers) or a flash-style SLM kernel (16 query rows, K/V
+   staged, online softmax). Compute-wise 2048 tokens is 90 GMAC of attention.
+5. Audio tower on the device (mel + conformer + blocked attention).
+
+## Shortcuts taken (round 9)
+
+- `shortcut: the score matrix is materialised in f32` in `e2_gpu_enq_attn` --
+  fine up to ~512 tokens (4 MB per head), and 2 passes of DRAM traffic beyond
+  that. Upgrade with a per-64-row key band, then with a fused flash kernel.
+- `shortcut: attention takes nseq == 1 only` -- multiple sequences fall back to
+  the CPU int8 attention with a flush per layer, which is what makes the batch
+  rows expensive. Upgrade with the per-row band from roadmap item 3.
+- `shortcut: one activation quantise per linear call` -- `quant_s8` is 14% of
+  text 512 and runs even when the producer kernel could have written int8
+  directly. Upgrade with roadmap item 2.
+- The audio tower still runs entirely on the CPU (`e2_gpu_no_dev`), as in
+  round 8.

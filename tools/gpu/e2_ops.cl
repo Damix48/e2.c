@@ -167,168 +167,125 @@ __kernel void k_rope_vision(__global float *q, __global float *k,
 /* to scratch, which is 27x slower than the local-memory version.      */
 /* ------------------------------------------------------------------ */
 #define ATT_ROWS 4            /* query rows per work-group */
-#define ATT_DMAX 512          /* widest head in the model */
+#define ATT_DMAX 512          /* ------------------------------------------------------------------ */
+/* int8 attention                                                      */
+/*                                                                    */
+/* scores = Q x K^T and context = P x V^T are plain matrix-engine      */
+/* products (k_gemm_xmx, activations centred int8).  These two kernels  */
+/* do the preprocessing: pack K / V^T into the A operand layout with a  */
+/* per-row scale, and turn the scores into an int8 P with the softmax   */
+/* folded into its per-128-block scales.                               */
+/* ------------------------------------------------------------------ */
 
-__attribute__((intel_reqd_sub_group_size(32)))
-__kernel void k_attn_part(__global const float *q, __global const float *k,
-                          __global const float *v, __global float *part,
-                          __global float *stats, __global const int *seq_off,
-                          const int nseq, const int t, const int heads,
-                          const int kv_heads, const int head_dim, const int window,
-                          const int nchunk)
+/* Pack one f32 matrix into the A operand layout: pq[(fb*nkc + kstep)*256 +
+ * lane*32 + r*4 + c] holds k = 4*lane+c of row fb*8+r, centred int8.  Source
+ * element (row, k) is src[row*rstride + k*kstride], so the same kernel packs K
+ * (row = key, k = dim, contiguous) and V^T (row = dim, k = key, strided).  Rows
+ * past rvalid and k past kvalid are zero, which is what makes them contribute
+ * nothing to either product.  One sub-group per row, lane l one k-quad. */
+__kernel void k_attn_pack(__global const float *src, __global char *pq,
+                          __global float *sc, const int rpad, const int rvalid,
+                          const int kpad, const int kvalid, const int rstride,
+                          const int kstride)
 {
     int gs = get_sub_group_size();
     int lane = get_sub_group_local_id();
-    /* one work-group = ATT_ROWS (4) sub-groups = 4 query rows of one block,
-     * one band chunk; the work-group id walks (seq, head, row block, chunk) */
-    long sg = (long)get_global_id(0) / gs;   /* sub-group id, independent of the
-                                              * work-group size the driver picks */
-    long wg = sg / ATT_ROWS;
-    int widx = (int)(sg % ATT_ROWS);
-    int npos = (t + ATT_ROWS - 1) / ATT_ROWS;
-    int chunk = (int)(wg % nchunk);
-    long rest = wg / nchunk;
-    int pb = (int)(rest % npos);
-    rest /= npos;
-    int head = (int)(rest % heads);
-    int seq = (int)(rest / heads);
-    int pos = pb * ATT_ROWS + widx;
-    int groups = heads / kv_heads;
-    int kvh = head / groups;
-    __local float att_acc[ATT_ROWS][ATT_DMAX];
-    size_t qs = (size_t)heads * head_dim, ks = (size_t)kv_heads * head_dim;
-    size_t off = (size_t)seq_off[seq];
-    size_t psz = (size_t)nseq * t * heads * head_dim;   /* one chunk of partials */
-
-    if (pos >= t || head_dim > ATT_DMAX) return;
-    int lo = 0, hi = t;
-    if (window > 0) {
-        lo = pos - window; if (lo < 0) lo = 0;
-        hi = pos + window + 1; if (hi > t) hi = t;
-    }
-    int l0 = lo, band = hi - lo, per = (band + nchunk - 1) / nchunk;
-    lo = l0 + chunk * per;
-    hi = lo + per; if (hi > l0 + band) hi = l0 + band;
-    __global const float *qp = q + (off + pos) * qs + (size_t)head * head_dim;
-    __global const float *kp = k + off * ks + (size_t)kvh * head_dim;
-    __global const float *vp = v + off * ks + (size_t)kvh * head_dim;
-    int per_lane = head_dim / gs;
-    __local float *acc = att_acc[widx];
-    for (int i = 0; i < per_lane; i++) acc[lane + i * gs] = 0.0f;
-
-    /* Two keys per trip: both score dots are issued before either is reduced,
-     * which is what gives the memory pipeline something to overlap.  The key
-     * loop is serial per sub-group, and at 2048 tokens this kernel is limited
-     * by memory-level parallelism (~10 GB/s of an 81 GB/s part), not by ALU. */
-    float m = -INFINITY, l = 0.0f;
-    int j = lo;
-    for (; j + 2 <= hi; j += 2) {
-        __global const float *k0 = kp + (size_t)j * ks;
-        __global const float *k1 = k0 + ks;
-        float s0 = 0.0f, s1 = 0.0f;
-        for (int i = 0; i < per_lane; i++) {
-            float qv = qp[lane + i * gs];
-            int d = lane + i * gs;
-            s0 += qv * k0[d];
-            s1 += qv * k1[d];
-        }
-        s0 = sub_group_reduce_add(s0);
-        s1 = sub_group_reduce_add(s1);
-        __global const float *v0 = vp + (size_t)j * ks;
-        __global const float *v1 = v0 + ks;
-        float m0 = fmax(m, s0);
-        float e0 = exp(s0 - m0);
-        float a0 = exp(m - m0);
-        float m1 = fmax(m0, s1);
-        float e1 = exp(s1 - m1);
-        float a1 = exp(m0 - m1);
-        l = (l * a0 + e0) * a1 + e1;
-        for (int i = 0; i < per_lane; i++) {
-            int d = lane + i * gs;
-            acc[d] = (acc[d] * a0 + e0 * v0[d]) * a1 + e1 * v1[d];
-        }
-        m = m1;
-    }
-    for (; j < hi; j++) {
-        __global const float *kj = kp + (size_t)j * ks;
-        float s = 0.0f;
-        for (int i = 0; i < per_lane; i++) s += qp[lane + i * gs] * kj[lane + i * gs];
-        s = sub_group_reduce_add(s);
-        float mn = fmax(m, s);
-        float e = exp(s - mn);
-        float alpha = exp(m - mn);
-        l = l * alpha + e;
-        __global const float *vj = vp + (size_t)j * ks;
-        for (int i = 0; i < per_lane; i++) {
-            int d = lane + i * gs;
-            acc[d] = acc[d] * alpha + e * vj[d];
-        }
-        m = mn;
-    }
-    if (nchunk == 1) {
-        float inv = l > 0.0f ? 1.0f / l : 0.0f;
-        __global float *op = part + (off + pos) * qs + (size_t)head * head_dim;
-        for (int i = 0; i < per_lane; i++) {
-            int d = lane + i * gs;
-            op[d] = acc[d] * inv;
-        }
+    int row = get_global_id(0) / gs;
+    if (row >= rpad) return;
+    int nkc = kpad >> 5;
+    __global char *base = pq + (size_t)(row >> 3) * nkc * 256 + (row & 7) * 4;
+    if (row >= rvalid) {
+        for (int kq = lane; kq < (kpad >> 2); kq += gs)
+            *(__global char4 *)(base + (size_t)(kq >> 3) * 256 + (kq & 7) * 32) =
+                (char4)(0);
+        if (lane == 0) sc[row] = 0.0f;
         return;
     }
-    __global float *pp = part + (size_t)chunk * psz +
-                         (off + pos) * qs + (size_t)head * head_dim;
-    for (int i = 0; i < per_lane; i++) {
-        int d = lane + i * gs;
-        pp[d] = acc[d];
-    }
-    if (lane == 0) {
-        stats[((size_t)chunk * nseq * t + off + pos) * heads + head] = m;
-        stats[((size_t)nchunk * nseq * t + off + pos) * heads + head] = l;
+    __global const float *rp = src + (size_t)row * rstride;
+    float amax = 0.0f;
+    for (int i = lane; i < kvalid; i += gs)
+        amax = fmax(amax, fabs(rp[(size_t)i * kstride]));
+    amax = sub_group_reduce_max(amax);
+    float s = amax > 0.0f ? amax / 127.0f : 1e-12f;
+    if (lane == 0) sc[row] = s;
+    float inv = 1.0f / s;
+    for (int kq = lane; kq < (kpad >> 2); kq += gs) {
+        int k0 = kq * 4;
+        int4 r = (int4)(0);
+        if (kstride == 1 && k0 + 3 < kvalid) {
+            float4 v = *(const __global float4 *)(rp + k0);
+            r = clamp(convert_int4_rte(v * inv), (int4)(-127), (int4)(127));
+        } else {
+            for (int j = 0; j < 4; j++) {
+                int kk = k0 + j;
+                if (kk < kvalid) {
+                    float v = clamp(rp[(size_t)kk * kstride] * inv, -127.0f, 127.0f);
+                    ((int *)&r)[j] = (int)rint(v);
+                }
+            }
+        }
+        *(__global char4 *)(base + (size_t)(kq >> 3) * 256 + (kq & 7) * 32) =
+            convert_char4(r);
     }
 }
 
-/* Merge the band chunks of each (sequence, row, head). */
-__kernel void k_attn_comb(__global const float *part, __global const float *stats,
-                          __global float *out, const int nseq, const int t,
-                          const int heads, const int head_dim, const int nchunk)
+/* scores -> P.  One sub-group per query row.  P is int8 in [0,127] with one
+ * scale per 128-wide key block, and the 1/sum of the row is folded into those
+ * scales, so the context product needs no normalisation pass.  Keys outside
+ * [row-window, row+window] get p = 0 (the sliding window; a key past kvalid is
+ * excluded too). */
+__kernel void k_attn_softmax(__global const float *S, __global char *P,
+                             __global float *psc, const int rows, const int kpad,
+                             const int kvalid, const int window)
 {
     int gs = get_sub_group_size();
     int lane = get_sub_group_local_id();
-    long row = (long)get_global_id(0) / gs;
-    long rows = (long)nseq * t * heads;
+    int row = get_global_id(0) / gs;
     if (row >= rows) return;
-    size_t psz = rows * head_dim;
-    int head = (int)(row % heads);
-    long tr = row / heads;                     /* (seq, pos) flattened */
-    float m = -INFINITY;
-    for (int c = 0; c < nchunk; c++) {
-        float mc = stats[((size_t)c * nseq * t + tr) * heads + head];
-        if (mc > m) m = mc;
+    int lo = 0, hi = kvalid;
+    if (window > 0) {
+        lo = row - window; if (lo < 0) lo = 0;
+        hi = row + window + 1; if (hi > kvalid) hi = kvalid;
     }
-    float lsum = 0.0f;
-    for (int c = 0; c < nchunk; c++) {
-        float mc = stats[((size_t)c * nseq * t + tr) * heads + head];
-        float lc = stats[((size_t)nchunk * nseq * t + tr) * heads + head];
-        lsum += lc * exp(mc - m);
-    }
-    float inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
-    int per_lane = head_dim / gs;
-    __global float *op = out + row * head_dim;
-    for (int i = 0; i < per_lane; i++) {
-        int d = lane + i * gs;
-        float v = 0.0f;
-        for (int c = 0; c < nchunk; c++) {
-            float mc = stats[((size_t)c * nseq * t + tr) * heads + head];
-            v += part[(size_t)c * psz + row * head_dim + d] * exp(mc - m);
+    __global const float *sp = S + (size_t)row * kpad;
+    float mx = -3.0e38f;
+    for (int i = lo + lane; i < hi; i += gs) mx = fmax(mx, sp[i]);
+    mx = sub_group_reduce_max(mx);
+    float sum = 0.0f;
+    for (int i = lo + lane; i < hi; i += gs) sum += exp(sp[i] - mx);
+    sum = sub_group_reduce_add(sum);
+    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    int nblk = kpad >> 7;
+    __global char *pp = P + (size_t)row * kpad;
+    for (int b = 0; b < nblk; b++) {
+        int b0 = b << 7, b1 = b0 + 128;
+        float bm = 0.0f;
+        for (int i = b0 + lane; i < b1; i += gs)
+            if (i >= lo && i < hi) {
+                float v = exp(sp[i] - mx);
+                if (v > bm) bm = v;
+            }
+        bm = sub_group_reduce_max(bm);
+        float s = bm * inv / 127.0f;
+        if (s < 1e-20f) s = 1e-20f;
+        if (lane == 0) psc[(size_t)row * nblk + b] = s;
+        float is = 1.0f / s;
+        for (int i = b0 + lane; i < b1; i += gs) {
+            float v = (i >= lo && i < hi) ? exp(sp[i] - mx) : 0.0f;
+            int q = (int)rint(v * is);
+            pp[i] = (char)(q < 0 ? 0 : (q > 127 ? 127 : q));
         }
-        op[d] = v * inv;
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* quantisation: f32 rows -> u8 rows (zero point 128), one scale per    */
-/* `blk`-wide block.  Same rounding as e2_quant_rows_blk.               */
+/* quantisation: f32 rows -> centred int8 rows, one scale per `blk`-wide */
+/* block.  Same rounding as e2_quant_rows_blk; centred (not biased by   */
+/* 128) because the matrix engine's signed/signed DPAS then needs no    */
+/* zero-point term in the epilogue, which is the difference between     */
+/* 4 and 9 TMAC/s.                                                     */
 /* ------------------------------------------------------------------ */
-__kernel void k_quant_u8(__global const float *x, __global uchar *q,
+__kernel void k_quant_s8(__global const float *x, __global char *q,
                          __global float *sc, const int rows, const int k,
                          const int blk)
 {
@@ -346,18 +303,18 @@ __kernel void k_quant_u8(__global const float *x, __global uchar *q,
     float s = mx / 127.0f;
     if (s < 1e-12f) s = 1e-12f;
     float inv = 1.0f / s;
-    __global uchar *qp = q + (size_t)row * k + (size_t)b * blk;
+    __global char *qp = q + (size_t)row * k + (size_t)b * blk;
     for (int i = lane; i < blk; i += gs) {
-        int v = (int)rint(xp[i] * inv) + 128;
-        qp[i] = (uchar)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        int v = (int)rint(xp[i] * inv);
+        qp[i] = (char)(v < -127 ? -127 : (v > 127 ? 127 : v));
     }
     if (lane == 0) sc[(size_t)row * nblk + b] = s;
 }
 
 /* gelu(gate) * up, quantised in the same pass (the MLP down-projection reads
- * the u8 form directly, so the f32 product never reaches memory). */
+ * the int8 form directly, so the f32 product never reaches memory). */
 __kernel void k_gelu_mul_q(__global const float *gate, __global const float *up,
-                           __global uchar *q, __global float *sc,
+                           __global char *q, __global float *sc,
                            const int rows, const int k, const int blk)
 {
     int gs = get_sub_group_size();
@@ -378,11 +335,11 @@ __kernel void k_gelu_mul_q(__global const float *gate, __global const float *up,
     float s = mx / 127.0f;
     if (s < 1e-12f) s = 1e-12f;
     float inv = 1.0f / s;
-    __global uchar *qp = q + base;
+    __global char *qp = q + base;
     for (int i = lane; i < blk; i += gs) {
         float v = gelu1(gp[i]) * up2[i] * inv;
-        int r = (int)rint(v) + 128;
-        qp[i] = (uchar)(r < 0 ? 0 : (r > 255 ? 255 : r));
+        int r = (int)rint(v);
+        qp[i] = (char)(r < -127 ? -127 : (r > 127 ? 127 : r));
     }
     if (lane == 0) sc[(size_t)row * nblk + b] = s;
 }

@@ -373,6 +373,17 @@ int e2_gpu_op_linear_pq(e2_ctx *ctx, float *y, const uint8_t *xq, const float *x
     return OP_FAIL;
 }
 
+int e2_gpu_op_ple(e2_ctx *ctx, float *y, const float *x, int m,
+                  const e2_linear *gate, const e2_linear *proj,
+                  const float *ple, int nl, int li) {
+    e2_gpu *g = e2_gpu_on(ctx) ? ctx->gpu : NULL;
+    if (g && g->ready && (SKIPPED(SK_LINEAR) || SKIPPED(SK_GELU))) return OP_FAIL;
+    if (!g || !g->ready) return OP_FAIL;
+    if (e2_gpu_enq_ple(g, y, x, m, gate, proj, ple, nl, li) == 0) return 0;
+    e2_gpu_flush(ctx);
+    return OP_FAIL;
+}
+
 int e2_gpu_op_mlp(e2_ctx *ctx, float *y, const float *x, int m,
                   const e2_linear *gate, const e2_linear *up,
                   const e2_linear *down) {

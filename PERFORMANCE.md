@@ -1624,6 +1624,7 @@ the extra registers cost occupancy.
 | 10 | 64-wide activation blocks for the MLP input | wrong (mixed block widths inside one k loop); the MLP input stays 128-wide, only the *output* is 64-wide |
 | 11 | TN=128/256 tiles | worse at every m (table above) |
 | 12 | 512/1024-thread work groups | better only with a *bigger token tile*; a bigger feature tile with 512 threads loses |
+| 13 | fused PLE block (`k_gemm_ple`: gate + gelu + slice multiply + quantise in one epilogue) | removes 144 MB of f32 activation per forward and 2 launches per layer, for **1.6%** (text 512 69.7 -> 68.6, 12 interleaved reps).  Kept because it is positive and simpler, but it is the measurement that killed the activation-bandwidth theory |
 
 ## Bugs found (all in this round's own new code)
 
@@ -1679,26 +1680,28 @@ all measured:
 * **The f32 activation stream is the problem at text 512.**  The fused MLP
   alone is worth 36 ms of 85, and it removed exactly one f32 intermediate
   (8 MB/layer).  Everything else that writes f32 costs the same order.
-* **The GEMM phase is bound by writing fresh f32 output, not by arithmetic.**
-  `E2_GB_LAYERS` runs the real per-layer GEMM sequence with 24 cold weight
-  buffers and a barrier per launch: 7.1 ms at m=512.  The same 216 GEMMs inside
-  the real forward cost ~49 ms (`E2_GPU_NOLAUNCH=1 E2_GPU_NOATTN=1`).  Sweeping
-  how much *distinct* output memory the testbed writes (`E2_GB_YBUF=N`) closes
-  the gap completely:
+* **The end-to-end vs isolated GEMM gap is real, large, and still not
+  attributed.**  `E2_GB_LAYERS` runs the real per-layer GEMM sequence with 24
+  cold weight buffers and a barrier per launch: 7.1 ms at m=512.  The same 216
+  GEMMs inside the real forward cost ~49 ms (`E2_GPU_NOLAUNCH=1
+  E2_GPU_NOATTN=1`).  Two candidate explanations were tested and **both were
+  rejected**:
 
-  | distinct output | 4 MB | 16 MB | 32 MB | 64 MB | 128 MB |
-  |---|---:|---:|---:|---:|---:|
-  | GEMM phase at m=512 | 10.2 | 20.7 | 15.8 | 33.6 | 43.8 ms |
+  - *Distinct output memory.*  The testbed with `E2_GB_YBUF=N` cycles the
+    output through N buffers instead of overwriting one warm tile:
+    4 MB 10.2, 32 MB 15.8, 64 MB 33.6, 128 MB 43.8 ms at m=512.  That looked
+    like the answer - a forward writes 340-400 MB of distinct f32 activation -
+    but removing 144 MB of it for real (experiment 13 below) bought 1.6%.  The
+    marginal cost of the *pipeline's* activation traffic is ~130 GB/s, i.e.
+    340 MB ~ 2.6 ms, not 40.  The ybuf sweep must be pricing something else
+    (L2 thrash or first-touch mapping), so it over-predicts by ~10x.
+  - *Write-allocate.*  The epilogue writes full 64-byte lines (`fb*8` floats per
+    lane), so partial-line read-modify-write is not it.
 
-  A forward at 512 tokens writes ~340-400 MB of distinct f32 activation (per
-  layer: q 2, k 1, v 1, o 1, down 1, ple_gate 1, ple_proj 1, and six norm
-  outputs at 1 MB each).  At the 128 MB point the phase is already 43.8 ms, so
-  **the end-to-end GEMM phase is explained by activation write bandwidth, and
-  the isolated testbed was misleading because it overwrote one warm tile.**
-  Ruled out along the way: launch count, barriers (in the testbed they cost
-  <5%), the tile, and output write-allocate (the epilogue writes full 64-byte
-  lines).  This is why the f16 activation stream is roadmap item 2: it halves
-  the only number that matters here.
+  Also ruled out: launch count, barriers (in the testbed <5%), the tile, and
+  the kernel itself (it matches the CPU bit for bit and runs at 7-8 TMAC/s in
+  isolation).  **This is the top open question**; nothing else in this codebase
+  is worth 4x.
 * **The vision attention is the whole image/video cost.**  Image 442 ms is
   GEMM 190 + elementwise 10 + attention 240.  Both paths are terrible: the CPU
   int8 attention is 240 ms and the device path is 290 ms, for 35 GMAC of work
@@ -1710,21 +1713,25 @@ all measured:
 
 ## Round 10 roadmap (measured, in the order that pays)
 
-1. **Make the activation stream f16.**  This is now the top item because the
-   measurement above pins the cost: the GEMM phase is bound by distinct f32
-   activation bytes, and a forward writes 340-400 MB of them at text 512.  The
-   residual stream has to stay f32 (24 accumulations), but every GEMM output and
-   every norm output can be f16: 170-200 MB instead, i.e. the 43.8 ms point of
-   the table instead of the ~49 ms one, and roughly half of the 63 ms forward.
-   The kernels that must gain an f16 source: `k_rmsnorm_q`, `k_norm_rope`,
-   `k_attn_pack`, `k_quant_s8`, `k_gelu_tanh`/`k_mul_slice`, and the GEMM
-   epilogue (`vstore_half8`).  Accuracy budget: the path is at cos 0.9997 vs
-   f32 today and the target is 0.999.
-2. **Fuse the remaining epilogues that can be fused.**  Two per layer are worth
-   ~3 MB each: `ple_gate + gelu + mul_slice` into one GEMM epilogue, and
-   `rmsnorm_add(post_attn) + rmsnorm_q(pre_ff)` into one kernel (the second
-   currently re-reads the row the first just wrote).  ~10 ms of the 63 at text
-   512, no new maths.
+1. **Attribute the end-to-end vs isolated GEMM gap** (49 vs 7.1 ms at text
+   512).  It is 4x of the total and every row inherits it.  Suggested next
+   probes, cheapest first: (a) run the real forward with the GEMM kernel
+   replaced by one that skips its epilogue store (`#ifdef` variant) - if the
+   phase collapses, it is the store; (b) the same with the *loads* skipped;
+   (c) count actual DRAM traffic with `intel_gpu_top` during one forward and
+   compare against 340 MB; (d) check whether the per-GEMM activation buffer
+   being a fresh arena allocation (different 4 KB/2 MB pages each time) is
+   what the ybuf sweep was really pricing.
+2. **f16 activations**, *if* (1) points at the activation stream after all.
+   The residual stream must stay f32 (24 accumulations), but every GEMM output
+   and norm output can be f16; the kernels that need an f16 source are
+   `k_rmsnorm_q`, `k_norm_rope`, `k_attn_pack`, `k_quant_s8`, `k_gelu_tanh`/
+   `k_mul_slice`, and the GEMM epilogue (`vstore_half8`).  Do **not** start this
+   before (1): experiment 13 says the traffic is only worth ~2.6 ms.
+3. **Fuse `rmsnorm_add(post_attn) + rmsnorm_q(pre_ff)`** into one kernel (the
+   second re-reads the row the first just wrote).  One op, one launch per layer,
+   and by experiment 13's rate expect ~1%, not the 5% the traffic estimate
+   suggests.
 3. **A fused int8 flash attention** (16 query rows, 128-key blocks, online
    softmax, K/V from SLM, P fed back as the DPAS A operand in the accumulator
    layout - which is already the A layout).  Kills the score matrix for the

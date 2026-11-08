@@ -49,7 +49,8 @@ typedef struct e2_gpu {
     ze_module_handle_t dmodule, bmodule, omodule;
     ze_kernel_handle_t k_gemm, k_gemm_z, k_gemm_b2, k_mlp_gu;
     /* the same three, with the large token tile (tools/gpu/e2_xmx_big.cl) */
-    ze_kernel_handle_t k_bgemm_z, k_bgemm_b2, k_bmlp_gu;
+    ze_kernel_handle_t k_gemm_ple;
+    ze_kernel_handle_t k_bgemm_z, k_bgemm_b2, k_bmlp_gu, k_bgemm_ple;
     ze_kernel_handle_t k_rmsnorm, k_rmsnorm_q, k_norm_rope, k_rope_text,
         k_rope_vision;
     ze_kernel_handle_t k_attn_pack, k_attn_softmax, k_quant_s8;
@@ -134,6 +135,12 @@ int e2_gpu_gemm_add(e2_gpu *g, float *y, const int8_t *xq, const float *xsc,
 int e2_gpu_enq_mlp(e2_gpu *g, float *y, const float *x, int m,
                    const e2_linear *gate, const e2_linear *up,
                    const e2_linear *down);
+
+/* The PLE block: quantise(gelu(gate(x)) * ple[token][li][feature]) feeding the
+ * per-layer projection, in one launch plus the projection. */
+int e2_gpu_enq_ple(e2_gpu *g, float *y, const float *x, int m,
+                   const e2_linear *gate, const e2_linear *proj,
+                   const float *ple, int nl, int li);
 
 /* Enqueue y[m][n] = x @ w^T (quantising x on the device).  0 = enqueued. */
 int e2_gpu_enq_linear(e2_gpu *g, float *y, const float *x, int m, const e2_linear *l);

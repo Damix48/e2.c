@@ -313,6 +313,104 @@ __kernel void k_mlp_gu(__global const char *xq, __global const float *xsc,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* PLE block: quantise(gelu(x @ w^T) * ple[token][layer][feature])     */
+/*                                                                     */
+/* The PLE gate projection is immediately followed by a gelu, a        */
+/* per-layer slice multiply and a quantise, so the f32 result is a     */
+/* pure pass-through: fusing the three into the GEMM epilogue removes  */
+/* three read+write passes over 1 MB per layer.  The int8 output uses  */
+/* 64-wide blocks (one work-group column tile), which is what           */
+/* k_gemm_b2 expects.                                                   */
+/* ------------------------------------------------------------------ */
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void k_gemm_ple(__global const char *xq, __global const float *xsc,
+                         __global const char *wp, __global const float *wsc,
+                         __global const float *ple, __global char *outq,
+                         __global float *outsc,
+                         const int m, const int k, const int n,
+                         const int xstr, const int xscstr,
+                         const int nl, const int li)
+{
+    const int lane = get_sub_group_local_id();
+    const int sg = get_sub_group_id();
+    const int csg = sg % E2_CSG;
+    const int nkc = k >> 5, nblk = k >> 7;
+    const int m0 = get_group_id(0) * E2_TM + (sg / E2_CSG) * (E2_XTB * 8);
+    const int n0 = get_group_id(1) * E2_TN + csg * (E2_XFB * 8);
+    const int active = (m0 < m && n0 < n);
+    const int mtok = m0 + lane;
+    const int ntb = m0 + 8 >= m ? 1 : E2_XTB;
+    const int fb0 = n0 >> 3;
+
+    float8 facc[E2_XTB][E2_XFB];
+#pragma unroll
+    for (int tc = 0; tc < E2_XTB; tc++)
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++) facc[tc][fb] = (float8)(0.0f);
+    if (active) {
+        for (int b = 0; b < nblk; b++)
+            xmx_block4(wp, xq, xsc, facc, b, lane, nkc, m, xstr, xscstr, mtok,
+                       fb0, ntb);
+        /* gelu(x*wsc) * ple, then the block max of the 64-feature tile */
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++)
+#pragma unroll
+            for (int tc = 0; tc < ntb; tc++) {
+                const int row = mtok + tc * 8;
+                float8 w = vload8(0, wsc + n0 + fb * 8);
+                const __global float *pl = ple + ((size_t)row * nl + li) * n;
+#pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    float g = facc[tc][fb][r] * w[r];
+                    float t = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+                    g = t > 15.0f ? g : g / (1.0f + exp(-2.0f * t));
+                    facc[tc][fb][r] = g * pl[n0 + fb * 8 + r];
+                }
+            }
+    }
+
+    __local float sm[E2_NT][E2_CSG];
+#pragma unroll
+    for (int tc = 0; tc < E2_XTB; tc++) {
+        const int lr = (sg / E2_CSG) * (E2_XTB * 8) + tc * 8 + lane;
+        const int row = m0 + tc * 8 + lane;
+        float mx = 0.0f;
+        if (active && row < m) {
+#pragma unroll
+            for (int fb = 0; fb < E2_XFB; fb++)
+#pragma unroll
+                for (int r = 0; r < 8; r++) mx = fmax(mx, fabs(facc[tc][fb][r]));
+        }
+        sm[lr][csg] = mx;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (!active) return;
+    const int blk = n0 >> 6;
+    const int nsc = n >> 6;
+#pragma unroll
+    for (int tc = 0; tc < E2_XTB; tc++) {
+        const int lr = (sg / E2_CSG) * (E2_XTB * 8) + tc * 8 + lane;
+        const int row = m0 + tc * 8 + lane;
+        if (row >= m) continue;
+        float mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < E2_CSG; j++) mx = fmax(mx, sm[lr][j]);
+        float s = mx / 127.0f;
+        if (s < 1e-12f) s = 1e-12f;
+        outsc[(size_t)row * nsc + blk] = s;
+        const float inv = 1.0f / s;
+        __global char *qp = outq + (size_t)row * n + n0;
+#pragma unroll
+        for (int fb = 0; fb < E2_XFB; fb++)
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                int v = (int)rint(facc[tc][fb][r] * inv);
+                qp[fb * 8 + r] = (char)(v < -127 ? -127 : (v > 127 ? 127 : v));
+            }
+    }
+}
+
 /* Matrix-engine issue probe: the same tile shape and DPAS mix as k_gemm_xmx
  * with the operand loads removed, so what it measures is the engine itself.
  * dpas/s * 2048 is the device's int8 MAC ceiling. */

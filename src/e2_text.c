@@ -205,6 +205,13 @@ mlp_done:
 
         /* PLE block: gate, gelu, multiply by this layer's per-token slice */
         _i = 12;
+        /* device: gate + gelu + slice multiply + quantise + projection, with no
+         * f32 intermediate at all */
+        if (e2_gpu_op_ple(ctx, tmp, x, n, &ly->ple_gate, &ly->ple_proj, ple, L,
+                          li) == 0) {
+            _i = 15;
+            goto ple_done;
+        }
         PROF_T(e2_linear_forward(ctx, h, x, n, &ly->ple_gate));
         PROF_T(e2_gelu_tanh_ctx(ctx, h, n * P));
         _q = e2_now_ms();
@@ -220,6 +227,7 @@ mlp_done:
         p2[7] += e2_now_ms() - _q;
         _i = 13;
         PROF_T(e2_linear_forward(ctx, tmp, h, n, &ly->ple_proj));
+ple_done:
         _i = 15;
         _q = e2_now_ms();
         e2_rmsnorm_add(ctx, x, tmp, ly->ple_norm, n, H, c->text_eps);

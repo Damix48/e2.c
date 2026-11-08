@@ -66,6 +66,11 @@ int e2_gpu_op_linear_multi(e2_ctx *ctx, const float *x, int m,
 int e2_gpu_op_mlp(e2_ctx *ctx, float *y, const float *x, int m,
                   const e2_linear *gate, const e2_linear *up,
                   const e2_linear *down);
+/* The PLE block in two launches: gate + gelu + the per-layer slice multiply +
+ * quantise, then the projection.  The f32 intermediate never exists. */
+int e2_gpu_op_ple(e2_ctx *ctx, float *y, const float *x, int m,
+                  const e2_linear *gate, const e2_linear *proj,
+                  const float *ple, int nl, int li);
 
 #ifdef __cplusplus
 }

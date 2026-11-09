@@ -351,11 +351,30 @@ __kernel void k_attn_softmax(__global const float *S, __global char *P,
         if (hi <= lo) hi = lo + 1;
     }
     __global const float *sp = S + (size_t)row * kpad;
+    const int gs4 = gs * 4;
+    /* Full band (every text row up to the sliding window, and the vision
+     * tower) takes a float4 path with no per-element mask.  The exponential's
+     * argument is always <= 0, so native_exp cannot overflow. */
+    const int full = (lo == 0 && hi == kpad);
     float mx = -3.0e38f;
-    for (int i = lo + lane; i < hi; i += gs) mx = fmax(mx, sp[i]);
+    if (full) {
+        for (int i = lane * 4; i < kpad; i += gs4) {
+            float4 v = *(const __global float4 *)(sp + i);
+            mx = fmax(mx, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));
+        }
+    } else {
+        for (int i = lo + lane; i < hi; i += gs) mx = fmax(mx, sp[i]);
+    }
     mx = sub_group_reduce_max(mx);
     float sum = 0.0f;
-    for (int i = lo + lane; i < hi; i += gs) sum += exp(sp[i] - mx);
+    if (full) {
+        for (int i = lane * 4; i < kpad; i += gs4) {
+            float4 v = native_exp(*(const __global float4 *)(sp + i) - mx);
+            sum += v.x + v.y + v.z + v.w;
+        }
+    } else {
+        for (int i = lo + lane; i < hi; i += gs) sum += native_exp(sp[i] - mx);
+    }
     sum = sub_group_reduce_add(sum);
     float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     int nblk = kpad >> 7;
@@ -363,11 +382,18 @@ __kernel void k_attn_softmax(__global const float *S, __global char *P,
     for (int b = 0; b < nblk; b++) {
         int b0 = b << 7, b1 = b0 + 128;
         float bm = 0.0f;
-        for (int i = b0 + lane; i < b1; i += gs)
-            if (i >= lo && i < hi) {
-                float v = exp(sp[i] - mx);
-                if (v > bm) bm = v;
+        if (full) {
+            for (int i = b0 + lane * 4; i < b1; i += gs4) {
+                float4 v = native_exp(*(const __global float4 *)(sp + i) - mx);
+                bm = fmax(bm, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));
             }
+        } else {
+            for (int i = b0 + lane; i < b1; i += gs)
+                if (i >= lo && i < hi) {
+                    float v = native_exp(sp[i] - mx);
+                    if (v > bm) bm = v;
+                }
+        }
         bm = sub_group_reduce_max(bm);
         /* Quantise against the block max (q in [0,127]), and fold the row
          * normalisation into the *dequantisation* scale only.  Folding 1/sum
@@ -378,10 +404,18 @@ __kernel void k_attn_softmax(__global const float *S, __global char *P,
         if (s < 1e-20f) s = 1e-20f;
         if (lane == 0) psc[(size_t)row * nblk + b] = s;
         float is = s0 > 0.0f ? 1.0f / s0 : 0.0f;
-        for (int i = b0 + lane; i < b1; i += gs) {
-            float v = (i >= lo && i < hi) ? exp(sp[i] - mx) : 0.0f;
-            int q = (int)rint(v * is);
-            pp[i] = (char)(q < 0 ? 0 : (q > 127 ? 127 : q));
+        if (full) {
+            for (int i = b0 + lane * 4; i < b1; i += gs4) {
+                float4 v = native_exp(*(const __global float4 *)(sp + i) - mx) * is;
+                int4 r = clamp(convert_int4_rte(v), (int4)(0), (int4)(127));
+                *(__global char4 *)(pp + i) = convert_char4(r);
+            }
+        } else {
+            for (int i = b0 + lane; i < b1; i += gs) {
+                float v = (i >= lo && i < hi) ? native_exp(sp[i] - mx) : 0.0f;
+                int q = (int)rint(v * is);
+                pp[i] = (char)(q < 0 ? 0 : (q > 127 ? 127 : q));
+            }
         }
     }
 }

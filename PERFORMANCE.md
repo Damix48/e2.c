@@ -1907,3 +1907,69 @@ section; `native_exp` GELU alone took text 8 to 12.5 and text 512 to 61.0.)
    and their graph shows it can be zero.
 3. **A fused f16/int8 flash attention with per-shape tiles** (item 3) — the whole
    image/video gap.
+
+# Round 10 correction: the "isolated GEMM" baseline was wrong
+
+The round-10 ledger claimed the GEMM phase runs 4-7x slower in the pipeline
+than in isolation and could not say why.  That claim was wrong, and the cause of
+the error was in the testbed, not the engine.
+
+`gpu-bench E2_GB_LAYERS` computes its grid from `E2_GB_RSG/E2_GB_CSG`, which
+defaulted to 4/8, while the checked-in SPIR-V is compiled with 8/4.  The kernel
+then stepped `n0` by 64 while the grid only spanned `n/128`, so **it computed
+half of the output columns and reported a rate 1.8x too good**, silently,
+because the layer testbed never verified a result.
+
+| m=512, GEMM phase | ms | TMAC/s |
+|---|---:|---:|
+| mismatched grid (what round 10 quoted) | 9.4 | 6.8 |
+| **correct grid (128x64 tile)** | **12.6** | **5.1** |
+| same GEMMs inside the real forward | ~25-31 | 2.1-2.6 |
+
+So the in-situ penalty is **~2x, not 4-7x**, and the testbed now prints the tile
+it used and checks that the grid covers `m`.
+
+## What the 2-3x against the older `~/Projects/e2.c` actually is
+
+With the corrected numbers, at 512 tokens (their shares from their own profiler,
+mine from `E2_GPU_TS`, both normalised to the wall):
+
+| phase | e2.c-next | old `~/Projects/e2.c` | ratio |
+|---|---:|---:|---:|
+| GEMM | ~25 | ~14.7 | 1.7x |
+| row ops (norm / quantise / rope / scale) | ~21 | ~1.6 | **13x** |
+| attention | ~18 | ~3.3 | **5.5x** |
+
+The GEMM is only a third of the story.  **The two thirds that mattered were the
+row operations and the attention**, and in the row operations the cause was
+mundane: `k_rmsnorm_q`, `k_quant_s8`, `k_norm_rope` and `k_attn_softmax` loaded
+**one float per lane with a runtime sub-group stride**, which the compiler
+cannot vectorise, so 16 lanes moved 64 bytes per memory instruction instead of
+256.  On top of that `enq_mlp`/`enq_ple` re-quantised the activation that
+`k_rmsnorm_q` had just quantised (48 wasted passes per forward).
+
+Fixing those (float4 lanes, `native_exp`, one `act_get()` for every consumer):
+
+| same-run A/B vs the commit before it | text 8 | 64 | 128 | 512 | 2048 |
+|---|---:|---:|---:|---:|---:|
+| cumulative | **-28%** | -24% | -23% | -7% | -3% |
+
+Against the older engine, alternating runs in one session, 3 alternations, min:
+
+| tokens | old | e2.c-next | gap |
+|---|---:|---:|---:|
+| 15 | 4.47 | 9.49 | 2.1x |
+| 196 | 11.10 | 23.69 | 2.1x |
+| 512 | 26.18 | 55.45 | 2.1x |
+
+The gap was 2.5-3.5x before this; it is now a flat 2.1x.  What is left, in
+order: the attention (f16 XMX with no materialised f32 score rectangle, and
+per-shape tiles), and finishing the row-op fusion — their graph has **no
+separate quantiser at all**, mine still has 49 `quant_s8` calls per forward.
+
+## Lesson
+
+Two of the three wrong conclusions in this file came from a benchmark that did
+less work than it claimed (this one, and the tile sweep that launched a tile it
+had not compiled).  A timing testbed that does not check a result is not a
+measurement.

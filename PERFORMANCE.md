@@ -1800,3 +1800,110 @@ all measured:
 - `shortcut: one tile per m range` -- two variants, threshold 768.  The table
   above shows the optimum moves smoothly with m; a per-m choice of three
   variants would win another ~5% at m=512.
+
+# Why the older `~/Projects/e2.c` is faster
+
+Asked directly, so measured directly.  Both engines were run **on this host, in
+the same session, back to back**, on their own shipped artefacts:
+
+* old: `~/Projects/e2.c`, `E2_Q8_READ=…/embeddinggemma-2-q8.e8cq build/e2_text_bench … gpu`,
+  best of 5, its own `models/e2` + `tests/fixtures`
+* new: `e2.c-next`, `E2_DEVICE=gpu tests/e2_bench_full`, best of 5, `models/e2-text.bin`
+
+| tokens | old `~/Projects/e2.c` GPU | e2.c-next GPU | old is |
+|---|---:|---:|---:|
+| 15 | 4.34 | 15.07 | 3.5x faster |
+| 64 | 6.25 | 18.68 | 3.0x |
+| 128 | 8.96 | 23.90 | 2.7x |
+| 196 | 11.14 | 28.40 | 2.5x |
+| 512 | 26.29 | 76.38 | 2.9x |
+| 2048 | 193.2 | 429.1 | 2.2x |
+
+Caveat: the two use different model files (410 MB `.e8cq` vs 277 MB `.e2model`),
+so this is "as shipped" rather than bit-identical work.  The host was loaded, so
+read the ratios.  (The new column is before the two commits at the end of this
+section; `native_exp` GELU alone took text 8 to 12.5 and text 512 to 61.0.)
+
+## The kernels, side by side (both engines' own profilers, n=196)
+
+| old `~/Projects/e2.c` | n | ms | % | e2.c-next | n | % |
+|---|---:|---:|---:|---|---:|---:|
+| `k_gemm_dpas2` | 122 | 5.55 | 36% | `gemm` | 193 | 40% |
+| `k_gemm_dpas_large_gate` | 24 | 3.26 | 20% | `mlp_gu` + `gemm_ple` | 48 | 22% |
+| `k_attn_f16_ctx` | 24 | 2.53 | 15% | `attn_softmax` + `attn_pack` | 72 | 7% |
+| `k_rowops` | 99 | 1.58 | 10% | `rmsnorm_q` + `quant_s8` + `scale` | 266 | 26% |
+| `k_attn_f16` (QK) | 24 | 1.12 | 7% | — (inside `gemm`) | — | — |
+| `k_attn_f16_softmax` | 24 | 0.80 | 5% | — | — | — |
+| `k_norm_rope3` | 24 | 0.68 | 4% | `norm_rope` | 48 | 5% |
+| `k_attn_f16_pack` | 24 | 0.49 | 3% | — | — | — |
+| `k_gelu_mul_quant` | 24 | 0.32 | 2% | — (inside `mlp_gu`) | — | — |
+| `k_embed` (device) | 1 | 0.01 | 0% | CPU `e2_text_embed_ids` | — | — |
+| **total** | **391** | **15.2** | | **total** | **628** | |
+
+## What actually explains it
+
+1. **Their GEMM kernel is not faster than mine.**  This is the important
+   finding, and it kills the obvious explanation.  Measured rates:
+   - my kernel, isolated (`gpu-bench E2_GB_LAYERS`, real per-layer shapes, cold
+     weights): **5.7-7.3 TMAC/s** at m=512
+   - their kernel, inside their real pipeline (GEMM share x wall / GMAC):
+     **~4.4 TMAC/s** at n=512
+   - my kernel, inside my real pipeline: **~1.4 TMAC/s**
+
+   So their real pipeline runs its GEMMs at roughly the rate their kernel
+   achieves in isolation, and **my pipeline loses 4-5x between its own kernel and
+   the same kernel in situ**.  That gap — not the kernel, not the tile, not the
+   launch count — is the 2-3x.  It is the same unexplained gap round 10 recorded
+   as roadmap item 1.
+2. **Their row operations are 2.6x cheaper.**  `k_rowops` is one kernel with
+   modes (normalize / rope / residual / **quantize**) and `k_norm_rope3` folds
+   rope in, so the whole activation stream is 123 launches.  Mine is 290
+   (`rmsnorm_q` 145, `quant_s8` 97, `norm_rope` 48) at 26% of kernel time vs
+   their 14%.  There is **no separate quantizer in their graph at all** — every
+   producer writes int8.  I fused the norm+quantise pair and the PLE/MLP
+   producers; the remaining `quant_s8` calls (attention Q, the two fused-block
+   inputs, the embedding projection) are still separate passes.
+3. **Their attention is FP16 on XMX, mine is int8 with a materialised f32 score
+   matrix.**  At 196 tokens mine is actually *cheaper* (7% vs 30%), which is why
+   the gap is smallest at medium lengths.  Their design has no f32 score
+   rectangle, so it scales: image 205 ms vs my 431, video 2.2x.  They also carry
+   dedicated tiles per shape (32x32 for the vision head_dim-64 scores, 64x16 for
+   the context product) where I have one tile per size class.
+4. **The token-embedding lookup runs on the device** (`k_embed`, 0.01 ms), so
+   their forward has no host-side work between submissions.  Mine does
+   `e2_text_embed_ids` serially on the CPU.
+5. **Batched GEMMs via a descriptor array of int byte-offsets** into one big
+   `wbuf`/`acts` pair (`k_gemm_dpas`, `get_global_id(2)`), not pointers.  That is
+   the design that works where my pointer-in-struct attempt did not.
+6. **256 GRFs only for the bulk GEMM** (`k_gemm_dpas_large*`), never blanket.
+   Their ordinary GEMM spills 288 bytes and they accept it; blanket mode was
+   measured worse there, and I measured it worse here too.
+7. **`native_exp` bounded GELU** (their Attempt 9, 7%).  Ported: text 8
+   **-8%**, 128 -8%, 512 -11%, 64 -5%, 2048 0% (same-run A/B, 6 interleaved
+   runs).  The bounded form takes the exponential over `|u|` and folds the sign
+   back, so the argument is nonpositive and cannot overflow.
+
+## Hypotheses tested and rejected
+
+* **Device-local weights.**  The old engine allocates `wbuf`/`acts` with
+  `zeMemAllocDevice`; e2.c-next uses shared USM for everything, and that was the
+  most likely single explanation.  Added `zeMemAllocDevice` +
+  `zeCommandListAppendMemoryCopy` to the loader and an `E2_GB_DEV` knob to
+  `gpu-bench`: **no difference** (m=8 2.36 shared vs 2.29 device; m=512 8.83 vs
+  8.78).  Two earlier readings of "1.6x" were an uninitialised device buffer
+  being read, because the test uploaded nothing — the same class of measurement
+  trap as the three in round 10.  Weights stay in shared USM.
+* **Their tile being better.**  No: their 16x16 sub-group tile at GY=32 is a
+  16x512 workgroup tile, mine is 128x64, and my isolated rate is higher.
+
+## What is worth porting next, in order
+
+1. **The pipeline/kernel gap (item 1 above)** — worth 2-3x on every row and it is
+   the only thing that explains the shortfall.  Their pipeline does not have it;
+   the difference to hunt is what their per-launch state does that mine does not
+   (one `wbuf`, one `acts`, fixed offsets, `M` padded to the tile, no per-GEMM
+   arena allocation).
+2. **Finish eliminating the separate quantizer** (item 2) — ~26% of kernel time,
+   and their graph shows it can be zero.
+3. **A fused f16/int8 flash attention with per-shape tiles** (item 3) — the whole
+   image/video gap.

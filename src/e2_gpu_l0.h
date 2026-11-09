@@ -301,6 +301,17 @@ extern ze_result_t (*zeMemAllocShared)(ze_context_handle_t hContext,
                                        const ze_host_mem_alloc_desc_t *host_desc,
                                        size_t size, size_t alignment,
                                        ze_device_handle_t hDevice, void **pptr);
+/* Device-local memory: what a read-only buffer the GPU streams should use.
+ * Shared USM is host coherent and exists in the same DRAM on an iGPU, but it is
+ * mapped as system memory, and that is not the same access path. */
+extern ze_result_t (*zeCommandListAppendMemoryCopy)(
+    ze_command_list_handle_t hCommandList, void *dstptr, const void *srcptr,
+    size_t size, ze_event_handle_t hSignalEvent, uint32_t numWaitEvents,
+    ze_event_handle_t *phWaitEvents);
+extern ze_result_t (*zeMemAllocDevice)(ze_context_handle_t hContext,
+                                       const ze_device_mem_alloc_desc_t *device_desc,
+                                       size_t size, size_t alignment,
+                                       ze_device_handle_t hDevice, void **pptr);
 extern ze_result_t (*zeMemFree)(ze_context_handle_t hContext, void *ptr);
 
 /* Returns 0 on success.  Safe to call on a machine without Level Zero. */

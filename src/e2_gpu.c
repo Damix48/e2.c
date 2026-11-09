@@ -230,8 +230,10 @@ static int wc_grow(e2_gpu *g) {
 /* Copy one packed matrix into shared USM the first time it is used, repacked
  * into the matrix-engine layout (src/e2_gpu_pack.h).  Shared memory on an iGPU
  * is the same DRAM, so this is one CPU pass and no PCIe hop; after that the
- * kernel reads it at full bandwidth.  Matrices whose shape has no matrix-engine
- * layout are refused, so the caller falls back to the CPU kernel. */
+ * kernel reads it at full bandwidth.  Device-local memory (zeMemAllocDevice)
+ * measured no faster here: 2.36 vs 2.29 ms at m=8 with `gpu-bench E2_GB_DEV`.
+ * Matrices whose shape has no matrix-engine layout are refused, so the caller
+ * falls back to the CPU kernel. */
 e2_gpu_wc *e2_gpu_weight(e2_gpu *g, const e2_qmat *w) {
     int blk = w->blk ? w->blk : 128;
     int nblk = w->k / blk;

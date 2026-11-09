@@ -268,8 +268,12 @@ __kernel void k_mlp_gu(__global const char *xq, __global const float *xsc,
 #pragma unroll
                 for (int r = 0; r < 8; r++) {
                     float g = gacc[tc][fb][r];
-                    float t = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-                    g = t > 15.0f ? g : g / (1.0f + exp(-2.0f * t));
+                    float u = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+                    if (u <= 15.0f) {
+                        float e = native_exp(-2.0f * fabs(u));
+                        float s = (1.0f - e) / (1.0f + e);
+                        g *= 0.5f * (1.0f + (u < 0.0f ? -s : s));
+                    }
                     acc[tc][fb][r] *= g;
                 }
             }
@@ -370,8 +374,12 @@ __kernel void k_gemm_ple(__global const char *xq, __global const float *xsc,
 #pragma unroll
                 for (int r = 0; r < 8; r++) {
                     float g = facc[tc][fb][r] * w[r];
-                    float t = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-                    g = t > 15.0f ? g : g / (1.0f + exp(-2.0f * t));
+                    float u = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+                    if (u <= 15.0f) {
+                        float e = native_exp(-2.0f * fabs(u));
+                        float s = (1.0f - e) / (1.0f + e);
+                        g *= 0.5f * (1.0f + (u < 0.0f ? -s : s));
+                    }
                     facc[tc][fb][r] = g * pl[n0 + fb * 8 + r];
                 }
             }

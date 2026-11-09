@@ -63,6 +63,12 @@ ze_result_t (*zeKernelSetArgumentValue)(ze_kernel_handle_t, uint32_t, size_t,
 ze_result_t (*zeMemAllocShared)(ze_context_handle_t, const ze_device_mem_alloc_desc_t *,
                                 const ze_host_mem_alloc_desc_t *, size_t, size_t,
                                 ze_device_handle_t, void **) = 0;
+ze_result_t (*zeCommandListAppendMemoryCopy)(ze_command_list_handle_t, void *,
+                                             const void *, size_t,
+                                             ze_event_handle_t, uint32_t,
+                                             ze_event_handle_t *) = 0;
+ze_result_t (*zeMemAllocDevice)(ze_context_handle_t, const ze_device_mem_alloc_desc_t *,
+                                size_t, size_t, ze_device_handle_t, void **) = 0;
 ze_result_t (*zeMemFree)(ze_context_handle_t, void *) = 0;
 
 static void *g_handle;
@@ -117,6 +123,8 @@ int e2_gpu_l0_open(void) {
     LOAD(zeKernelSetGroupSize);
     LOAD(zeKernelSetArgumentValue);
     LOAD(zeMemAllocShared);
+    LOAD(zeCommandListAppendMemoryCopy);
+    LOAD(zeMemAllocDevice);
     LOAD(zeMemFree);
     return 0;
 }

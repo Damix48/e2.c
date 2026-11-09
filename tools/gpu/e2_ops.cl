@@ -15,10 +15,16 @@
 #define GELU_K 0.7978845608028654f /* sqrt(2/pi) */
 #define GELU_C 0.044715f
 
+/* gelu(x) = x * sigmoid(2u), u = GELU_K*(x + GELU_C*x^3).  The exponential is
+ * evaluated with a NONPOSITIVE argument (|u|) and the sign is folded back, so
+ * the hardware native_exp cannot overflow, and native_exp is what the ISA's
+ * transcendental unit is for.  The general tanh form is >1000 ISA lines. */
 static inline float gelu1(float x) {
-    float t = GELU_K * (x + GELU_C * x * x * x);
-    if (t > 15.0f) return x;
-    return x / (1.0f + exp(-2.0f * t));
+    float u = GELU_K * (x + GELU_C * x * x * x);
+    if (u > 15.0f) return x;
+    float e = native_exp(-2.0f * fabs(u));
+    float s = (1.0f - e) / (1.0f + e);          /* tanh(|u|) */
+    return 0.5f * x * (1.0f + (u < 0.0f ? -s : s));
 }
 
 static inline float rms_scale(float sumsq, int dim, float eps) {

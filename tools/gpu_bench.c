@@ -51,6 +51,32 @@ static void *usm(size_t n) {
     return p;
 }
 
+/* E2_GB_DEV=1: allocate with zeMemAllocDevice instead of shared USM, i.e. the
+ * way a read-only weight buffer should be allocated.  Shared USM is host
+ * coherent, which is what the rest of the engine uses. */
+static void *devmem(size_t n) {
+    ze_device_mem_alloc_desc_t dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    void *p = NULL;
+    ck(zeMemAllocDevice(g_ctx, &dd, n, 64, g_dev, &p), "devalloc");
+    return p;
+}
+
+/* upload host bytes into a device-local buffer with one blocking copy */
+static void devwrite(void *dst, const void *src, size_t n) {
+    ze_command_list_desc_t ld;
+    memset(&ld, 0, sizeof(ld));
+    ld.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
+    ze_command_list_handle_t l = NULL;
+    ck(zeCommandListCreate(g_ctx, g_dev, &ld, &l), "wl");
+    ck(zeCommandListAppendMemoryCopy(l, dst, src, n, NULL, 0, NULL), "wc");
+    ck(zeCommandListClose(l), "wcl");
+    ck(zeCommandQueueExecuteCommandLists(g_queue, 1, &l, NULL), "we");
+    ck(zeCommandQueueSynchronize(g_queue, UINT64_MAX), "ws");
+    zeCommandListDestroy(l);
+}
+
 static float frand(void) {
     static uint32_t s = 12345;
     s = s * 1103515245u + 12345u;
@@ -389,7 +415,7 @@ static int run_layers(int m) {
     };
     const int NL = 24, NS = (int)(sizeof(sh) / sizeof(sh[0]));
     const size_t per = 4u << 20;               /* 4 MB of weights per layer */
-    int8_t *w = usm((size_t)NL * per);
+    int8_t *w = getenv("E2_GB_DEV") ? devmem((size_t)NL * per) : usm((size_t)NL * per);
     float *wsc = usm(sizeof(float) * 4096);
     /* E2_GB_YBUF=N: rotate the output through N buffers, so each GEMM writes
      * fresh memory instead of overwriting one warm tile.  The real pipeline
@@ -401,7 +427,15 @@ static int run_layers(int m) {
     float *y = yall;
     int8_t *xq = usm((size_t)m * 2048);
     float *xsc = usm(sizeof(float) * (size_t)m * 32);
-    memset(w, 3, (size_t)NL * per);
+    if (getenv("E2_GB_DEV")) {
+        /* the copy source must be host-visible USM, not malloc */
+        int8_t *stg = usm((size_t)NL * per);
+        if (!stg) return -1;
+        memset(stg, 3, (size_t)NL * per);
+        devwrite(w, stg, (size_t)NL * per);
+    } else {
+        memset(w, 3, (size_t)NL * per);
+    }
     memset(xq, 1, (size_t)m * 2048);
     for (int i = 0; i < 4096; i++) wsc[i] = 0.01f;
     for (int i = 0; i < m * 32; i++) xsc[i] = 0.01f;

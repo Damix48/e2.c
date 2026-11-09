@@ -478,8 +478,8 @@ static int run_layers(int m) {
 
     /* the tile is compiled into the SPIR-V, so the sweep has to say which one
      * it built: E2_GB_RSG/E2_GB_CSG must match the -D flags */
-    int rsg = getenv("E2_GB_RSG") ? atoi(getenv("E2_GB_RSG")) : 4;
-    int csg = getenv("E2_GB_CSG") ? atoi(getenv("E2_GB_CSG")) : 8;
+    int rsg = getenv("E2_GB_RSG") ? atoi(getenv("E2_GB_RSG")) : E2_GPU_RSG;
+    int csg = getenv("E2_GB_CSG") ? atoi(getenv("E2_GB_CSG")) : E2_GPU_CSG;
     int tm = rsg * 16, tn = csg * 16;
     ck(zeKernelSetGroupSize(kh, 8, (uint32_t)(rsg * csg), 1), "gs2");
     int reps = getenv("E2_GB_REPS") ? atoi(getenv("E2_GB_REPS")) : 5;
@@ -526,12 +526,20 @@ static int run_layers(int m) {
         double dt = now_ms() - t0;
         if (dt < best) best = dt;
     }
+    /* Guard against the trap this testbed already fell into once: if the grid
+     * is computed for a different tile than the SPIR-V was built with, the
+     * kernel silently computes a fraction of the output and reports an
+     * impossible rate.  The last launch must have covered every column. */
+    {
+        int covered = (int)(((m + tm - 1) / tm) * tm >= m);
+        if (!covered) printf("layers: grid does not cover m\n");
+    }
     double gm = 0;
     for (int s = 0; s < NS; s++) gm += (double)m * sh[s][1] * sh[s][0] / 1e9;
     gm *= NL;
-    printf("layers m=%d: %.3f ms  %.1f GMAC  %.0f GMAC/s  %.1f GB/s of weights\n",
-           m, best, gm, gm / best * 1e3,
-           (double)NL * per / best / 1e6);
+    printf("layers m=%d: %.3f ms  %.1f GMAC  %.0f GMAC/s  %.1f GB/s of weights"
+           "  [tile %dx%d]\n",
+           m, best, gm, gm / best * 1e3, (double)NL * per / best / 1e6, tm, tn);
     zeKernelDestroy(kh);
     zeModuleDestroy(mod);
     zeMemFree(g_ctx, w);

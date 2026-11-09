@@ -481,6 +481,20 @@ int e2_gpu_enq_attn(e2_gpu *g, float *out, const float *q, const float *k,
     return 0;
 }
 
+/* The quantised form of an activation row block.  A norm kernel has usually
+ * already produced it (k_rmsnorm_q writes int8 as it normalises), and the
+ * fused MLP/PLE blocks were re-quantising the same rows a second time, so
+ * every consumer goes through here. */
+static int act_get(e2_gpu *g, const float *x, int m, int k, e2_act *a) {
+    if (g->ac.x == x && g->ac.m == m && g->ac.k == k) {
+        a->q = g->ac.q;
+        a->scale = g->ac.sc;
+        return 0;
+    }
+    g->ac.x = NULL;                 /* another activation: drop the cache */
+    return e2_gpu_pack_act(g, x, m, k, a);
+}
+
 int e2_gpu_enq_mlp(e2_gpu *g, float *y, const float *x, int m,
                    const e2_linear *gate, const e2_linear *up,
                    const e2_linear *down) {
@@ -497,7 +511,7 @@ int e2_gpu_enq_mlp(e2_gpu *g, float *y, const float *x, int m,
               *cd = e2_gpu_weight(g, wd);
     if (!cg || !cu || !cd || !cg->pq || !cu->pq || !cd->pq) return -1;
     e2_act a;
-    if (e2_gpu_pack_act(g, x, m, k, &a) != 0) return -1;
+    if (act_get(g, x, m, k, &a) != 0) return -1;
 
     const int nblk = n / 64;                 /* 64-wide: one column tile */
     const int inblk = k / 128;               /* the input's scale stride */
@@ -547,7 +561,7 @@ int e2_gpu_enq_ple(e2_gpu *g, float *y, const float *x, int m,
     e2_gpu_wc *cg = e2_gpu_weight(g, wg), *cp = e2_gpu_weight(g, wp);
     if (!cg || !cp || !cg->pq || !cp->pq) return -1;
     e2_act a;
-    if (e2_gpu_pack_act(g, x, m, k, &a) != 0) return -1;
+    if (act_get(g, x, m, k, &a) != 0) return -1;
     const int nblk = n / 64, inblk = k / 128;
     int8_t *q = e2_arena_alloc(&g->act, (size_t)m * n);
     float *sc = e2_arena_alloc(&g->act, (size_t)m * nblk * sizeof(float));
@@ -621,13 +635,8 @@ int e2_gpu_pack_act(e2_gpu *g, const float *x, int m, int k, e2_act *a) {
 }
 
 int e2_gpu_enq_linear(e2_gpu *g, float *y, const float *x, int m, const e2_linear *l) {
-    if (g->ac.x == x && g->ac.m == m && g->ac.k == l->w.k) {
-        e2_act a = { g->ac.q, g->ac.sc };
-        return e2_gpu_enq_act(g, y, m, l, &a);
-    }
-    g->ac.x = NULL;                 /* another activation: drop the cache */
     e2_act a;
-    if (e2_gpu_pack_act(g, x, m, l->w.k, &a) != 0) return -1;
+    if (act_get(g, x, m, l->w.k, &a) != 0) return -1;
     return e2_gpu_enq_act(g, y, m, l, &a);
 }
 

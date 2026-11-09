@@ -82,32 +82,43 @@ __kernel void k_rmsnorm_q(__global const float *x, __global const float *w,
     const __global float *sp = acc_row ? src + (size_t)row * dim
                                        : x + (size_t)row * dim;
     float p = (mode == 1) ? pre : 1.0f;
-    float sum = 0.0f;
-    for (int i = lane; i < dim; i += gs) {
-        float v = sp[i] * p;
-        sum += v * v;
+    /* float4 per lane: with a runtime sub-group stride the compiler cannot
+     * vectorise the scalar form, and 16 lanes x 4 B per load is a quarter of
+     * the issue budget this kernel has.  dim is a multiple of 4 everywhere. */
+    const int gs4 = gs * 4;
+    float4 sum4 = (float4)(0.0f);
+    for (int i = lane * 4; i < dim; i += gs4) {
+        float4 v = *(const __global float4 *)(sp + i) * p;
+        sum4 += v * v;
     }
+    float sum = sum4.x + sum4.y + sum4.z + sum4.w;
     sum = sub_group_reduce_add(sum);
     float s = rms_scale(sum, dim, eps);
     __global float *op = out + (size_t)row * dim;
-    for (int i = lane; i < dim; i += gs) {
-        float v = sp[i] * p * s;
-        float r = w ? v * w[i] : v;
-        op[i] = acc_row ? op[i] + r : r;
+    for (int i = lane * 4; i < dim; i += gs4) {
+        float4 v = *(const __global float4 *)(sp + i) * (p * s);
+        if (w) v *= *(const __global float4 *)(w + i);
+        if (acc_row) v += *(const __global float4 *)(op + i);
+        *(__global float4 *)(op + i) = v;
     }
     /* quantise what was just written, one block at a time */
     int nblk = dim / blk;
     __global char *qp = q + (size_t)row * dim;
     for (int b = 0; b < nblk; b++) {
+        __global const float *bp = op + b * blk;
         float mx = 0.0f;
-        for (int i = lane; i < blk; i += gs) mx = fmax(mx, fabs(op[b * blk + i]));
+        for (int i = lane * 4; i < blk; i += gs4) {
+            float4 v = fabs(*(const __global float4 *)(bp + i));
+            mx = fmax(mx, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));
+        }
         mx = sub_group_reduce_max(mx);
         float qs = mx / 127.0f;
         if (qs < 1e-12f) qs = 1e-12f;
         float inv = 1.0f / qs;
-        for (int i = lane; i < blk; i += gs) {
-            int v = (int)rint(op[b * blk + i] * inv);
-            qp[b * blk + i] = (char)(v < -127 ? -127 : (v > 127 ? 127 : v));
+        for (int i = lane * 4; i < blk; i += gs4) {
+            float4 v = *(const __global float4 *)(bp + i) * inv;
+            int4 r = clamp(convert_int4_rte(v), (int4)(-127), (int4)(127));
+            *(__global char4 *)(qp + b * blk + i) = convert_char4(r);
         }
         if (lane == 0) sc[(size_t)row * nblk + b] = qs;
     }
@@ -135,20 +146,34 @@ __kernel void k_norm_rope(__global float *x, __global const float *w,
     int row = get_global_id(0) / gs;
     if (row >= rows) return;
     __global float *xp = x + (size_t)row * dim;
-    float sum = 0.0f;
-    for (int i = lane; i < dim; i += gs) sum += xp[i] * xp[i];
+    /* float4 per lane, as in k_rmsnorm_q: a runtime sub-group stride stops the
+     * compiler from vectorising the scalar form */
+    const int gs4 = gs * 4;
+    float4 sum4 = (float4)(0.0f);
+    for (int i = lane * 4; i < dim; i += gs4) {
+        float4 v = *(const __global float4 *)(xp + i);
+        sum4 += v * v;
+    }
+    float sum = sum4.x + sum4.y + sum4.z + sum4.w;
     sum = sub_group_reduce_add(sum);
     float s = rms_scale(sum, dim, eps);
-    for (int i = lane; i < dim; i += gs) xp[i] = w ? xp[i] * s * w[i] : xp[i] * s;
+    for (int i = lane * 4; i < dim; i += gs4) {
+        float4 v = *(const __global float4 *)(xp + i) * s;
+        if (w) v *= *(const __global float4 *)(w + i);
+        *(__global float4 *)(xp + i) = v;
+    }
     /* hf of the row is one rotation pair; the two halves are `dim/2` apart */
     int hf = dim / 2;
     int pos = rope_pos(row, per_pos, seq_off, nseq);
     __global const float *c = cs + (size_t)pos * hf;
     __global const float *sn2 = sn + (size_t)pos * hf;
-    for (int d = lane; d < hf; d += gs) {
-        float x1 = xp[d], x2 = xp[d + hf];
-        xp[d] = x1 * c[d] - x2 * sn2[d];
-        xp[d + hf] = x2 * c[d] + x1 * sn2[d];
+    for (int d = lane * 4; d < hf; d += gs4) {
+        float4 x1 = *(const __global float4 *)(xp + d);
+        float4 x2 = *(const __global float4 *)(xp + d + hf);
+        float4 cc = *(const __global float4 *)(c + d);
+        float4 ss = *(const __global float4 *)(sn2 + d);
+        *(__global float4 *)(xp + d) = x1 * cc - x2 * ss;
+        *(__global float4 *)(xp + d + hf) = x2 * cc + x1 * ss;
     }
 }
 
@@ -380,16 +405,21 @@ __kernel void k_quant_s8(__global const float *x, __global char *q,
     int b = (int)(gid % nblk);
     int row = (int)(gid / nblk);
     __global const float *xp = x + (size_t)row * k + (size_t)b * blk;
+    const int gs4 = gs * 4;
     float mx = 0.0f;
-    for (int i = lane; i < blk; i += gs) mx = fmax(mx, fabs(xp[i]));
+    for (int i = lane * 4; i < blk; i += gs4) {
+        float4 v = fabs(*(const __global float4 *)(xp + i));
+        mx = fmax(mx, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));
+    }
     mx = sub_group_reduce_max(mx);
     float s = mx / 127.0f;
     if (s < 1e-12f) s = 1e-12f;
     float inv = 1.0f / s;
     __global char *qp = q + (size_t)row * k + (size_t)b * blk;
-    for (int i = lane; i < blk; i += gs) {
-        int v = (int)rint(xp[i] * inv);
-        qp[i] = (char)(v < -127 ? -127 : (v > 127 ? 127 : v));
+    for (int i = lane * 4; i < blk; i += gs4) {
+        float4 v = *(const __global float4 *)(xp + i) * inv;
+        int4 r = clamp(convert_int4_rte(v), (int4)(-127), (int4)(127));
+        *(__global char4 *)(qp + i) = convert_char4(r);
     }
     if (lane == 0) sc[(size_t)row * nblk + b] = s;
 }

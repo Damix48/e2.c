@@ -1,0 +1,51 @@
+name: Build native library
+
+# Reusable: one RID, on the platform that runs it. Called by publish.yml.
+#
+# No libpng/libjpeg/libwebp/libsndfile on the runner on purpose: the Makefile
+# then falls back to the vendored decoders and the raw-PCM path, which is the
+# configuration the published package ships.
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: "Runner label"
+        required: true
+        type: string
+      rid:
+        description: "Runtime identifier, e.g. linux-x64"
+        required: true
+        type: string
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build native library
+        run: sh sdk/csharp/build/build-native.sh
+
+      - name: Test
+        # Without models/*.bin the fixtures skip every numeric test but still
+        # run the load path: E2Model.Load -> resolver -> e2_api_version -> e2_load.
+        run: dotnet test sdk/csharp/tests/E2.Tests/E2.Tests.csproj -c Release
+
+      - name: Build benchmark
+        run: dotnet build sdk/csharp/tests/E2.Bench/E2.Bench.csproj -c Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.rid }}
+          path: sdk/csharp/src/E2/runtimes/${{ inputs.rid }}
+          if-no-files-found: error

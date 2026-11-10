@@ -67,8 +67,13 @@ Published to GitHub Packages by `.github/workflows/publish.yml` on a `v*` tag
 (or manually, with an explicit version):
 
 ```bash
-git tag v0.1.0 && git push --tags     # builds linux-x64 + osx-arm64, pushes the nupkg
+git tag v0.1.0 && git push --tags     # builds linux-x64, pushes the nupkg
 ```
+
+`osx-arm64` is built too when the repository variable `E2_MACOS_RUNNER` is set
+(e.g. `macos-14`) — macOS runners are not available to every account, so the
+leg is opt-in rather than a hard requirement. Without it the package simply
+contains no `osx-arm64` asset.
 
 The package carries one native library per RID under `runtimes/`. It is not a
 public feed, so consumers add a source:

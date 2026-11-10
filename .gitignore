@@ -20,3 +20,10 @@ logs/
 /tests/e2_ab_b
 /gpu-bench
 /gpu-check
+*.so
+*.dylib
+sdk/csharp/**/bin/
+sdk/csharp/**/obj/
+sdk/csharp/src/E2/runtimes/
+*.nupkg
+/tools/e2_golden

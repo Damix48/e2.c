@@ -1,0 +1,130 @@
+name: Publish C# SDK
+
+# Packages go to GitHub Packages (nuget.pkg.github.com/Damix48). Consumers need
+# a nuget.config entry for that feed, since it is not a public source.
+#
+# The engine's own test suite (make test) and the SDK's golden-vector tests need
+# models/*.bin, which are generated from the HuggingFace checkpoint (`make pack`)
+# and are far too large for the repo. CI therefore covers: the shared library
+# builds, the binding loads it and the ABI version matches, the managed project
+# and benchmark compile, and the nupkg contains the native assets for every RID.
+# Numeric parity is checked locally with `make golden && dotnet test`.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (default: tag without v, else 0.1.0-ci.<run>)"
+        required: false
+        type: string
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  # One job per RID: the native library has to be compiled on the platform that
+  # runs it, and the tests must load the same artifact that gets packaged.
+  build:
+    name: build ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: macos-14
+            rid: osx-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build native library
+        # No libpng/libjpeg/libwebp/libsndfile on the runner: the Makefile falls
+        # back to the vendored decoders and the raw-PCM path, which is the
+        # configuration the nupkg ships.
+        run: sh sdk/csharp/build/build-native.sh
+
+      - name: Test
+        # Without models/*.bin the fixtures skip every numeric test but still
+        # run the load path: E2Model.Load -> resolver -> e2_api_version -> e2_load.
+        run: dotnet test sdk/csharp/tests/E2.Tests/E2.Tests.csproj -c Release
+
+      - name: Build benchmark
+        run: dotnet build sdk/csharp/tests/E2.Bench/E2.Bench.csproj -c Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: sdk/csharp/src/E2/runtimes/${{ matrix.rid }}
+          if-no-files-found: error
+
+  publish:
+    name: pack and push
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write # required to push to GitHub Packages
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+          # Authenticates dotnet against GitHub Packages for the push below.
+          source-url: https://nuget.pkg.github.com/damix48/index.json
+        env:
+          NUGET_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: /tmp/native
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.1.0-ci.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "packaging $version"
+
+      - name: Pack
+        # The csproj globs runtimes/**; drop every RID in place first.
+        run: |
+          mkdir -p sdk/csharp/src/E2/runtimes
+          cp -r /tmp/native/* sdk/csharp/src/E2/runtimes/
+          find sdk/csharp/src/E2/runtimes -type f
+          dotnet pack sdk/csharp/src/E2/E2.csproj -c Release \
+            -p:Version=${{ steps.version.outputs.version }} -o dist
+
+      - name: Verify the nupkg contains every native asset
+        run: |
+          set -e
+          for rid in linux-x64 osx-arm64; do
+            unzip -l dist/*.nupkg | grep -q "runtimes/$rid/native" \
+              || { echo "missing $rid in the package"; exit 1; }
+          done
+          unzip -l dist/*.nupkg
+
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget push "dist/*.nupkg" \
+            --source https://nuget.pkg.github.com/damix48/index.json \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --skip-duplicate --no-symbols

@@ -23,6 +23,8 @@ preprocessing are fixed to this checkpoint.
 make                  # libe2.a + e2cli (auto-detects png/jpeg/webp/sndfile)
 make USE_SYSTEM_IMAGE=0 USE_WEBP=0 USE_SNDFILE=0   # vendored / PCM-only
 make test             # self-checks against models/
+make shared           # libe2.so / libe2.dylib for language bindings
+make golden           # regenerate the C# SDK reference embeddings
 make bench            # text batch throughput
 make bench-full       # text/image/audio latency
 make clean
@@ -125,6 +127,11 @@ cannot cover both < 512 and >= 512 tokens.
 | audio file loading | `src/e2_audio_file.c` |
 | public wrappers | `src/e2_multimodal.c`, `src/e2.c` |
 | quantizer / format | `tools/e2_pack.py` |
+| C# SDK (P/Invoke) | `sdk/csharp/src/E2/`, tests in `sdk/csharp/tests/` |
+
+`e2.h` is the ABI. Any signature change there must bump `E2_API_VERSION` in
+`e2.h` **and** `NativeMethods.ApiVersion` in `sdk/csharp/src/E2/NativeMethods.cs`;
+`E2Model.Load` refuses a mismatched library.
 
 ## GPU backend
 

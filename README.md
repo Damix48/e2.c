@@ -208,10 +208,21 @@ vendor/png.h, jpeg.h     vendored single-header image decoders
 tools/e2_pack.py         HuggingFace -> int8 E2 model
 tools/e2_ref.py          HuggingFace reference dumps for validation
 tools/e2cli.c            command line front-end
+tools/e2_golden.c         reference embeddings for the C# binding tests
 tools/bench_compare.py    e2 vs OpenVINO (f32/int8) benchmark, all tasks
 tests/e2_test.c          self-checks
 tests/e2_bench_full.c    spec-driven text/batch/image/audio/video latency
+sdk/csharp/              C# SDK (P/Invoke over `make shared`), tests + bench
 ```
+
+## C# SDK
+
+```bash
+make shared                                  # libe2.so / libe2.dylib
+cd sdk/csharp && dotnet test tests/E2.Tests   # golden vectors, API, concurrency
+```
+
+See `sdk/csharp/README.md`.
 
 ## Extending to a new CPU or GPU
 

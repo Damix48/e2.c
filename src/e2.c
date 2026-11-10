@@ -222,3 +222,7 @@ int e2_embed_text_task(e2_ctx *ctx, const char *task, const char *text, float *o
     free(s);
     return rc;
 }
+
+int e2_api_version(void) { return E2_API_VERSION; }
+
+void e2_free_buffer(void *p) { free(p); }

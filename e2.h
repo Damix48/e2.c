@@ -25,6 +25,11 @@ extern "C" {
 
 #define E2_EMBED_DIM 768
 
+/* Header ABI version. Bindings must refuse to load a library whose
+ * e2_api_version() differs. Bump it on any signature change above. */
+#define E2_API_VERSION 1
+int e2_api_version(void);
+
 typedef struct e2_ctx e2_ctx;
 
 /* Modalities. A model file may contain only a subset. */
@@ -98,9 +103,13 @@ int e2_embed_audio(e2_ctx *ctx, const float *samples, int nsamples,
 /*
  * Load an audio file (WAV, FLAC, OGG/Vorbis, Opus, MP3 when built with
  * libsndfile), downmix to mono and resample to 16 kHz. Caller frees the
- * returned buffer with free(). Returns 0 on success.
+ * returned buffer with e2_free_buffer(). Returns 0 on success.
  */
 int e2_audio_read(const char *path, float **samples, int *nsamples);
+
+/* Free a buffer returned by this library. Never free() it directly: language
+ * runtimes link their own allocator on some platforms. */
+void e2_free_buffer(void *p);
 
 /* Encode a video as a sequence of frames (image files), sampled as given. */
 int e2_embed_video(e2_ctx *ctx, const char *const *frame_paths, int nframes,

@@ -45,7 +45,17 @@ SRC := src/e2.c src/e2_model.c src/e2_util.c src/e2_gemm.c src/e2_ops.c \
 OBJ := $(SRC:.c=.o)
 HDR := e2.h src/e2_internal.h src/e2_gpu.h src/e2_gpu_int.h src/e2_gpu_l0.h src/e2_gpu_pack.h src/e2_gpu_spv.h
 
-.PHONY: all clean test bench compare pack help spv gpu-bench
+# Shared library for language bindings (C#/P/Invoke, ctypes, ...).
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+SHARED      := libe2.dylib
+SHAREDFLAGS := -dynamiclib -install_name @rpath/libe2.dylib
+else
+SHARED      := libe2.so
+SHAREDFLAGS := -shared -Wl,-soname,libe2.so
+endif
+
+.PHONY: all clean test bench compare pack help spv gpu-bench shared golden
 
 all: libe2.a e2cli
 	@echo "e2: system-image=$(USE_SYSTEM_IMAGE) webp=$(USE_WEBP) sndfile=$(USE_SNDFILE)"
@@ -54,12 +64,19 @@ help:
 	@echo "make            build libe2.a + e2cli"
 	@echo "make test       run C self-checks (uses models/)"
 	@echo "make bench      text batch benchmark"
+	@echo "make shared     build $(SHARED) for language bindings"
+	@echo "make golden     regenerate SDK reference embeddings"
 	@echo "make compare    e2 vs OpenVINO (f32/int8), all tasks (needs .venv)"
 	@echo "make pack       quantize all six model variants (needs .venv)"
 	@echo "make DOTPROD=1  build with ARMv8.2 dot-product instructions"
 
 libe2.a: $(OBJ)
 	ar rcs $@ $^
+
+shared: $(SHARED)
+
+$(SHARED): $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -fPIC $(SHAREDFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
 %.o: %.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -75,6 +92,19 @@ tests/e2_bench: tests/e2_bench.c libe2.a $(HDR)
 
 tests/e2_bench_full: tests/e2_bench_full.c libe2.a $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< libe2.a $(LDFLAGS)
+
+# No -ffast-math here: it links crtfastmath.o and rewrites the synthetic
+# sample arithmetic, which the audio tower amplifies (cos ~0.9986).
+tools/e2_golden: tools/e2_golden.c libe2.a $(HDR)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $< libe2.a $(LDFLAGS)
+
+# Reference embeddings for the C# binding tests (needs models/).
+GOLDEN := sdk/csharp/tests/E2.Tests/golden/embeddings.txt
+MODEL  ?= models/e2-text+image+audio.bin
+TOK    ?= models/e2-tokenizer.bin
+
+golden: tools/e2_golden
+	./tools/e2_golden $(MODEL) $(TOK) $(GOLDEN)
 
 # regenerate src/e2_gpu_spv.h from tools/gpu/*.cl (needs clang + xxd; the
 # generated header is checked in so a normal build does not)
@@ -116,3 +146,4 @@ pack:
 
 clean:
 	rm -f $(OBJ) libe2.a e2cli tests/e2_test tests/e2_bench tests/e2_bench_full mb gpu-check gpu-bench
+	rm -f $(SHARED) tools/e2_golden

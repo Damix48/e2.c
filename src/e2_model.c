@@ -11,7 +11,9 @@
 #define E2_MAGIC "E2MODEL1"
 #define E2_ENTRY_SIZE 168
 
-static char g_err[512] = "ok";
+/* Thread-local: bindings call the API from a worker pool, and a shared buffer
+ * handed one thread's error text to another. */
+static _Thread_local char g_err[512] = "ok";
 
 int e2_fail(const char *fmt, ...) {
     va_list ap;
